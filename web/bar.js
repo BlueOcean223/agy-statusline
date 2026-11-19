@@ -293,6 +293,14 @@
     },
     // Called by the sidecar after (re)attaching so it learns the panes even if nothing changed.
     resend() { reported = ''; render(false); },
+    // Used by the side panel to draw the same bar into its own header.
+    renderInto(container, payload, id, dark) {
+      if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
+      data = payload;
+      container.classList.add(BAR);
+      container.classList.toggle('dark', !!dark);
+      container.replaceChildren(...build(id));
+    },
   };
 
   if (document.body) start();

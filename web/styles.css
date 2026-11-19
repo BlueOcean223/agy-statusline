@@ -202,110 +202,6 @@ button { cursor: pointer; }
   gap: 2px;
 }
 
-/* Clean wrap-safe pipe separator trick (same as ccline / agy-zh-pack) */
-.cc-line {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  row-gap: 2px;
-  margin-left: -1.4em;
-  clip-path: inset(-4px -4px -4px 1.4em);
-}
-
-.cc-seg {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  white-space: nowrap;
-  margin-left: 1.4em;
-  position: relative;
-  color: var(--kc, var(--fg));
-  cursor: default;
-}
-
-.cc-seg::before {
-  content: "|";
-  color: var(--k-sep);
-  position: absolute;
-  left: -0.92em;
-  top: 0;
-  bottom: 0;
-  display: flex;
-  align-items: center;
-  font-weight: 400;
-}
-
-.cc-ic {
-  width: 12.5px;
-  height: 12.5px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex: none;
-}
-.cc-ic svg {
-  width: 12.5px;
-  height: 12.5px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.65;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
-.cc-dot { opacity: 0.55; margin: 0 1px; }
-.cc-sub { color: var(--fg-muted); font-weight: 400; }
-.cc-warn { color: var(--k-warn) !important; }
-.cc-crit { color: var(--k-crit) !important; }
-.cc-ok { color: var(--k-ok) !important; }
-
-.cc-cells {
-  display: inline-flex;
-  align-items: center;
-  gap: 1.5px;
-  margin-right: 2px;
-}
-.cc-cells i {
-  display: block;
-  width: 4px;
-  height: 9px;
-  border-radius: 1px;
-  background: var(--cell-off);
-}
-.cc-cells i.on {
-  background: currentColor;
-}
-
-/* Dual-row CCometixLine Pace Bar */
-.cc-pace {
-  display: inline-flex;
-  flex-direction: column;
-  gap: 1.5px;
-  width: 34px;
-  margin-right: 2px;
-}
-.cc-pace-row {
-  width: 100%;
-  height: 3.5px;
-  border-radius: 1.5px;
-  background: var(--cell-off);
-  overflow: hidden;
-}
-.cc-pace-row.clock {
-  height: 2.5px;
-  opacity: 0.7;
-}
-.cc-pace-fill {
-  display: block;
-  height: 100%;
-  background: currentColor;
-  border-radius: 1.5px;
-}
-.cc-pace-row.clock .cc-pace-fill {
-  background: var(--fg-muted);
-}
-
-/* Underline Tabs */
 .tabs {
   display: flex;
   gap: 18px;
@@ -553,3 +449,6 @@ button { cursor: pointer; }
   font-weight: 500;
 }
 .primary-btn:hover { opacity: 0.9; }
+
+/* Header strip is drawn by bar.js (same renderer as the bar above the chat input). */
+.ccline-strip.agy-ccline-bar { padding: 6px 0 4px; }

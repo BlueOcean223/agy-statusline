@@ -32,16 +32,10 @@ impl Default for ModelRule {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 0 means use the model's default Antigravity Desktop compaction limit (256k).
+    /// 0 means use the limit the language_server reports (`maxContextTokens`).
     pub context_limit_override: u64,
     pub cache_ttl_sec: u64,
-    pub quotas_enabled: bool,
-    /// "usd" or "tokens"
-    pub quota_mode: String,
-    pub five_hour_usd_limit: f64,
-    pub seven_day_usd_limit: f64,
-    pub five_hour_token_limit: u64,
-    pub seven_day_token_limit: u64,
+    /// Count subagents' calls in a root conversation's token and cost totals (side panel).
     pub include_subagents: bool,
     /// In-page statusline above the chat input (drawn over CDP).
     pub bar_enabled: bool,
@@ -56,12 +50,6 @@ impl Default for Config {
         Self {
             context_limit_override: 0,
             cache_ttl_sec: 300,
-            quotas_enabled: true,
-            quota_mode: "usd".into(),
-            five_hour_usd_limit: 15.0,
-            seven_day_usd_limit: 80.0,
-            five_hour_token_limit: 15_000_000,
-            seven_day_token_limit: 80_000_000,
             include_subagents: true,
             bar_enabled: true,
             bar_show_cost: true,
@@ -76,12 +64,6 @@ impl Default for Config {
 pub struct ConfigPatch {
     pub context_limit_override: Option<u64>,
     pub cache_ttl_sec: Option<u64>,
-    pub quotas_enabled: Option<bool>,
-    pub quota_mode: Option<String>,
-    pub five_hour_usd_limit: Option<f64>,
-    pub seven_day_usd_limit: Option<f64>,
-    pub five_hour_token_limit: Option<u64>,
-    pub seven_day_token_limit: Option<u64>,
     pub include_subagents: Option<bool>,
     pub bar_enabled: Option<bool>,
     pub bar_show_cost: Option<bool>,
@@ -195,24 +177,6 @@ pub fn apply_config_patch(plugin_data: &Path, patch: ConfigPatch) -> Config {
     }
     if let Some(v) = patch.cache_ttl_sec {
         cfg.cache_ttl_sec = v.max(30);
-    }
-    if let Some(v) = patch.quotas_enabled {
-        cfg.quotas_enabled = v;
-    }
-    if let Some(v) = patch.quota_mode {
-        cfg.quota_mode = v;
-    }
-    if let Some(v) = patch.five_hour_usd_limit {
-        cfg.five_hour_usd_limit = v.max(0.1);
-    }
-    if let Some(v) = patch.seven_day_usd_limit {
-        cfg.seven_day_usd_limit = v.max(0.1);
-    }
-    if let Some(v) = patch.five_hour_token_limit {
-        cfg.five_hour_token_limit = v.max(10_000);
-    }
-    if let Some(v) = patch.seven_day_token_limit {
-        cfg.seven_day_token_limit = v.max(10_000);
     }
     if let Some(v) = patch.include_subagents {
         cfg.include_subagents = v;

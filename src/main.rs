@@ -4,12 +4,12 @@ mod hook;
 mod http;
 mod live;
 mod ls;
+mod panel;
 mod server;
-mod telemetry;
+mod transcript;
 
 use clap::{Parser, Subcommand};
 use config::{find_app_data_dir, find_plugin_data_dir};
-use telemetry::{build_snapshot, fmt_tokens, fmt_usd};
 
 #[derive(Parser)]
 #[command(name = "agy-ccline", version, about = "Pure-Rust CCometixLine plugin & sidecar for Antigravity")]
@@ -32,49 +32,61 @@ enum Commands {
         /// Conversation ids to build views for (defaults to the most recently modified root)
         ids: Vec<String>,
     },
-    /// Print live statusline & telemetry summary for the active or specified conversation
+    /// Print a two-line terminal preview for the specified (or most recently viewed) conversation
     Status {
         #[arg(short, long, default_value = "")]
         conversation: String,
     },
 }
 
-fn print_status(conv: &str) {
-    let app_data = find_app_data_dir();
-    let plugin_data = find_plugin_data_dir(&app_data);
-    let snap = build_snapshot(&app_data, &plugin_data, conv, &[]);
-    let s = &snap.summary;
+fn fmt_tok(n: u64) -> String {
+    match n {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1e6),
+        n if n >= 1_000 => format!("{}k", n / 1000),
+        n => n.to_string(),
+    }
+}
 
-    // Two-line ANSI CCometixLine preview in terminal
-    println!(
-        "\x1b[38;2;180;190;254m✦ {}{}\x1b[0m \x1b[90m|\x1b[0m \x1b[38;2;137;220;235m◔ {:.0}% · {}/{}{}\x1b[0m \x1b[90m|\x1b[0m \x1b[38;2;148;226;213m⛁ {} · {:.0}% hit\x1b[0m \x1b[90m|\x1b[0m \x1b[38;2;245;194;231m{} · {} today\x1b[0m",
-        s.model_short,
-        if s.effort.is_empty() { String::new() } else { format!("·{}", s.effort) },
-        s.context_pct,
-        fmt_tokens(s.context_tokens),
-        fmt_tokens(s.context_limit),
-        if s.compactions > 0 { format!(" · {}× compact", s.compactions) } else { String::new() },
-        fmt_tokens(s.last_cache_tokens),
-        s.last_cache_hit_pct,
-        fmt_usd(s.session_cost_usd),
-        fmt_usd(s.today_cost_usd),
-    );
-    println!(
-        "\x1b[38;2;186;194;222mΣ {} tok\x1b[0m \x1b[90m|\x1b[0m \x1b[38;2;166;227;161m⏲ {:.1} tok/s (avg {:.1})\x1b[0m \x1b[90m|\x1b[0m \x1b[38;2;250;179;135m5h {}% ({}/{}) · 7d {}% ({}/{})\x1b[0m",
-        fmt_tokens(s.total_tokens),
-        s.last_tps,
-        s.avg_tps,
-        s.quota_5h.pct,
-        s.quota_5h.used_fmt,
-        s.quota_5h.limit_fmt,
-        s.quota_7d.pct,
-        s.quota_7d.used_fmt,
-        s.quota_7d.limit_fmt,
-    );
-    println!(
-        "\x1b[90mSession: {} ({}) · State: {}\x1b[0m",
-        snap.conversation_title, snap.conversation_id, s.activity_label
-    );
+/// Two-line terminal preview of the bar for one conversation (default: the one viewed last).
+fn print_status(conv: &str) {
+    let Some(ls) = ls::LsClient::connect() else {
+        eprintln!("language_server not found");
+        std::process::exit(1);
+    };
+    let cfg = config::load_config(&find_plugin_data_dir(&find_app_data_dir()));
+    let mut eng = live::Engine::new(ls);
+    eng.tick(&Default::default());
+    let p = eng.panel(Some(conv).filter(|c| !c.is_empty()), &cfg);
+    let Some(id) = p["id"].as_str() else {
+        println!("no conversations");
+        return;
+    };
+    let v = &p["bar"]["views"][id];
+    let m = &v["main"];
+    let c = |rgb: (u8, u8, u8), s: String| format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2);
+    let sep = "\x1b[90m | \x1b[0m";
+    let used = m["ctxUsed"].as_u64().unwrap_or(0);
+    let max = m["ctxMax"].as_u64().unwrap_or(0);
+    let mut l1 = vec![
+        c((180, 190, 254), format!("✦ {}", m["model"].as_str().unwrap_or("–"))),
+        c((203, 166, 247), format!("◔ {}% · {} / {}", if max > 0 { used * 100 / max } else { 0 }, fmt_tok(used), fmt_tok(max))),
+        c((137, 220, 235), format!("⛁ {} · {:.0}% hit", fmt_tok(m["cacheRead"].as_u64().unwrap_or(0)), m["cacheHit"].as_f64().unwrap_or(0.0) * 100.0)),
+        c((245, 194, 231), format!("$ ${:.2} · ${:.2} today", v["costConv"].as_f64().unwrap_or(0.0), p["bar"]["today"].as_f64().unwrap_or(0.0))),
+    ];
+    if m["running"].as_bool() == Some(true) {
+        l1.push(c((166, 227, 161), "● running".into()));
+    }
+    let mut l2 = vec![
+        c((242, 205, 205), format!("⧗ {:.1}s", m["ttftMs"].as_f64().unwrap_or(0.0) / 1000.0)),
+        c((148, 226, 213), format!("ϟ {:.0} tok/s", m["tps"].as_f64().unwrap_or(0.0))),
+    ];
+    for q in v["quota"].as_array().into_iter().flatten() {
+        let label = if q["window"] == "5h" { "5h" } else { "7d" };
+        l2.push(c((250, 179, 135), format!("{label} {:.0}%", q["used"].as_f64().unwrap_or(0.0) * 100.0)));
+    }
+    println!("{}", l1.join(sep));
+    println!("{}", l2.join(sep));
+    println!("\x1b[90m{} ({id})\x1b[0m", p["title"].as_str().unwrap_or(""));
 }
 
 fn print_live(ids: Vec<String>) {

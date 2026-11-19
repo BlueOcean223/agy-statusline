@@ -1,5 +1,4 @@
 use crate::config::{ConfigPatch, apply_config_patch, find_app_data_dir, find_plugin_data_dir, load_config};
-use crate::telemetry::build_snapshot;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -14,6 +13,7 @@ const INDEX_HTML: &str = include_str!("../web/index.html");
 const STYLES_CSS: &str = include_str!("../web/styles.css");
 const APP_JS: &str = include_str!("../web/app.js");
 const PRELOAD_JS: &str = include_str!("../web/preload.js");
+const BAR_JS: &str = include_str!("../web/bar.js");
 
 fn url_decode(s: &str) -> String {
     let mut bytes = Vec::with_capacity(s.len());
@@ -192,27 +192,28 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         ("GET", "/healthz" | "/api/health") => {
             send_response(stream, 200, "application/json", br#"{"ok":true}"#);
         }
-        ("GET", "/api/telemetry") => {
-            let conv_id = query.get("conversationId").map(String::as_str).unwrap_or("");
-            let ws_uris: Vec<String> = query
-                .get("workspaceUris")
-                .map(|s| s.split(',').filter(|x| !x.is_empty()).map(str::to_string).collect())
-                .unwrap_or_default();
-            let snap = build_snapshot(&app_data, &plugin_data, conv_id, &ws_uris);
-            if let Some(client_etag) = query.get("etag")
-                && !client_etag.is_empty()
-                && *client_etag == snap.etag
+        ("GET", "/bar.js") => {
+            send_response(stream, 200, "application/javascript; charset=utf-8", BAR_JS.as_bytes());
+        }
+        ("GET", "/api/panel") => {
+            let conv_id = query.get("conversationId").map(String::as_str).filter(|s| !s.is_empty());
+            let cfg = load_config(&plugin_data);
+            let out = match crate::live::ENGINE.lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(eng) => eng.panel(conv_id, &cfg),
+                    None => json!({ "id": null, "error": "language_server not connected" }),
+                },
+                Err(_) => json!({ "id": null, "error": "engine unavailable" }),
+            };
+            // Keeps the engine refreshing this conversation while the panel shows it.
+            if let (Some(shared), Some(id)) = (LIVE.get(), out["id"].as_str())
+                && let Ok(mut s) = shared.0.lock()
             {
-                let out = serde_json::to_vec(&json!({
-                    "unchanged": true,
-                    "etag": snap.etag
-                }))
-                .unwrap_or_default();
-                send_response(stream, 200, "application/json", &out);
-                return;
+                s.panel.insert(id.to_string(), std::time::Instant::now());
             }
-            let out = serde_json::to_vec(&snap).unwrap_or_default();
-            send_response(stream, 200, "application/json", &out);
+            let mut out = out;
+            out["config"] = serde_json::to_value(&cfg).unwrap_or(Value::Null);
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
         ("GET", "/api/live-status") => {
             let out = match LIVE.get() {
