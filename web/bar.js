@@ -151,10 +151,20 @@
     const t = document.querySelector('[data-testid="model-selector-trigger"]');
     return t ? t.textContent.trim() : '';
   };
+  // The selector reads e.g. "Gemini 4 Neon Extra" (model + effort); a group lists
+  // "Models within this group: Gemini 4 Neon, Gemini 4 Carbon, …". Match the longest listed name it starts with.
   const homeQuota = () => {
     const groups = (data && data.quotaGroups) || [];
-    const fam = selectedModel().split(' (')[0];
-    const g = groups.find((x) => fam && String(x.models || '').includes(fam)) || groups[0];
+    const sel = selectedModel();
+    let best = null;
+    let bestLen = 0;
+    for (const g of groups) {
+      const names = String(g.models || '').replace(/^[^:]*:/, '').split(',').map((s) => s.trim()).filter(Boolean);
+      for (const n of names) {
+        if (sel.startsWith(n) && n.length > bestLen) { best = g; bestLen = n.length; }
+      }
+    }
+    const g = best || groups[0];
     return g ? g.buckets : [];
   };
 
