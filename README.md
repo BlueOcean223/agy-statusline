@@ -1,9 +1,9 @@
 # AGY CometixLine (`agy-statusline`)
 
-Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行 [CCometixLine](https://github.com/Haleclipse/CCometixLine) 风格的状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)。
+Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行 [CCometixLine](https://github.com/Haleclipse/CCometixLine) 风格的状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)，可选的中文界面直接用它的词典和翻译脚本（MIT，见 `i18n/LICENSE`）。
 
 ```
-✦ Gemini 4 Neon (XHigh) | ◔ 43% · 222k / 512k | ⛁ 212k · 97% hit | $ $21.8 · $43.2 today | ● running
+✦ Gemini 4 Neon (XHigh) | ⑂ main* · ↑1 · +525 −353 | ◔ 43% · 222k / 512k | ⛁ 212k · 97% hit | $ $21.8 · $43.2 today | ● running
 ⧗ 4.0s | ϟ 857 tok/s | 5h ▮▮▮▯▯▯▯▯▯▯ 33% · 19:18 | 7d ▮▮▯▯▯▯▯▯▯▯ 18% · Wed 09:31 · ↓1%
   ▣ research · API Researcher | ✦ Gemini 4 Neon (XHigh) | ◔ … | ⧗ 4.9s | ϟ 427 tok/s | ● running
 ```
@@ -25,13 +25,15 @@ Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显
 - `GetCascadeTrajectoryGeneratorMetadata`：每次模型调用的 token、首字时间、生成时长、实际模型、上下文估算（按 offset 增量拉）
 - `RetrieveUserQuotaSummary`：5 小时和每周额度
 
+Git 段在 sidecar 里对对话所在工作区（`workspaces[0].workspaceFolderAbsoluteUri`）跑 `git status --porcelain=v2 --branch` 和 `git diff HEAD --numstat`，每个工作区最多 5 秒一次，带 `GIT_OPTIONAL_LOCKS=0`，不抢你自己 git 命令要的锁。
+
 另外读两类本地文件：`brain/<id>/.system_generated/logs/transcript.jsonl`（按字节偏移增量读，给每次调用补开始时间和“这一轮做了什么”的标签）和 `annotations/<id>.pbtxt`（对话标题）。
 
 不修改 Antigravity 发出的任何请求。
 
 ## 启用输入框上方的状态栏
 
-Antigravity 2.33.0 起，只有带调试端口参数启动才能注入。先完全退出 Antigravity，再：
+Antigravity 2.33.0 起，只有带调试端口参数启动才能注入。最简单的是在右侧面板 Settings 里点“以调试模式重启 Antigravity”（点两次确认，会中断正在运行的对话）；它会退出 Antigravity，等进程结束后用下面的命令重新打开。也可以自己退出后运行：
 
 ```bash
 open -a Antigravity --args --remote-debugging-port=0
@@ -45,7 +47,10 @@ open -a Antigravity --args --remote-debugging-port=0
 
 右侧面板的 Settings 页（写入 `~/.gemini/antigravity/plugin_data/agy-statusline/config.toml`）：
 
-- 输入框状态栏：总开关、费用、额度、子代理行；顶部显示 CDP 和 language_server 的连接状态
+- 面板顶部的状态条就是输入框状态栏的预览，跟着下面的设置立刻变化；设置改动 0.4 秒后自动保存
+- 输入框状态栏：总开关，以及模型、Git、上下文、缓存命中、对话花费、今日花费、首字延迟、输出速度、5 小时额度、7 天额度、运行状态、子代理行各自的开关
+- 中文界面：把 Antigravity 的菜单、按钮等界面文字换成中文，不动对话内容和代码。打开时立刻生效，窗口刷新后仍然生效；关闭后已经翻译的文字要刷新窗口（或重启）才恢复英文。同样需要调试端口
+- 调试端口状态和“以调试模式重启 Antigravity”按钮（目前只支持 macOS）
 - 上下文上限覆盖、缓存 TTL、面板合计是否含子代理
 - 模型单价在 config.toml 的 `[[models]]` 里改，按顺序匹配 `responseModel + 显示名`
 
@@ -65,5 +70,6 @@ cargo build --release && cp target/release/agy-ccline bin/.new && mv -f bin/.new
 
 ## 已知限制
 
-- 压缩次数（`checkpointIndex` 前进或上下文估算骤降）没有在真正被压缩过的对话上验证过。
+- 压缩次数只在一个对话上验证过（上下文估算从 481k 降到 22k）；那份数据里没有 `checkpointIndex`。
+- 重启按钮的“退出后重新打开”没有在真实窗口里完整走过一遍；确认流程和脚本语法已检查。
 - 子代理标签页（`subagent-tab-conversation`）的选择器沿用 agy-zh-pack，macOS 上还没在真实窗口里验证；主对话和首页已验证。
