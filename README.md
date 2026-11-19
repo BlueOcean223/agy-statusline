@@ -15,15 +15,17 @@ Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显
 | 部分 | 做什么 |
 |---|---|
 | `agy-ccline sidecar` | 由 `sidecars/statusline/sidecar.json` 拉起、Antigravity 负责重启。里面三件事：live 引擎调 language_server 只读 API 取数；CDP 画师把渲染脚本注入主窗口并推数据；HTTP 服务提供右侧面板 |
-| `agy-ccline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms）；同时写旧面板用的 bridge 文件 |
+| `agy-ccline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms） |
 | `web/bar.js` | 注入页面的纯渲染脚本：找输入框、回报对话 ID、画状态栏。没有任何取数逻辑 |
-| `web/index.html` 等 | 右侧面板（Overview / Turns / Settings） |
+| `web/index.html` 等 | 右侧面板（Overview / Turns / Settings），数据来自 `/api/panel`，顶部状态条也由 `bar.js` 绘制 |
 
 数据来源（都是本机 language_server 的只读接口，地址和 token 由 Antigravity 通过 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 交给 sidecar）：
 
-- `GetAllCascadeTrajectories`：对话状态、步数、父子关系
+- `GetAllCascadeTrajectories`：对话状态、步数、父子关系、工作区和分支
 - `GetCascadeTrajectoryGeneratorMetadata`：每次模型调用的 token、首字时间、生成时长、实际模型、上下文估算（按 offset 增量拉）
 - `RetrieveUserQuotaSummary`：5 小时和每周额度
+
+另外读两类本地文件：`brain/<id>/.system_generated/logs/transcript.jsonl`（按字节偏移增量读，给每次调用补开始时间和“这一轮做了什么”的标签）和 `annotations/<id>.pbtxt`（对话标题）。
 
 不修改 Antigravity 发出的任何请求。
 
@@ -44,7 +46,8 @@ open -a Antigravity --args --remote-debugging-port=0
 右侧面板的 Settings 页（写入 `~/.gemini/antigravity/plugin_data/agy-statusline/config.toml`）：
 
 - 输入框状态栏：总开关、费用、额度、子代理行；顶部显示 CDP 和 language_server 的连接状态
-- 上下文上限覆盖、模型单价（`[[models]]`，按顺序匹配 `responseModel + 显示名`）
+- 上下文上限覆盖、缓存 TTL、面板合计是否含子代理
+- 模型单价在 config.toml 的 `[[models]]` 里改，按顺序匹配 `responseModel + 显示名`
 
 费用 = token × 单价，是公开 API 标准价的折算，不是订阅实际扣费。
 
@@ -58,10 +61,9 @@ cargo build --release && cp target/release/agy-ccline bin/.new && mv -f bin/.new
 
 - `agy-ccline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
 - `AGY_DEVTOOLS_PORT_FILE=<path> agy-ccline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
-- `agy-ccline status`：旧的终端预览（transcript 引擎）。
+- `agy-ccline status [-c 对话ID]`：终端里的两行预览，默认取最近看过的对话。
 
 ## 已知限制
 
 - 压缩次数（`checkpointIndex` 前进或上下文估算骤降）没有在真正被压缩过的对话上验证过。
-- 右侧面板的 Overview / Turns 仍用旧的 transcript 引擎出数。
 - 输入框和对话 ID 的 DOM 选择器沿用 agy-zh-pack（Windows 版验证过），macOS 真实窗口里尚未验证。

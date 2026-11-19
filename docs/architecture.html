@@ -79,7 +79,8 @@
                          │     页面 ──binding──▶ “我这里显示的是对话 X”
                          │     sidecar ──Runtime.evaluate──▶ __agyBar.update({...})
                          │
-                         │  ③ 侧栏面板（原有）：Settings 写 config.toml，显示 CDP / LS 连接状态</div>
+                         │  ③ 侧栏面板：/api/panel 由同一个引擎出数，顶部状态条也用 bar.js 画
+                         │     Settings 写 config.toml，显示 CDP / LS 连接状态</div>
 
   <h2>每个字段从哪来</h2>
   <table>
@@ -96,14 +97,13 @@
 
   <h2>hook 在这里的位置</h2>
   <ul>
-    <li>hook 同步执行、会阻塞 agent 循环，所以只做两件事：写原来的 bridge 文件（旧面板还在用），向 <code>plugin_data/live.port</code> 里的端口发一个 UDP 包，不等回应。实测单次 ≤10ms。</li>
+    <li>hook 同步执行、会阻塞 agent 循环，所以只做一件事：向 <code>plugin_data/live.port</code> 里的端口发一个 UDP 包，不等回应。实测单次 ≤10ms。</li>
     <li>没有 hook 也能工作，只是数据要等下一次轮询（运行中最多 2 秒）。</li>
   </ul>
 
   <h2>还要你决定或注意的</h2>
   <ul>
     <li><strong>调试端口</strong>：2.33.0 起只有带 <code>--remote-debugging-port</code> 启动才有。开了以后本机任何进程都能通过它控制 Antigravity 窗口。</li>
-    <li><strong>侧栏面板</strong>仍用旧的 transcript 引擎出数（Overview、Turns 两页）。两边数字基本一致，但统一到新引擎是后续工作。</li>
     <li>单价是公开 API 标准价折算，不是订阅实际扣费。</li>
   </ul>
   <p class="note">页面结构依赖：输入框 <code>[data-testid="agent-input-box"]</code>，对话 ID 取自 <code>[data-testid="conversation-view"][data-cascade-id]</code>（子代理标签页取 <code>subagent-tab-conversation</code>）。这两个选择器沿用 agy-zh-pack 在 Windows 版上验证过的，macOS 版尚未在真实窗口里验证。</p>
