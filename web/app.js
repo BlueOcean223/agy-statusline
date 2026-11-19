@@ -15,7 +15,9 @@
   const hostConvId = window.sidecar?.conversationId || params.get('conversationId') || '';
   let selectedConvId = hostConvId;
   let activeTab = 'overview';
-  let settingsDirty = false;
+  // Settings being edited; the preview strip draws with these until the saved config catches up.
+  let draft = null;
+  let saveTimer = 0;
   let lastJson = '';
   let last = null;
 
@@ -51,7 +53,6 @@
       panelOverview.classList.toggle('hidden', activeTab !== 'overview');
       panelTurns.classList.toggle('hidden', activeTab !== 'turns');
       panelSettings.classList.toggle('hidden', activeTab !== 'settings');
-      settingsDirty = false;
       if (last) renderPanels(last, true);
     });
   }
@@ -105,9 +106,17 @@
   const kv = (k, v) => `<div class="kv-row"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`;
 
   // ---------------------------------------------------------------- render
+  // The strip previews the in-page bar for the selected conversation, drawn with the settings as edited.
   function renderStrip(p) {
     if (!window.__agyBar || !p.bar) return;
-    window.__agyBar.renderInto(stripEl, p.bar, p.id, document.documentElement.dataset.theme === 'dark');
+    const c = draft || p.config || {};
+    if (c.bar_enabled === false) {
+      stripEl.classList.remove('agy-ccline-bar');
+      stripEl.innerHTML = '<div class="strip-off">状态栏已关闭</div>';
+      return;
+    }
+    const bar = { ...p.bar, opts: { ...(p.bar.opts || {}), enabled: true, seg: c.bar_segments || {} } };
+    window.__agyBar.renderInto(stripEl, bar, p.id, document.documentElement.dataset.theme === 'dark');
   }
 
   function renderOverview(p) {
@@ -231,68 +240,143 @@
       </div>`).join('');
   }
 
+  const SEGMENTS = [
+    ['model', '模型'], ['git', 'Git'], ['context', '上下文'], ['cache', '缓存命中'],
+    ['cost', '对话花费'], ['today', '今日花费'], ['ttft', '首字延迟'], ['speed', '输出速度'],
+    ['quota_5h', '5 小时额度'], ['quota_7d', '7 天额度'], ['running', '运行状态'], ['subagents', '子代理行'],
+  ];
+  const postJson = (path, body) => {
+    const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
+    return f(path, { method: 'POST', body: JSON.stringify(body) });
+  };
+  function readSettings() {
+    const seg = {};
+    for (const [k] of SEGMENTS) seg[k] = $('seg-' + k).checked;
+    return {
+      bar_enabled: $('cfg-bar-on').checked,
+      bar_segments: seg,
+      ui_zh: $('cfg-zh').checked,
+      context_limit_override: Number($('cfg-ctx-win').value) || 0,
+      cache_ttl_sec: Math.max(30, Number($('cfg-ttl').value) || 300),
+      include_subagents: $('cfg-sub').checked,
+    };
+  }
+  // Every change redraws the preview at once and is written to config.toml shortly after.
+  function onSettingsChange() {
+    draft = readSettings();
+    panelSettings.querySelector('.seg-grid').classList.toggle('off', !draft.bar_enabled);
+    if (last) renderStrip(last);
+    setSaveState('保存中…');
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(async () => {
+      const sent = draft;
+      try {
+        const res = await postJson('/api/config', sent);
+        if (!res.ok) throw new Error('HTTP ' + res.status);
+        setSaveState('已保存到 config.toml');
+        // Later edits made while this one was saving keep their draft.
+        if (draft === sent) draft = null;
+        lastJson = '';
+        await poll();
+      } catch (e) {
+        setSaveState('保存失败：' + e.message, true);
+      }
+    }, 400);
+  }
+  function setSaveState(text, bad) {
+    const n = $('save-state');
+    if (n) { n.textContent = text; n.classList.toggle('bad', !!bad); }
+  }
+
+  // Built once per visit to the tab; polling only refreshes the status lines.
   function renderSettings(p, force = false) {
-    if (settingsDirty && !force) return;
-    const c = p.config;
+    if (!force && panelSettings.childElementCount) { updateLiveStatus(); return; }
+    const c = draft || p.config;
+    const sg = c.bar_segments || {};
     const opt = (v, label) => `<option value="${v}" ${c.context_limit_override === v ? 'selected' : ''}>${label}</option>`;
+    const segBox = ([k, label]) =>
+      `<label class="seg-check"><input id="seg-${k}" type="checkbox" ${sg[k] !== false ? 'checked' : ''} /><span>${label}</span></label>`;
     panelSettings.innerHTML = `
       <div class="section">
-        <div class="sec-head"><span class="sec-title">输入框状态栏 (In-page Statusline)</span></div>
-        <div class="form-hint" id="live-status" style="margin-bottom:8px;line-height:1.6">…</div>
+        <div class="sec-head"><span class="sec-title">输入框状态栏</span><span id="save-state" class="save-state"></span></div>
         <div class="form-row">
-          <div class="form-label"><span>Show Statusline Above Input</span><span class="form-hint">需要 Antigravity 带 --remote-debugging-port 启动</span></div>
+          <div class="form-label"><span>显示在输入框上方</span><span class="form-hint">改动立刻反映在顶部预览，并自动保存</span></div>
           <input id="cfg-bar-on" type="checkbox" ${c.bar_enabled ? 'checked' : ''} />
         </div>
-        <div class="form-row"><div class="form-label"><span>Cost (conversation · today)</span></div><input id="cfg-bar-cost" type="checkbox" ${c.bar_show_cost ? 'checked' : ''} /></div>
-        <div class="form-row"><div class="form-label"><span>5h / Weekly Quota</span></div><input id="cfg-bar-quota" type="checkbox" ${c.bar_show_quota ? 'checked' : ''} /></div>
-        <div class="form-row"><div class="form-label"><span>Running Subagent Rows</span></div><input id="cfg-bar-subs" type="checkbox" ${c.bar_show_subagents ? 'checked' : ''} /></div>
+        <div class="seg-grid ${c.bar_enabled ? '' : 'off'}">${SEGMENTS.map(segBox).join('')}</div>
       </div>
 
       <div class="section">
-        <div class="sec-head"><span class="sec-title">Numbers (config.toml)</span></div>
+        <div class="sec-head"><span class="sec-title">界面与调试端口</span></div>
         <div class="form-row">
-          <div class="form-label"><span>Context Limit</span><span class="form-hint">默认用后台报告的上限（maxContextTokens）</span></div>
+          <div class="form-label"><span>中文界面</span><span class="form-hint">把 Antigravity 的菜单、按钮等界面文字换成中文，不动对话内容。关闭后要重启窗口才完全恢复英文。词典来自 agy-zh-pack</span></div>
+          <input id="cfg-zh" type="checkbox" ${c.ui_zh ? 'checked' : ''} />
+        </div>
+        <div class="form-hint" id="live-status" style="margin:6px 0 8px;line-height:1.6">…</div>
+        <div class="restart-row">
+          <button id="btn-restart" type="button" class="secondary-btn">以调试模式重启 Antigravity</button>
+          <span id="restart-hint" class="form-hint"></span>
+        </div>
+      </div>
+
+      <div class="section">
+        <div class="sec-head"><span class="sec-title">计算口径 (config.toml)</span></div>
+        <div class="form-row">
+          <div class="form-label"><span>上下文上限</span><span class="form-hint">默认用后台报告的上限（maxContextTokens）</span></div>
           <select id="cfg-ctx-win" class="field-select">
             ${opt(0, '后台报告的上限')}${opt(200000, '200K')}${opt(256000, '256K')}${opt(512000, '512K')}${opt(1000000, '1M')}
           </select>
         </div>
         <div class="form-row">
-          <div class="form-label"><span>Prompt Cache TTL (s)</span><span class="form-hint">Overview 里“缓存热度”的倒计时</span></div>
+          <div class="form-label"><span>Prompt 缓存 TTL（秒）</span><span class="form-hint">Overview 里“缓存热度”的倒计时</span></div>
           <input id="cfg-ttl" type="number" step="30" min="30" class="field-input" value="${c.cache_ttl_sec}" />
         </div>
         <div class="form-row">
-          <div class="form-label"><span>Include Subagents in Totals</span><span class="form-hint">面板 Tokens &amp; Cost 是否计入子代理</span></div>
+          <div class="form-label"><span>总计包含子代理</span><span class="form-hint">面板 Tokens &amp; Cost 是否计入子代理</span></div>
           <input id="cfg-sub" type="checkbox" ${c.include_subagents ? 'checked' : ''} />
         </div>
         <div class="form-hint" style="margin-top:6px">模型单价在 config.toml 的 [[models]] 里改，按顺序匹配“实际模型名 + 显示名”。</div>
-        <div style="margin-top:12px;display:flex;justify-content:flex-end">
-          <button id="btn-save-cfg" type="button" class="primary-btn">Save to config.toml</button>
-        </div>
       </div>
     `;
-    panelSettings.querySelectorAll('input, select').forEach((el) => {
-      el.addEventListener('focus', () => { settingsDirty = true; });
-      el.addEventListener('change', () => { settingsDirty = true; });
-    });
-    panelSettings.querySelector('#btn-save-cfg').addEventListener('click', async () => {
-      const payload = {
-        context_limit_override: Number($('cfg-ctx-win').value) || 0,
-        cache_ttl_sec: Number($('cfg-ttl').value) || 300,
-        include_subagents: $('cfg-sub').checked,
-        bar_enabled: $('cfg-bar-on').checked,
-        bar_show_cost: $('cfg-bar-cost').checked,
-        bar_show_quota: $('cfg-bar-quota').checked,
-        bar_show_subagents: $('cfg-bar-subs').checked,
-      };
-      const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
-      const res = await f('/api/config', { method: 'POST', body: JSON.stringify(payload) });
-      if (res.ok) {
-        settingsDirty = false;
-        lastJson = '';
-        await poll();
-      }
-    });
+    panelSettings.querySelectorAll('input[type=checkbox], select').forEach((el) => el.addEventListener('change', onSettingsChange));
+    $('cfg-ttl').addEventListener('change', onSettingsChange);
+    $('btn-restart').addEventListener('click', onRestart);
     updateLiveStatus();
+  }
+
+  // Two clicks: the first arms the button and says what the restart interrupts.
+  let restartArmed = 0;
+  async function onRestart() {
+    const btn = $('btn-restart');
+    const hint = $('restart-hint');
+    if (!restartArmed) {
+      let running = 0;
+      try { running = (await (await fetch('/api/live-status', { cache: 'no-store' })).json()).running || 0; } catch (e) {}
+      btn.textContent = '确认重启';
+      btn.classList.add('danger');
+      hint.textContent = running ? `${running} 个对话正在运行，重启会中断它们` : '会关闭所有 Antigravity 窗口后重新打开';
+      restartArmed = setTimeout(() => {
+        restartArmed = 0;
+        btn.textContent = '以调试模式重启 Antigravity';
+        btn.classList.remove('danger');
+        hint.textContent = '';
+      }, 6000);
+      return;
+    }
+    clearTimeout(restartArmed);
+    restartArmed = 0;
+    btn.disabled = true;
+    try {
+      const res = await postJson('/api/restart-debug', {});
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || 'HTTP ' + res.status);
+      hint.textContent = '正在退出 Antigravity，稍后自动重新打开…';
+    } catch (e) {
+      btn.disabled = false;
+      btn.textContent = '以调试模式重启 Antigravity';
+      btn.classList.remove('danger');
+      hint.textContent = '重启失败：' + e.message;
+    }
   }
 
   async function updateLiveStatus() {
@@ -300,7 +384,9 @@
     if (!box) return;
     try {
       const j = await (await fetch('/api/live-status', { cache: 'no-store' })).json();
-      box.innerHTML = `CDP: ${esc(j.cdp || '—')}<br>language_server: ${esc(j.ls || '—')}` +
+      const state = j.debug ? '<span class="ok">调试端口已连接，状态栏和中文界面可用</span>'
+        : '<span class="bad">没连上调试端口：状态栏和中文界面需要 Antigravity 以调试模式启动</span>';
+      box.innerHTML = state + `<br>CDP: ${esc(j.cdp || '—')}<br>language_server: ${esc(j.ls || '—')}` +
         (j.panes && j.panes.length ? `<br>showing: ${j.panes.map((x) => esc(String(x).slice(0, 8))).join(', ')}` : '');
     } catch (e) {
       box.textContent = 'live status unavailable';
