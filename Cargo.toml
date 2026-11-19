@@ -1,12 +1,12 @@
 [package]
-name = "agy-ccline"
+name = "agy-statusline"
 version = "0.2.0"
 edition = "2024"
-description = "Pure-Rust CCometixLine telemetry & native Auxiliary Pane sidecar for Google Antigravity"
+description = "Statusline and telemetry side pane for Google Antigravity"
 license = "MIT"
 
 [[bin]]
-name = "agy-ccline"
+name = "agy-statusline"
 path = "src/main.rs"
 
 [dependencies]

@@ -77,7 +77,7 @@ pub fn run(shared: SharedRef) {
                         let (shared, connected, url) = (shared.clone(), connected.clone(), url.to_string());
                         thread::spawn(move || {
                             if let Err(e) = run_page(&id, &url, &ws, &shared) {
-                                eprintln!("[agy-ccline] cdp page {}: {e}", &id[..id.len().min(8)]);
+                                eprintln!("[agy-statusline] cdp page {}: {e}", &id[..id.len().min(8)]);
                             }
                             if let Ok(mut s) = shared.0.lock() {
                                 s.panes.remove(&id);

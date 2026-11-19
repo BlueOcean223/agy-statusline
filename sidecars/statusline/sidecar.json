@@ -1,9 +1,9 @@
 {
   "command": "/bin/sh",
-  "args": ["-c", "exec ../../bin/agy-ccline sidecar"],
+  "args": ["-c", "exec ../../bin/agy-statusline sidecar"],
   "restart_policy": "always",
   "display_name": "Statusline",
-  "description": "CCometixLine-inspired native telemetry & statusline pane for context, cache hit rate, cost, TPS, subagents, and 5h/7d quotas.",
+  "description": "Statusline and telemetry pane for context, cache hit rate, cost, TPS, subagents, and 5h/7d quotas.",
   "has_web_ui": true,
   "agent_permissions": {
     "allows_user_interactions": false

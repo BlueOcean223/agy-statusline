@@ -1,10 +1,10 @@
 /*
- * AGY CometixLine — Native Auxiliary Pane stylesheet.
+ * AGY Statusline — Auxiliary Pane stylesheet.
  *
  * Follows Antigravity's native Aux Pane design language (same token contract as
  * builtin swarm_board): colors come strictly from host CSS variables synced by
  * preload.js (--background, --foreground, --muted-foreground, --border, --primary),
- * while the embedded 2-line CCometixLine strip uses semantic Catppuccin Latte /
+ * while the 2-line status strip uses semantic Catppuccin Latte /
  * Mocha hues adapted automatically to the host's light/dark luminance.
  */
 :root {
@@ -26,7 +26,7 @@
   --field: color-mix(in srgb, var(--fg) 4.5%, transparent);
   --ring: color-mix(in srgb, var(--primary) 65%, transparent);
 
-  /* CCometixLine semantic tokens — Catppuccin Latte in light host */
+  /* Statusline segment colours — Catppuccin Latte in light host */
   --k-model: #5c64d6;
   --k-git: #8839ef;
   --k-context: #04a5e5;
@@ -71,7 +71,7 @@
   --hover: color-mix(in srgb, var(--fg) 6%, transparent);
   --field: color-mix(in srgb, var(--fg) 6.5%, transparent);
 
-  /* CCometixLine semantic tokens — Catppuccin Mocha in dark host */
+  /* Statusline segment colours — Catppuccin Mocha in dark host */
   --k-model: #b4befe;
   --k-git: #cba6f7;
   --k-context: #89dceb;
@@ -109,7 +109,7 @@ button { cursor: pointer; }
 ::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--fg) 18%, transparent); border-radius: 8px; }
 
 /* ------------------------------------------------------------------ */
-/* Sticky Native Header + Flush CCometixLine Strip                     */
+/* Sticky Native Header + Status Strip                     */
 /* ------------------------------------------------------------------ */
 .header {
   position: sticky;
@@ -187,7 +187,7 @@ button { cursor: pointer; }
   75%, 100% { transform: scale(2.6); opacity: 0; }
 }
 
-/* Flush 2-Line CCometixLine Status Strip (zero outer card/border) */
+/* 2-line status strip (no outer card or border) */
 .strip-cap {
   margin-top: 8px;
   padding-top: 6px;
@@ -195,7 +195,7 @@ button { cursor: pointer; }
   font-size: var(--text-2xs);
   color: var(--fg-faint);
 }
-.ccline-strip {
+.status-strip {
   padding: 2px 0 4px;
   font-family: var(--mono);
   font-size: 11.5px;
@@ -476,4 +476,4 @@ button { cursor: pointer; }
 .strip-off { color: var(--fg-faint); font-size: var(--text-xs); padding: 2px 0; }
 
 /* Header strip is drawn by bar.js (same renderer as the bar above the chat input). */
-.ccline-strip.agy-ccline-bar { padding: 2px 0 4px; }
+.status-strip.agy-statusline-bar { padding: 2px 0 4px; }

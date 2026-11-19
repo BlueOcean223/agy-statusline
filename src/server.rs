@@ -331,7 +331,7 @@ pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
     let ui_token = env::var("ANTIGRAVITY_SIDECAR_UI_TOKEN").unwrap_or_default();
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let bound_port = listener.local_addr()?.port();
-    eprintln!("[agy-ccline] listening on 127.0.0.1:{bound_port}");
+    eprintln!("[agy-statusline] listening on 127.0.0.1:{bound_port}");
 
     for incoming in listener.incoming() {
         if let Ok(stream) = incoming {

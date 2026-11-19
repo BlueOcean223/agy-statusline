@@ -1,8 +1,8 @@
 {
   "name": "agy-statusline",
-  "displayName": "AGY CometixLine",
+  "displayName": "AGY Statusline",
   "version": "0.2.0",
-  "description": "Pure-Rust CCometixLine statusline & live telemetry panel for Antigravity: context, compactions, prompt cache hit rate, tokens, cost, TPS, subagents, and 5h/7d quota pace.",
+  "description": "Statusline above the chat input and a live telemetry pane for Antigravity: context, compactions, prompt cache hit rate, tokens, cost, TPS, subagents, and 5h/7d quota pace.",
   "logo": "assets/logo.svg",
   "suggestedPrompts": [
     "打开右侧 Statusline 面板查看当前会话上下文与缓存命中率",

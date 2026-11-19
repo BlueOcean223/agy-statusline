@@ -1,4 +1,4 @@
-// In-page statusline renderer, injected by `agy-ccline sidecar` over CDP.
+// In-page statusline renderer, injected by `agy-statusline sidecar` over CDP.
 // No data logic lives here: the sidecar pushes ready-made numbers with window.__agyBar.update(payload)
 // and polls window.__agyBar.panes() to learn which conversation each chat input belongs to.
 // Re-injecting replaces the previous instance.
@@ -6,7 +6,7 @@
   'use strict';
   if (window.__agyBar) { try { window.__agyBar.destroy(); } catch (e) {} }
 
-  const BAR = 'agy-ccline-bar';
+  const BAR = 'agy-statusline-bar';
   const INPUT = '[data-testid="agent-input-box"]';
   // The main pane's ancestor carries data-cascade-id; a subagent tab keeps it on a nearby sibling.
   // Sidebar rows also carry data-cascade-id, so only these two elements are trusted.
@@ -183,7 +183,7 @@
   };
 
   const build = (paneId, box) => {
-    if (!data) return [line([seg('muted', null, ['waiting for agy-ccline sidecar…'])])];
+    if (!data) return [line([seg('muted', null, ['waiting for agy-statusline sidecar…'])])];
     const o = data.opts || {};
     const sg = o.seg || {};
     const on = (k) => sg[k] !== false;
@@ -214,7 +214,7 @@
           on('cache') ? cacheSeg(s) : null, ...callSegs(s, sg), on('running') || !s.running ? stateSeg(s) : null], 'sub'));
       }
     }
-    if (data.error) lines.push(line([seg('warn', null, [String(data.error).slice(0, 120)], 'agy-ccline sidecar error')]));
+    if (data.error) lines.push(line([seg('warn', null, [String(data.error).slice(0, 120)], 'agy-statusline sidecar error')]));
     return lines.filter(Boolean);
   };
 
@@ -268,8 +268,8 @@
 .${BAR} .cells{display:inline-flex;gap:2px;margin-right:.1em}
 .${BAR} .cells i{display:block;width:5px;height:10px;border-radius:1.5px;background:var(--cell-off)}
 .${BAR} .cells i.on{background:var(--kc)}
-.${BAR} .pulse{width:7px;height:7px;border-radius:50%;background:var(--kc);margin-right:.45em;animation:agyCclPulse 1.2s ease-in-out infinite}
-@keyframes agyCclPulse{0%,100%{opacity:1}50%{opacity:.25}}
+.${BAR} .pulse{width:7px;height:7px;border-radius:50%;background:var(--kc);margin-right:.45em;animation:agyBarPulse 1.2s ease-in-out infinite}
+@keyframes agyBarPulse{0%,100%{opacity:1}50%{opacity:.25}}
 .${BAR} .k-model{--kc:var(--k-model)} .${BAR} .k-context{--kc:var(--k-context)} .${BAR} .k-cache{--kc:var(--k-cache)}
 .${BAR} .k-timing{--kc:var(--k-timing)} .${BAR} .k-tokens{--kc:var(--k-tokens)} .${BAR} .k-quota{--kc:var(--k-quota)}
 .${BAR} .k-git{--kc:var(--k-git)} .${BAR} .k-agent{--kc:var(--k-agent)} .${BAR} .k-cost{--kc:var(--k-cost)} .${BAR} .k-warn{--kc:var(--k-warn)}

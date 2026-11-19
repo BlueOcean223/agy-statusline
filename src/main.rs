@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 use config::{find_app_data_dir, find_plugin_data_dir};
 
 #[derive(Parser)]
-#[command(name = "agy-ccline", version, about = "Pure-Rust CCometixLine plugin & sidecar for Antigravity")]
+#[command(name = "agy-statusline", version, about = "Statusline plugin and sidecar for Antigravity")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Commands>,
@@ -119,7 +119,7 @@ fn main() {
     match cli.command {
         Some(Commands::Sidecar { port }) => {
             if let Err(e) = server::run_server(port) {
-                eprintln!("[agy-ccline] server error: {e}");
+                eprintln!("[agy-statusline] server error: {e}");
                 std::process::exit(1);
             }
         }

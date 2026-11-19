@@ -709,7 +709,7 @@ pub(crate) fn quota_views(group: &Value) -> Vec<QuotaView> {
                 .collect()
         })
         .unwrap_or_default();
-    // 5h first, then weekly, like ccline.
+    // 5h first, then weekly.
     out.sort_by_key(|q| if q.window == "5h" { 0 } else { 1 });
     out
 }

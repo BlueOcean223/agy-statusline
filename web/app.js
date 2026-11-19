@@ -5,7 +5,7 @@
   const convSelect = $('conv-select');
   const livePill = $('live-pill');
   const liveLabel = $('live-label');
-  const stripEl = $('ccline-strip');
+  const stripEl = $('status-strip');
   const turnsCountEl = $('turns-count');
   const panelOverview = $('panel-overview');
   const panelTurns = $('panel-turns');
@@ -111,7 +111,7 @@
     if (!window.__agyBar || !p.bar) return;
     const c = draft || p.config || {};
     if (c.bar_enabled === false) {
-      stripEl.classList.remove('agy-ccline-bar');
+      stripEl.classList.remove('agy-statusline-bar');
       stripEl.innerHTML = '<div class="strip-off">状态栏已关闭</div>';
       return;
     }

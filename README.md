@@ -1,6 +1,6 @@
-# AGY CometixLine (`agy-statusline`)
+# AGY Statusline (`agy-statusline`)
 
-Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行 [CCometixLine](https://github.com/Haleclipse/CCometixLine) 风格的状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)，可选的中文界面直接用它的词典和翻译脚本（MIT，见 `i18n/LICENSE`）。
+Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)，可选的中文界面直接用它的词典和翻译脚本（MIT，见 `i18n/LICENSE`）。
 
 ```
 ✦ Gemini 4 Neon (XHigh) | ⑂ main* · ↑1 · +525 −353 | ◔ 43% · 222k / 512k | ⛁ 212k · 97% hit | $ $21.8 · $43.2 today | ● running
@@ -14,8 +14,8 @@ Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显
 
 | 部分 | 做什么 |
 |---|---|
-| `agy-ccline sidecar` | 由 `sidecars/statusline/sidecar.json` 拉起、Antigravity 负责重启。里面三件事：live 引擎调 language_server 只读 API 取数；CDP 画师把渲染脚本注入主窗口并推数据；HTTP 服务提供右侧面板 |
-| `agy-ccline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms） |
+| `agy-statusline sidecar` | 由 `sidecars/statusline/sidecar.json` 拉起、Antigravity 负责重启。里面三件事：live 引擎调 language_server 只读 API 取数；CDP 画师把渲染脚本注入主窗口并推数据；HTTP 服务提供右侧面板 |
+| `agy-statusline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms） |
 | `web/bar.js` | 注入页面的纯渲染脚本：找输入框、回报对话 ID、画状态栏。没有任何取数逻辑 |
 | `web/index.html` 等 | 右侧面板（Overview / Turns / Settings），数据来自 `/api/panel`，顶部状态条也由 `bar.js` 绘制 |
 
@@ -59,14 +59,14 @@ open -a Antigravity --args --remote-debugging-port=0
 ## 开发
 
 ```bash
-cargo build --release && cp target/release/agy-ccline bin/.new && mv -f bin/.new bin/agy-ccline
+cargo build --release && cp target/release/agy-statusline bin/.new && mv -f bin/.new bin/agy-statusline
 ```
 
-替换后结束旧的 sidecar 进程（`pkill -f 'agy-ccline sidecar'`），Antigravity 会用新二进制重新拉起。
+替换后结束旧的 sidecar 进程（`pkill -f 'agy-statusline sidecar'`），Antigravity 会用新二进制重新拉起。
 
-- `agy-ccline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
-- `AGY_DEVTOOLS_PORT_FILE=<path> agy-ccline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
-- `agy-ccline status [-c 对话ID]`：终端里的两行预览，默认取最近看过的对话。
+- `agy-statusline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
+- `AGY_DEVTOOLS_PORT_FILE=<path> agy-statusline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
+- `agy-statusline status [-c 对话ID]`：终端里的两行预览，默认取最近看过的对话。
 
 ## 已知限制
 
