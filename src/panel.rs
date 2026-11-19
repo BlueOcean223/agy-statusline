@@ -2,7 +2,7 @@
 
 use crate::config::Config;
 use crate::live::{Call, Engine, call_cost, local_midnight_ms, now_ms};
-use crate::transcript::read_annotation;
+use crate::transcript::{annotated_ids, read_annotation};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -10,17 +10,23 @@ const SERIES_LEN: usize = 40;
 const RECENT_LEN: usize = 15;
 
 impl Engine {
-    /// Root conversation the user looked at most recently (annotation view time, else last modified).
-    fn auto_conversation(&self) -> Option<String> {
-        self.summaries
-            .iter()
-            .filter(|(_, s)| s.root.is_none())
-            .map(|(id, s)| {
-                let viewed = read_annotation(&self.app_data, id).map(|a| a.viewed_ms).unwrap_or(0);
-                (viewed.max(s.modified_ms), id)
+    /// Top-level conversations, most recently viewed or modified first. Includes conversations the
+    /// language_server hasn't loaded yet (found through their annotation files).
+    fn top_level_recent(&self) -> Vec<String> {
+        let mut ids: HashSet<String> = annotated_ids(&self.app_data).into_iter().collect();
+        ids.extend(self.summaries.iter().filter(|(_, s)| s.root.is_none()).map(|(id, _)| id.clone()));
+        let mut scored: Vec<(i64, String)> = ids
+            .into_iter()
+            .filter(|id| self.summaries.get(id).is_none_or(|s| s.root.is_none()))
+            .map(|id| {
+                let viewed = read_annotation(&self.app_data, &id).map(|a| a.viewed_ms).unwrap_or(0);
+                let modified = self.summaries.get(&id).map(|s| s.modified_ms).unwrap_or(0);
+                let disk = self.disk.get(&id).copied().unwrap_or(0);
+                (viewed.max(modified).max(disk), id)
             })
-            .max()
-            .map(|(_, id)| id.clone())
+            .collect();
+        scored.sort_by(|a, b| b.cmp(a));
+        scored.into_iter().map(|(_, id)| id).collect()
     }
 
     /// Makes sure `id` and its subagents are loaded, for a panel request between engine ticks.
@@ -38,7 +44,7 @@ impl Engine {
     pub fn panel(&mut self, requested: Option<&str>, cfg: &Config) -> Value {
         let id = match requested.filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
-            None => match self.auto_conversation() {
+            None => match self.top_level_recent().into_iter().next() {
                 Some(id) => id,
                 None => return json!({ "id": null }),
             },
@@ -167,16 +173,9 @@ impl Engine {
             })
             .collect();
 
-        let mut recent_convs: Vec<(i64, String)> = self
-            .summaries
-            .iter()
-            .filter(|(_, s)| s.root.is_none())
-            .map(|(cid, s)| (s.modified_ms, cid.clone()))
-            .collect();
-        recent_convs.sort_by(|a, b| b.cmp(a));
         let mut listed: HashSet<String> = HashSet::new();
         let recent: Vec<Value> = std::iter::once(id.clone())
-            .chain(recent_convs.into_iter().map(|(_, cid)| cid))
+            .chain(self.top_level_recent())
             .filter(|cid| listed.insert(cid.clone()))
             .take(RECENT_LEN + 1)
             .map(|cid| json!({ "id": cid, "title": self.title(&cid) }))

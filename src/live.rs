@@ -207,6 +207,9 @@ pub struct Engine {
     pub(crate) quota: Value,
     pub(crate) quota_at: Option<Instant>,
     pub(crate) summaries_at: Option<Instant>,
+    /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
+    pub(crate) disk: HashMap<String, i64>,
+    disk_at: Option<Instant>,
     pub last_error: Option<String>,
 }
 
@@ -223,6 +226,8 @@ impl Engine {
             quota: Value::Null,
             quota_at: None,
             summaries_at: None,
+            disk: HashMap::new(),
+            disk_at: None,
             last_error: None,
         }
     }
@@ -348,10 +353,19 @@ impl Engine {
 
         // Which conversations need (re)loading: everything touched today (for today's cost),
         // the panes on screen and their subagents.
+        if self.disk_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(30)) {
+            self.disk = crate::transcript::scan_brain(&self.app_data);
+            self.disk_at = Some(Instant::now());
+        }
         let midnight = local_midnight_ms();
         let mut want: HashSet<String> = HashSet::new();
         for (id, s) in &self.summaries {
             if s.modified_ms >= midnight {
+                want.insert(id.clone());
+            }
+        }
+        for (id, mtime) in &self.disk {
+            if *mtime >= midnight {
                 want.insert(id.clone());
             }
         }

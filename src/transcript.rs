@@ -105,6 +105,41 @@ fn describe_tool_call(tc: &Value) -> String {
     name.to_string()
 }
 
+fn is_uuid(s: &str) -> bool {
+    s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
+}
+
+/// Conversations on disk with their transcript mtime. After Antigravity restarts, the
+/// language_server only lists conversations it has loaded, so this is how older ones are found;
+/// querying a conversation's metadata loads it.
+pub fn scan_brain(app_data: &Path) -> HashMap<String, i64> {
+    let mut out = HashMap::new();
+    let Ok(rd) = fs::read_dir(app_data.join("brain")) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if !is_uuid(&name) {
+            continue;
+        }
+        let mtime = fs::metadata(e.path().join(".system_generated/logs/transcript.jsonl"))
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        out.insert(name, mtime);
+    }
+    out
+}
+
+/// Top-level conversations that have an annotation file (subagents don't get one).
+pub fn annotated_ids(app_data: &Path) -> Vec<String> {
+    let Ok(rd) = fs::read_dir(app_data.join("annotations")) else { return Vec::new() };
+    rd.flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".pbtxt").map(str::to_string))
+        .filter(|n| is_uuid(n))
+        .collect()
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Annotation {
     pub title: String,
