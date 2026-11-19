@@ -66,4 +66,4 @@ cargo build --release && cp target/release/agy-ccline bin/.new && mv -f bin/.new
 ## 已知限制
 
 - 压缩次数（`checkpointIndex` 前进或上下文估算骤降）没有在真正被压缩过的对话上验证过。
-- 输入框和对话 ID 的 DOM 选择器沿用 agy-zh-pack（Windows 版验证过），macOS 真实窗口里尚未验证。
+- 子代理标签页（`subagent-tab-conversation`）的选择器沿用 agy-zh-pack，macOS 上还没在真实窗口里验证；主对话和首页已验证。

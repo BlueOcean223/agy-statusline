@@ -75,8 +75,8 @@
    PostToolUse    │      │     RetrieveUserQuotaSummary    5h / 每周额度（3 分钟，Stop 后立刻）
    Stop          ─┘      │
    (≤10ms, 不等回应)      │  ② CDP 画师：读 DevToolsActivePort，连主窗口
-                         │     注入 web/bar.js，addBinding(__agyBarHost)
-                         │     页面 ──binding──▶ “我这里显示的是对话 X”
+                         │     注入 web/bar.js（addScriptToEvaluateOnNewDocument + 立即执行一次）
+                         │     每秒读 __agyBar.panes()：“我这里显示的是对话 X，手上有没有数据”
                          │     sidecar ──Runtime.evaluate──▶ __agyBar.update({...})
                          │
                          │  ③ 侧栏面板：/api/panel 由同一个引擎出数，顶部状态条也用 bar.js 画
@@ -103,6 +103,8 @@
 
   <h2>还要你决定或注意的</h2>
   <ul>
+    <li><strong>重启后的对话</strong>：Antigravity 重启后 language_server 只列出已加载的对话。sidecar 每 30 秒扫一遍 <code>brain/</code>，今天动过的对话主动查一次（查询会让后台加载它）；面板的“自动跟随”和最近对话列表按 <code>annotations/</code> 的最后查看时间排。</li>
+    <li><strong>为什么轮询而不用 binding</strong>：<code>Runtime.addBinding</code> 绑定在添加它的 CDP 会话上。sidecar 升级或被重启后，旧进程注入的页面还在调用已失效的 binding，新进程收不到。</li>
     <li><strong>调试端口</strong>：2.33.0 起只有带 <code>--remote-debugging-port</code> 启动才有。开了以后本机任何进程都能通过它控制 Antigravity 窗口。</li>
     <li>单价是公开 API 标准价折算，不是订阅实际扣费。</li>
   </ul>
