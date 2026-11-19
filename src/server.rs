@@ -225,6 +225,8 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                             "pages": s.pages.len(),
                             "panes": s.panes.values().flatten().collect::<Vec<_>>(),
                             "rev": s.rev,
+                            "running": s.running,
+                            "debug": !s.pages.is_empty(),
                         })
                     });
                     s.unwrap_or_else(|_| json!({}))
@@ -244,6 +246,13 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             let out = serde_json::to_vec(&json!({ "ok": true, "config": cfg })).unwrap_or_default();
             send_response(stream, 200, "application/json", &out);
         }
+        ("POST", "/api/restart-debug") => match restart_debug() {
+            Ok(()) => send_response(stream, 200, "application/json", br#"{"ok":true}"#),
+            Err(e) => {
+                let out = serde_json::to_vec(&json!({ "ok": false, "error": e })).unwrap_or_default();
+                send_response(stream, 500, "application/json", &out);
+            }
+        },
         ("POST", "/_sidecar/get-conversation-metadata") => {
             let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
             let cid = payload
@@ -262,6 +271,40 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             send_response(stream, 404, "text/plain; charset=utf-8", b"Not Found");
         }
     }
+}
+
+/// Quits Antigravity and reopens it with `--remote-debugging-port=0`. The script runs in its own
+/// process group so it outlives this sidecar, which Antigravity stops when it quits.
+#[cfg(target_os = "macos")]
+fn restart_debug() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    const SCRIPT: &str = r#"
+sleep 1
+osascript -e 'tell application "Antigravity" to quit'
+i=0
+while pgrep -xq Antigravity; do
+  i=$((i+1))
+  [ "$i" -ge 120 ] && exit 1
+  sleep 0.5
+done
+sleep 1
+open -a Antigravity --args --remote-debugging-port=0
+"#;
+    std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(SCRIPT)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("spawn restart script: {e}"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn restart_debug() -> Result<(), String> {
+    Err("restart is only implemented on macOS; relaunch Antigravity with --remote-debugging-port=0".into())
 }
 
 static LIVE: std::sync::OnceLock<crate::live::SharedRef> = std::sync::OnceLock::new();
