@@ -12,6 +12,7 @@
 
 use crate::config::{Config, ModelRule, find_app_data_dir, find_plugin_data_dir, load_config, write_atomic};
 use crate::ls::LsClient;
+use crate::git::GitInfo;
 use crate::transcript::Transcript;
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -141,6 +142,7 @@ pub struct Summary {
     pub sub_role: Option<String>,
     pub workspace: Option<String>,
     pub branch: Option<String>,
+    pub workspace_path: Option<String>,
 }
 
 impl Summary {
@@ -178,6 +180,10 @@ pub struct Shared {
     pub ls_status: String,
     /// Hook datagrams received since the engine last looked: (event, conversation id).
     pub hook_events: Vec<(String, String)>,
+    /// Mirrors `config.ui_zh` for the CDP threads.
+    pub ui_zh: bool,
+    /// Conversations currently running, for the restart button's warning.
+    pub running: usize,
     /// Conversations the side panel asked about, with the time of its last poll.
     pub panel: HashMap<String, Instant>,
     pub wake: bool,
@@ -210,6 +216,8 @@ pub struct Engine {
     /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
     pub(crate) disk: HashMap<String, i64>,
     disk_at: Option<Instant>,
+    /// Workspace path → (when read, git status).
+    git: HashMap<String, (Instant, Option<GitInfo>)>,
     pub last_error: Option<String>,
 }
 
@@ -228,6 +236,7 @@ impl Engine {
             summaries_at: None,
             disk: HashMap::new(),
             disk_at: None,
+            git: HashMap::new(),
             last_error: None,
         }
     }
@@ -265,6 +274,9 @@ impl Engine {
                     .or_else(|| s["workspaces"][0]["workspaceFolderAbsoluteUri"].as_str().and_then(|u| u.rsplit('/').next()))
                     .map(str::to_string),
                 branch: s["workspaces"][0]["branchName"].as_str().map(str::to_string),
+                workspace_path: s["workspaces"][0]["workspaceFolderAbsoluteUri"]
+                    .as_str()
+                    .and_then(crate::git::uri_to_path),
             };
             if let Some(prev) = self.summaries.get(id) {
                 if prev.step_count != next.step_count || prev.status != next.status {
@@ -400,6 +412,16 @@ impl Engine {
             self.dirty.remove(&id);
         }
         self.last_error = errors.into_iter().next();
+
+        // Git status for the workspaces on screen, at most every 5s per workspace.
+        let paths: HashSet<String> =
+            panes.iter().filter_map(|id| self.summaries.get(id)?.workspace_path.clone()).collect();
+        for path in paths {
+            if self.git.get(&path).is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(5)) {
+                let info = crate::git::read(&path);
+                self.git.insert(path, (Instant::now(), info));
+            }
+        }
     }
 
     pub fn root_of(&self, id: &str) -> String {
@@ -495,9 +517,7 @@ impl Engine {
             "views": views,
             "opts": {
                 "enabled": cfg.bar_enabled,
-                "cost": cfg.bar_show_cost,
-                "subagents": cfg.bar_show_subagents,
-                "quota": cfg.bar_show_quota,
+                "seg": cfg.bar_segments,
             },
             "error": self.last_error,
         })
@@ -593,7 +613,14 @@ impl Engine {
             }
         }
 
+        let summary = self.summaries.get(id);
+        let git = summary
+            .and_then(|s| s.workspace_path.as_ref())
+            .and_then(|p| self.git.get(p))
+            .and_then(|(_, g)| g.clone());
         View {
+            git,
+            workspace: summary.and_then(|s| s.workspace_path.clone()),
             main,
             is_sub,
             cost_conv,
@@ -640,6 +667,8 @@ pub struct View {
     pub price_name: Option<String>,
     pub quota: Vec<QuotaView>,
     pub subs: Vec<AgentLine>,
+    pub git: Option<GitInfo>,
+    pub workspace: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -747,6 +776,12 @@ pub fn run(shared: SharedRef) {
             }
             let cfg = load_config(&plugin_data);
             eng.tick(&interest);
+            let running = eng.summaries.values().filter(|s| s.active()).count();
+            let ui_zh = cfg.ui_zh;
+            set_status(&shared, |s| {
+                s.ui_zh = ui_zh;
+                s.running = running;
+            });
             let payload = eng.build_payload(&panes, &cfg).to_string();
             if payload != last_payload {
                 last_payload = payload.clone();

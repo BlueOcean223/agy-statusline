@@ -39,10 +39,47 @@ pub struct Config {
     pub include_subagents: bool,
     /// In-page statusline above the chat input (drawn over CDP).
     pub bar_enabled: bool,
-    pub bar_show_cost: bool,
-    pub bar_show_subagents: bool,
-    pub bar_show_quota: bool,
+    pub bar_segments: BarSegments,
+    /// Translate Antigravity's UI to Chinese (i18n/, from agy-zh-pack).
+    pub ui_zh: bool,
     pub models: Vec<ModelRule>,
+}
+
+/// Which parts of the statusline to show (in-page bar and the panel preview).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BarSegments {
+    pub model: bool,
+    pub git: bool,
+    pub context: bool,
+    pub cache: bool,
+    pub cost: bool,
+    pub today: bool,
+    pub ttft: bool,
+    pub speed: bool,
+    pub quota_5h: bool,
+    pub quota_7d: bool,
+    pub running: bool,
+    pub subagents: bool,
+}
+
+impl Default for BarSegments {
+    fn default() -> Self {
+        Self {
+            model: true,
+            git: true,
+            context: true,
+            cache: true,
+            cost: true,
+            today: true,
+            ttft: true,
+            speed: true,
+            quota_5h: true,
+            quota_7d: true,
+            running: true,
+            subagents: true,
+        }
+    }
 }
 
 impl Default for Config {
@@ -52,9 +89,8 @@ impl Default for Config {
             cache_ttl_sec: 300,
             include_subagents: true,
             bar_enabled: true,
-            bar_show_cost: true,
-            bar_show_subagents: true,
-            bar_show_quota: true,
+            bar_segments: BarSegments::default(),
+            ui_zh: false,
             models: default_model_rules(),
         }
     }
@@ -66,9 +102,8 @@ pub struct ConfigPatch {
     pub cache_ttl_sec: Option<u64>,
     pub include_subagents: Option<bool>,
     pub bar_enabled: Option<bool>,
-    pub bar_show_cost: Option<bool>,
-    pub bar_show_subagents: Option<bool>,
-    pub bar_show_quota: Option<bool>,
+    pub bar_segments: Option<BarSegments>,
+    pub ui_zh: Option<bool>,
 }
 
 pub fn default_model_rules() -> Vec<ModelRule> {
@@ -184,14 +219,11 @@ pub fn apply_config_patch(plugin_data: &Path, patch: ConfigPatch) -> Config {
     if let Some(v) = patch.bar_enabled {
         cfg.bar_enabled = v;
     }
-    if let Some(v) = patch.bar_show_cost {
-        cfg.bar_show_cost = v;
+    if let Some(v) = patch.bar_segments {
+        cfg.bar_segments = v;
     }
-    if let Some(v) = patch.bar_show_subagents {
-        cfg.bar_show_subagents = v;
-    }
-    if let Some(v) = patch.bar_show_quota {
-        cfg.bar_show_quota = v;
+    if let Some(v) = patch.ui_zh {
+        cfg.ui_zh = v;
     }
     let path = plugin_data.join("config.toml");
     if let Ok(toml_str) = toml::to_string_pretty(&cfg) {

@@ -1,5 +1,6 @@
 mod cdp;
 mod config;
+mod git;
 mod hook;
 mod http;
 mod live;

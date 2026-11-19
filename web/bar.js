@@ -48,6 +48,7 @@
     ttft: '<path d="M6 2h12v5l-4 5 4 5v5H6v-5l4-5-4-5zm2 2v2.3l4 5 4-5V4z"/>',
     speed: '<path d="M13 2L4 14h7l-1 8 9-12h-7z"/>',
     agent: '<path d="M9 2h6v3h3a2 2 0 012 2v11a2 2 0 01-2 2H6a2 2 0 01-2-2V7a2 2 0 012-2h3zm0 8a1.5 1.5 0 100 3 1.5 1.5 0 000-3zm6 0a1.5 1.5 0 100 3 1.5 1.5 0 000-3z"/>',
+    git: '<path d="M6 3a3 3 0 011 5.83v6.34A3 3 0 115 15.17V8.83A3 3 0 016 3zm12 3a3 3 0 01-1.02 5.83A6 6 0 0111 17h-.17a3 3 0 110-2H11a4 4 0 004-3.83A3 3 0 0118 6z"/>',
     done: '<path d="M9 16.2l-4.2-4.2L3.4 13.4 9 19 21 7l-1.4-1.4z"/>',
     cost: '<circle cx="12" cy="12" r="10"/><text x="12" y="16.5" text-anchor="middle" font-size="13" font-weight="700" font-family="Arial,sans-serif" fill="var(--bg-cut)">$</text>',
   };
@@ -100,10 +101,10 @@
   };
   const cacheSeg = (a) => (a.cacheHit == null ? null
     : seg('cache', icon('cache'), [fmtTok(a.cacheRead), pct(a.cacheHit) + ' hit'], 'Last call: tokens read from prompt cache · share of the prompt'));
-  const callSegs = (a) => {
+  const callSegs = (a, sg) => {
     const out = [];
-    if (a.ttftMs != null) out.push(seg('timing', icon('ttft'), [(a.ttftMs / 1000).toFixed(1) + 's'], 'Last call: time to first token'));
-    if (a.tps != null) out.push(seg('tokens', icon('speed'), [Math.round(a.tps) + ' tok/s'], 'Last call: output tokens / streaming time (' + fmtTok(a.outTokens) + ' tokens)'));
+    if (a.ttftMs != null && sg.ttft !== false) out.push(seg('timing', icon('ttft'), [(a.ttftMs / 1000).toFixed(1) + 's'], 'Last call: time to first token'));
+    if (a.tps != null && sg.speed !== false) out.push(seg('tokens', icon('speed'), [Math.round(a.tps) + ' tok/s'], 'Last call: output tokens / streaming time (' + fmtTok(a.outTokens) + ' tokens)'));
     return out;
   };
   const runSeg = () => {
@@ -111,8 +112,8 @@
     s.append(el('span', 'pulse'), el('span', '', 'running'));
     return s;
   };
-  const costSeg = (v, today) => {
-    const parts = [fmtUsd(v.costConv)];
+  const costSeg = (v, today, showConv) => {
+    const parts = [showConv ? fmtUsd(v.costConv) : null];
     if (today != null) parts.push(dim(fmtUsd(today) + ' today'));
     let title = 'Estimated at public API list prices (not what the subscription charges)\nThis conversation incl. subagents: ' + fmtUsd(v.costConv);
     if (v.costLast) {
@@ -121,6 +122,18 @@
     if (v.priceName) title += '\nPriced as ' + v.priceName;
     return seg('cost', icon('cost'), parts, title);
   };
+  const gitSeg = (g, path) => {
+    if (!g || !g.branch) return null;
+    const parts = [g.branch + (g.dirty ? '*' : '')];
+    if (g.ahead || g.behind) parts.push((g.ahead ? '↑' + g.ahead : '') + (g.behind ? '↓' + g.behind : ''));
+    if (g.added || g.deleted) parts.push(dim('+' + g.added + ' −' + g.deleted));
+    const title = 'Git: ' + (path || '') + (g.dirty ? '\nUncommitted changes' : '') +
+      (g.ahead || g.behind ? '\nAhead ' + g.ahead + ' · behind ' + g.behind + ' of upstream' : '') +
+      (g.added || g.deleted ? '\nLines vs HEAD: +' + g.added + ' −' + g.deleted : '');
+    return seg('git', icon('git'), parts, title);
+  };
+  // Hides the 5h or weekly bucket when its segment is switched off.
+  const quotaOn = (seg) => (q) => (q.window === '5h' ? seg.quota_5h !== false : q.window === 'weekly' ? seg.quota_7d !== false : true);
   const quotaSegs = (qs) => (qs || []).map((q) => {
     const key = q.used >= 0.9 ? 'crit' : q.used >= 0.7 ? 'warn' : 'quota';
     const parts = [cells(q.used), pct(q.used), fmtReset(q.resetMs)];
@@ -147,15 +160,16 @@
   };
 
   // ---------------------------------------------------------------- build
-  const selectedModel = () => {
-    const t = document.querySelector('[data-testid="model-selector-trigger"]');
+  // The model picker inside this input box; with two panes side by side each box has its own.
+  const selectedModel = (box) => {
+    const t = (box && box.querySelector('[data-testid="model-selector-trigger"]')) ||
+      document.querySelector('[data-testid="model-selector-trigger"]');
     return t ? t.textContent.trim() : '';
   };
   // The selector reads e.g. "Gemini 4 Neon Extra" (model + effort); a group lists
   // "Models within this group: Gemini 4 Neon, Gemini 4 Carbon, …". Match the longest listed name it starts with.
-  const homeQuota = () => {
+  const homeQuota = (sel) => {
     const groups = (data && data.quotaGroups) || [];
-    const sel = selectedModel();
     let best = null;
     let bestLen = 0;
     for (const g of groups) {
@@ -168,28 +182,36 @@
     return g ? g.buckets : [];
   };
 
-  const build = (paneId) => {
+  const build = (paneId, box) => {
     if (!data) return [line([seg('muted', null, ['waiting for agy-ccline sidecar…'])])];
     const o = data.opts || {};
+    const sg = o.seg || {};
+    const on = (k) => sg[k] !== false;
     const v = paneId && data.views ? data.views[paneId] : null;
+    const git = v && on('git') ? gitSeg(v.git, v.workspace) : null;
     if (!v || !v.main || !v.main.calls) {
       const items = [];
-      const m = selectedModel();
-      if (m) items.push(seg('model', icon('model'), [m]));
-      if (v && v.main && v.main.running) items.push(runSeg());
-      if (o.quota !== false) items.push(...quotaSegs(homeQuota()));
-      if (o.cost !== false && data.today) items.push(seg('cost', icon('cost'), [dim(fmtUsd(data.today) + ' today')]));
+      const m = selectedModel(box);
+      if (m && on('model')) items.push(seg('model', icon('model'), [m]));
+      items.push(git);
+      if (v && v.main && v.main.running && on('running')) items.push(runSeg());
+      items.push(...quotaSegs(homeQuota(m).filter(quotaOn(sg))));
+      if (on('today') && data.today) items.push(seg('cost', icon('cost'), [dim(fmtUsd(data.today) + ' today')]));
       return [line(items)].filter(Boolean);
     }
     const a = v.main;
-    const l1 = [v.isSub ? agentSeg(a) : null, modelSeg(a), ctxSeg(a), cacheSeg(a),
-      o.cost !== false ? costSeg(v, v.isSub ? null : data.today) : null, a.running ? runSeg() : null];
-    const l2 = [...callSegs(a), ...(o.quota !== false ? quotaSegs(v.quota) : [])];
+    const showToday = on('today') && !v.isSub;
+    const l1 = [v.isSub ? agentSeg(a) : null, on('model') ? modelSeg(a) : null, git,
+      on('context') ? ctxSeg(a) : null, on('cache') ? cacheSeg(a) : null,
+      on('cost') || showToday ? costSeg(v, showToday ? data.today : null, on('cost')) : null,
+      a.running && on('running') ? runSeg() : null];
+    const l2 = [...callSegs(a, sg), ...quotaSegs((v.quota || []).filter(quotaOn(sg)))];
     const lines = [line(l1), line(l2)];
-    if (o.subagents !== false) {
+    if (on('subagents')) {
       for (const s of v.subs || []) {
         if (s.id.startsWith('+')) { lines.push(line([seg('muted', null, [s.id + ' more subagents'])], 'sub')); continue; }
-        lines.push(line([agentSeg(s), modelSeg(s), ctxSeg(s), cacheSeg(s), ...callSegs(s), stateSeg(s)], 'sub'));
+        lines.push(line([agentSeg(s), on('model') ? modelSeg(s) : null, on('context') ? ctxSeg(s) : null,
+          on('cache') ? cacheSeg(s) : null, ...callSegs(s, sg), on('running') || !s.running ? stateSeg(s) : null], 'sub'));
       }
     }
     if (data.error) lines.push(line([seg('warn', null, [String(data.error).slice(0, 120)], 'agy-ccline sidecar error')]));
@@ -205,6 +227,8 @@
       const d = e.querySelector('[data-testid="subagent-tab-conversation"][data-cascade-id]');
       if (d) return d.getAttribute('data-cascade-id');
     }
+    // The URL names the conversation only when one pane is open; with more it can't say which box it is.
+    if (document.querySelectorAll(INPUT).length !== 1) return null;
     const m = UUID.exec(location.pathname);
     return m ? m[1] : null;
   };
@@ -220,13 +244,13 @@
   style.id = BAR + '-style';
   style.textContent = `
 .${BAR}{--k-model:#5c64d6;--k-context:#8839ef;--k-cache:#1b8fbf;--k-timing:#c4566a;--k-tokens:#158a90;
- --k-quota:#e0620d;--k-warn:#c9800f;--k-crit:#d20f39;--k-run:#40a02b;--k-muted:#8c8fa1;--k-agent:#df8e1d;--k-cost:#c03d8e;
+ --k-quota:#e0620d;--k-warn:#c9800f;--k-crit:#d20f39;--k-run:#40a02b;--k-muted:#8c8fa1;--k-agent:#df8e1d;--k-cost:#c03d8e;--k-git:#3f8f5a;
  --sep:#c9c6bc;--cell-off:#e6e2d8;--bg-cut:#fff;
  display:flex;flex-direction:column;gap:1px;padding:0 .9rem .35rem;
  font-family:"Google Sans Code","JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,"PingFang SC",monospace;
  font-size:12px;line-height:1.65;font-weight:500;font-variant-numeric:tabular-nums;color:var(--k-muted);cursor:default;user-select:text}
 .${BAR}.dark{--k-model:#b4befe;--k-context:#cba6f7;--k-cache:#89dceb;--k-timing:#f2cdcd;--k-tokens:#94e2d5;
- --k-quota:#fab387;--k-warn:#f9e2af;--k-crit:#f38ba8;--k-run:#a6e3a1;--k-muted:#7f849c;--k-agent:#f9e2af;--k-cost:#f5c2e7;
+ --k-quota:#fab387;--k-warn:#f9e2af;--k-crit:#f38ba8;--k-run:#a6e3a1;--k-muted:#7f849c;--k-agent:#f9e2af;--k-cost:#f5c2e7;--k-git:#a6d189;
  --sep:#585b70;--cell-off:#45475a;--bg-cut:#1e1e2e}
 .${BAR}[hidden]{display:none}
 .${BAR} .ln{display:flex;flex-wrap:wrap;align-items:center;row-gap:1px;margin-left:-1.6em;clip-path:inset(-6px -6px -6px 1.6em)}
@@ -248,7 +272,7 @@
 @keyframes agyCclPulse{0%,100%{opacity:1}50%{opacity:.25}}
 .${BAR} .k-model{--kc:var(--k-model)} .${BAR} .k-context{--kc:var(--k-context)} .${BAR} .k-cache{--kc:var(--k-cache)}
 .${BAR} .k-timing{--kc:var(--k-timing)} .${BAR} .k-tokens{--kc:var(--k-tokens)} .${BAR} .k-quota{--kc:var(--k-quota)}
-.${BAR} .k-agent{--kc:var(--k-agent)} .${BAR} .k-cost{--kc:var(--k-cost)} .${BAR} .k-warn{--kc:var(--k-warn)}
+.${BAR} .k-git{--kc:var(--k-git)} .${BAR} .k-agent{--kc:var(--k-agent)} .${BAR} .k-cost{--kc:var(--k-cost)} .${BAR} .k-warn{--kc:var(--k-warn)}
 .${BAR} .k-crit{--kc:var(--k-crit)} .${BAR} .k-run{--kc:var(--k-run)} .${BAR} .k-muted{--kc:var(--k-muted)}
 `;
 
@@ -260,7 +284,7 @@
       box.parentElement.insertBefore(bar, box);
       bar._fresh = true;
     }
-    return { bar, id: paneId(box) };
+    return { bar, box, id: paneId(box) };
   });
 
   const render = (force) => {
@@ -270,13 +294,13 @@
     const enabled = !data || !data.opts || data.opts.enabled !== false;
     const list = bars();
     paneIds = [...new Set(list.map((x) => x.id).filter(Boolean))].sort();
-    for (const { bar, id } of list) {
+    for (const { bar, box, id } of list) {
       bar.hidden = !enabled;
       bar.classList.toggle('dark', dark);
       if (!force && !bar._fresh && bar._for === id) continue;
       bar._fresh = false;
       bar._for = id;
-      bar.replaceChildren(...build(id));
+      bar.replaceChildren(...build(id, box));
     }
   };
 
