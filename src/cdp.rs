@@ -19,6 +19,15 @@ use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 
 const BAR_JS: &str = include_str!("../web/bar.js");
+// Chinese UI from agy-zh-pack (MIT, see i18n/LICENSE): a translator that rewrites text nodes
+// found in the dictionary or matching a rule, and skips conversation content.
+const I18N_TRANSLATOR: &str = include_str!("../i18n/translator.js");
+const I18N_DICT: &str = include_str!("../i18n/zh-CN.json");
+const I18N_RULES: &str = include_str!("../i18n/zh-CN.rules.json");
+
+fn i18n_source() -> String {
+    format!("try {{ ({I18N_TRANSLATOR})({I18N_DICT}, {I18N_RULES}); }} catch (e) {{ console.warn('agy i18n', e); }}")
+}
 const POLL_EVERY: Duration = Duration::from_millis(1000);
 
 fn devtools_port_file() -> Option<PathBuf> {
@@ -132,6 +141,11 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
     // restarts, a page injected by the previous process would keep calling a dead binding.
     let mut pushed_rev = 0u64;
     let mut poll_id: Option<u64> = None;
+    // Chinese UI: whether it is applied, and the id of its registered new-document script.
+    // None on attach, so a page left translated by an earlier sidecar run is also switched off.
+    let mut zh_applied: Option<bool> = None;
+    let mut zh_add_id: Option<u64> = None;
+    let mut zh_script: Option<String> = None;
     let mut polled_at = Instant::now() - POLL_EVERY;
     loop {
         if poll_id.is_none() && polled_at.elapsed() >= POLL_EVERY {
@@ -146,6 +160,10 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
         match page.ws.read() {
             Ok(Message::Text(t)) => {
                 let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
+                if zh_add_id.is_some() && v["id"].as_u64() == zh_add_id {
+                    zh_add_id = None;
+                    zh_script = v["result"]["identifier"].as_str().map(str::to_string);
+                }
                 if poll_id.is_some() && v["id"].as_u64() == poll_id {
                     poll_id = None;
                     let r = &v["result"]["result"]["value"];
@@ -172,10 +190,25 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
             Err(e) => return Err(e.to_string()),
         }
 
-        let (rev, payload) = match shared.0.lock() {
-            Ok(s) => (s.rev, if s.rev != pushed_rev { s.payload.clone() } else { String::new() }),
+        let (rev, payload, want_zh) = match shared.0.lock() {
+            Ok(s) => (s.rev, if s.rev != pushed_rev { s.payload.clone() } else { String::new() }, s.ui_zh),
             Err(_) => return Err("state poisoned".into()),
         };
+        if zh_applied != Some(want_zh) && zh_add_id.is_none() {
+            if want_zh {
+                let src = i18n_source();
+                page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": src }))?;
+                zh_add_id = Some(page.seq);
+                page.send("Runtime.evaluate", json!({ "expression": src }))?;
+            } else {
+                if let Some(sid) = zh_script.take() {
+                    page.send("Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": sid }))?;
+                }
+                // Stops translating new text; text already translated stays until the window reloads.
+                page.send("Runtime.evaluate", json!({ "expression": "window.__agyI18n && window.__agyI18n.disable()" }))?;
+            }
+            zh_applied = Some(want_zh);
+        }
         if rev != pushed_rev && !payload.is_empty() {
             page.push(&payload)?;
             pushed_rev = rev;
