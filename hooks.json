@@ -1,0 +1,45 @@
+{
+  "agy-ccline-telemetry": {
+    "enabled": true,
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "exec ./bin/agy-ccline hook",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "exec ./bin/agy-ccline hook",
+        "timeout": 5
+      }
+    ],
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "exec ./bin/agy-ccline hook",
+        "timeout": 5
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "exec ./bin/agy-ccline hook",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "exec ./bin/agy-ccline hook",
+        "timeout": 5
+      }
+    ]
+  }
+}

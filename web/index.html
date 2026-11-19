@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Statusline</title>
+  <script src="/preload.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@400;500;600&family=Google+Sans+Code:wght@400;500;600&display=swap">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="header">
+    <div class="header-top">
+      <div class="conv-title-wrap">
+        <select id="conv-select" class="conv-select" title="切换查看的对话（默认自动跟随当前窗格对话）">
+          <option value="">Loading…</option>
+        </select>
+      </div>
+      <span id="live-pill" class="live-pill">
+        <span class="live-dot"></span>
+        <span id="live-label">Idle</span>
+      </span>
+    </div>
+
+    <!-- Flush 2-line CCometixLine strip (no outer box, pure host-integrated typography) -->
+    <div id="ccline-strip" class="ccline-strip" aria-label="Statusline summary"></div>
+
+    <nav class="tabs" role="tablist">
+      <button type="button" class="tab active" data-tab="overview">Overview</button>
+      <button type="button" class="tab" data-tab="turns">Turns <span id="turns-count" class="tab-count"></span></button>
+      <button type="button" class="tab" data-tab="settings">Settings</button>
+    </nav>
+  </header>
+
+  <main class="main">
+    <section id="panel-overview" class="tab-panel"></section>
+    <section id="panel-turns" class="tab-panel hidden"></section>
+    <section id="panel-settings" class="tab-panel hidden"></section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
