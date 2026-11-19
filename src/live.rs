@@ -672,7 +672,9 @@ pub(crate) fn quota_views(group: &Value) -> Vec<QuotaView> {
                         (Some(r), Some(span)) => Some(1.0 - ((r - now_ms()) as f64 / span as f64).clamp(0.0, 1.0)),
                         _ => None,
                     };
-                    let pace = elapsed.map(|e| (1.0 - remaining) - e);
+                    // Rounded so the pushed payload only changes when the shown numbers can.
+                    let elapsed = elapsed.map(|e| (e * 1000.0).round() / 1000.0);
+                    let pace = elapsed.map(|e| (((1.0 - remaining) - e) * 1000.0).round() / 1000.0);
                     QuotaView { window, used: 1.0 - remaining, reset_ms, pace, elapsed }
                 })
                 .collect()

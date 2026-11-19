@@ -1,7 +1,7 @@
 // In-page statusline renderer, injected by `agy-ccline sidecar` over CDP.
-// No data logic lives here: the sidecar pushes ready-made numbers with window.__agyBar.update(payload),
-// and this script reports which conversation each chat input belongs to through the
-// __agyBarHost binding. Re-injecting replaces the previous instance.
+// No data logic lives here: the sidecar pushes ready-made numbers with window.__agyBar.update(payload)
+// and polls window.__agyBar.panes() to learn which conversation each chat input belongs to.
+// Re-injecting replaces the previous instance.
 (function () {
   'use strict';
   if (window.__agyBar) { try { window.__agyBar.destroy(); } catch (e) {} }
@@ -14,7 +14,7 @@
   const UUID = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/;
 
   let data = null;
-  let reported = '';
+  let paneIds = [];
   let timer = 0;
 
   // ---------------------------------------------------------------- formatting
@@ -253,20 +253,13 @@
     return { bar, id: paneId(box) };
   });
 
-  const report = (ids) => {
-    const key = JSON.stringify(ids);
-    if (key === reported || typeof window.__agyBarHost !== 'function') return;
-    reported = key;
-    try { window.__agyBarHost(JSON.stringify({ panes: ids })); } catch (e) {}
-  };
-
   const render = (force) => {
     if (!document.body) return;
     if (!style.isConnected) (document.head || document.documentElement).appendChild(style);
     const dark = isDark();
     const enabled = !data || !data.opts || data.opts.enabled !== false;
     const list = bars();
-    report([...new Set(list.map((x) => x.id).filter(Boolean))].sort());
+    paneIds = [...new Set(list.map((x) => x.id).filter(Boolean))].sort();
     for (const { bar, id } of list) {
       bar.hidden = !enabled;
       bar.classList.toggle('dark', dark);
@@ -291,8 +284,7 @@
       style.remove();
       delete window.__agyBar;
     },
-    // Called by the sidecar after (re)attaching so it learns the panes even if nothing changed.
-    resend() { reported = ''; render(false); },
+    panes() { return { panes: paneIds, hasData: !!data }; },
     // Used by the side panel to draw the same bar into its own header.
     renderInto(container, payload, id, dark) {
       if (!style.isConnected) (document.head || document.documentElement).appendChild(style);

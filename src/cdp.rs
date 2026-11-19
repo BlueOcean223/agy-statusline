@@ -1,8 +1,8 @@
 //! Draws the statusline inside the Antigravity window over the Chrome DevTools Protocol.
 //!
 //! CDP is used for painting only. The page script (`web/bar.js`) has no data logic: it mounts a bar
-//! above every chat input, reports which conversation each input belongs to through a CDP binding,
-//! and renders whatever JSON the engine pushes with `Runtime.evaluate`.
+//! above every chat input, exposes which conversation each input belongs to (`__agyBar.panes()`,
+//! polled every second), and renders whatever JSON the engine pushes with `Runtime.evaluate`.
 //!
 //! Antigravity 2.33+ only opens the debugging port when launched with `--remote-debugging-port`;
 //! the port is then written to `<userData>/DevToolsActivePort`.
@@ -15,11 +15,11 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket};
 
 const BAR_JS: &str = include_str!("../web/bar.js");
-const BINDING: &str = "__agyBarHost";
+const POLL_EVERY: Duration = Duration::from_millis(1000);
 
 fn devtools_port_file() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("AGY_DEVTOOLS_PORT_FILE") {
@@ -58,7 +58,8 @@ pub fn run(shared: SharedRef) {
                         let url = t["url"].as_str().unwrap_or("");
                         let id = t["id"].as_str().unwrap_or("").to_string();
                         let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or("").to_string();
-                        if kind != "page" || url.starts_with("devtools://") || id.is_empty() || ws.is_empty() {
+                        // `data:` pages are Antigravity's splash/overlay windows, never a chat.
+                        if kind != "page" || url.starts_with("devtools://") || url.starts_with("data:") || id.is_empty() || ws.is_empty() {
                             continue;
                         }
                         if !connected.lock().map(|mut c| c.insert(id.clone())).unwrap_or(false) {
@@ -118,10 +119,7 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
     ws.get_ref().set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
     let mut page = Page { ws, seq: 0 };
 
-    // Binding events are delivered only while the Runtime domain is enabled.
-    page.send("Runtime.enable", json!({}))?;
     page.send("Page.enable", json!({}))?;
-    page.send("Runtime.addBinding", json!({ "name": BINDING }))?;
     // Survives reloads and navigations; the evaluate below covers the already-loaded document.
     page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": BAR_JS }))?;
     page.send("Runtime.evaluate", json!({ "expression": BAR_JS }))?;
@@ -129,29 +127,42 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
         s.pages.insert(id.to_string(), url.to_string());
     }
 
+    // The page is polled for the conversations its inputs show rather than calling back through a
+    // Runtime binding: a binding stays tied to the CDP session that added it, so after the sidecar
+    // restarts, a page injected by the previous process would keep calling a dead binding.
     let mut pushed_rev = 0u64;
+    let mut poll_id: Option<u64> = None;
+    let mut polled_at = Instant::now() - POLL_EVERY;
     loop {
+        if poll_id.is_none() && polled_at.elapsed() >= POLL_EVERY {
+            polled_at = Instant::now();
+            page.send(
+                "Runtime.evaluate",
+                json!({ "expression": "window.__agyBar ? window.__agyBar.panes() : null", "returnByValue": true }),
+            )?;
+            poll_id = Some(page.seq);
+        }
+
         match page.ws.read() {
             Ok(Message::Text(t)) => {
                 let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
-                match v["method"].as_str() {
-                    Some("Runtime.bindingCalled") if v["params"]["name"] == BINDING => {
-                        let panes: Vec<String> = serde_json::from_str::<Value>(v["params"]["payload"].as_str().unwrap_or(""))
-                            .ok()
-                            .and_then(|p| p["panes"].as_array().cloned())
-                            .unwrap_or_default()
-                            .iter()
-                            .filter_map(|x| x.as_str().map(str::to_string))
-                            .collect();
-                        if let Ok(mut s) = shared.0.lock() {
-                            s.panes.insert(id.to_string(), panes);
-                        }
+                if poll_id.is_some() && v["id"].as_u64() == poll_id {
+                    poll_id = None;
+                    let r = &v["result"]["result"]["value"];
+                    let panes: Vec<String> =
+                        r["panes"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                    let changed = shared
+                        .0
+                        .lock()
+                        .map(|mut s| s.panes.insert(id.to_string(), panes.clone()).as_ref() != Some(&panes))
+                        .unwrap_or(false);
+                    if changed {
                         wake(shared);
-                        // The page asks right after (re)mounting, so it gets the current data at once.
+                    }
+                    // A reloaded page (or one not injected yet) has no data: push again.
+                    if r["hasData"] != true {
                         pushed_rev = 0;
                     }
-                    Some("Runtime.executionContextsCleared") => pushed_rev = 0,
-                    _ => {}
                 }
             }
             Ok(Message::Close(_)) => return Ok(()),
