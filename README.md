@@ -73,3 +73,7 @@ cargo build --release && cp target/release/agy-statusline bin/.new && mv -f bin/
 - 压缩次数只在一个对话上验证过（上下文估算从 481k 降到 22k）；那份数据里没有 `checkpointIndex`。
 - 重启按钮的“退出后重新打开”没有在真实窗口里完整走过一遍；确认流程和脚本语法已检查。
 - 子代理标签页（`subagent-tab-conversation`）的选择器沿用 agy-zh-pack，macOS 上还没在真实窗口里验证；主对话和首页已验证。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。`i18n/` 下的词典和翻译脚本来自 agy-zh-pack，按它自己的 MIT 许可（`i18n/LICENSE`）。`web/preload.js` 是 Antigravity 自带的 sidecar 前端桥接脚本，不在本项目许可范围内。
