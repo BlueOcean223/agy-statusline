@@ -19,8 +19,13 @@
   let lastJson = '';
   let last = null;
 
-  // Light/dark from the host's --background luminance.
+  // Light/dark from the host's --background luminance. The host doesn't always send its theme
+  // variables to the iframe; without them, follow the system scheme (Antigravity's default).
   function syncScheme() {
+    if (!getComputedStyle(document.documentElement).getPropertyValue('--background').trim()) {
+      document.documentElement.dataset.theme = matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+      return;
+    }
     const probe = document.createElement('span');
     probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #18181b)';
     document.documentElement.appendChild(probe);
@@ -34,6 +39,7 @@
     }
   }
   syncScheme();
+  matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { syncScheme(); if (last) renderStrip(last); });
   window.addEventListener('message', (e) => {
     if (e.data?.type === 'theme-change') requestAnimationFrame(() => { syncScheme(); if (last) renderStrip(last); });
   });
