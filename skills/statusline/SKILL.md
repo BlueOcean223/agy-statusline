@@ -13,6 +13,10 @@ Binary location: `/Users/gongshuisanye/code/agy-statusline/bin/agy-ccline`
 
 - **Print live terminal statusline & telemetry summary**:
   `/Users/gongshuisanye/code/agy-statusline/bin/agy-ccline status`
+- **Print the JSON pushed to the in-page statusline** (reads the language_server API):
+  `/Users/gongshuisanye/code/agy-statusline/bin/agy-ccline live`
+- **Enable the statusline above the chat input**: quit Antigravity, then run
+  `open -a Antigravity --args --remote-debugging-port=0` (the sidecar attaches over CDP within ~3s).
 - **Rebuild release binary after Rust or Web asset changes**:
   `cd /Users/gongshuisanye/code/agy-statusline && cargo build --release && cp target/release/agy-ccline bin/agy-ccline`
 

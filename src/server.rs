@@ -214,6 +214,24 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             let out = serde_json::to_vec(&snap).unwrap_or_default();
             send_response(stream, 200, "application/json", &out);
         }
+        ("GET", "/api/live-status") => {
+            let out = match LIVE.get() {
+                Some(shared) => {
+                    let s = shared.0.lock().map(|s| {
+                        json!({
+                            "cdp": s.cdp_status,
+                            "ls": s.ls_status,
+                            "pages": s.pages.len(),
+                            "panes": s.panes.values().flatten().collect::<Vec<_>>(),
+                            "rev": s.rev,
+                        })
+                    });
+                    s.unwrap_or_else(|_| json!({}))
+                }
+                None => json!({ "cdp": "live engine not running", "ls": "" }),
+            };
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
         ("GET", "/api/config") => {
             let cfg = load_config(&plugin_data);
             let out = serde_json::to_vec(&cfg).unwrap_or_default();
@@ -245,7 +263,19 @@ fn handle_client(stream: TcpStream, ui_token: String) {
     }
 }
 
+static LIVE: std::sync::OnceLock<crate::live::SharedRef> = std::sync::OnceLock::new();
+
+/// Starts the live engine (language_server polling) and the CDP painter next to the HTTP server.
+fn start_live() {
+    let shared: crate::live::SharedRef = std::sync::Arc::default();
+    let _ = LIVE.set(shared.clone());
+    let s1 = shared.clone();
+    thread::spawn(move || crate::live::run(s1));
+    thread::spawn(move || crate::cdp::run(shared));
+}
+
 pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
+    start_live();
     let port = explicit_port
         .or_else(|| {
             env::var("ANTIGRAVITY_SIDECAR_WEB_PORT")

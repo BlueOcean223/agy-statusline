@@ -42,6 +42,16 @@ fn is_valid_id(id: &str) -> bool {
         && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
+/// Tells the sidecar's live engine which conversation just changed. Fire-and-forget UDP:
+/// hooks block the agent loop, so this must never wait on the sidecar.
+fn poke_sidecar(plugin_data: &std::path::Path, event: &str, conv: &str) {
+    let Ok(port) = fs::read_to_string(crate::live::port_file(plugin_data)) else { return };
+    let Ok(port) = port.trim().parse::<u16>() else { return };
+    let Ok(sock) = std::net::UdpSocket::bind("127.0.0.1:0") else { return };
+    let msg = serde_json::json!({ "e": event, "c": conv }).to_string();
+    let _ = sock.send_to(msg.as_bytes(), ("127.0.0.1", port));
+}
+
 pub fn run_hook() {
     let mut input = String::new();
     let _ = io::stdin().read_to_string(&mut input);
@@ -150,6 +160,7 @@ pub fn run_hook() {
         if let Ok(json) = serde_json::to_string(&st) {
             let _ = write_atomic(&conv_path, &json);
         }
+        poke_sidecar(&plugin_data, event_name, conv_id);
     }
 
     let out = if event_name == "Stop" {

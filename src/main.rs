@@ -1,5 +1,9 @@
+mod cdp;
 mod config;
 mod hook;
+mod http;
+mod live;
+mod ls;
 mod server;
 mod telemetry;
 
@@ -23,6 +27,11 @@ enum Commands {
     },
     /// Lifecycle hook receiver (reads event JSON from stdin, writes millisecond timing to bridge)
     Hook,
+    /// Print the payload the in-page statusline would receive (reads the language_server API)
+    Live {
+        /// Conversation ids to build views for (defaults to the most recently modified root)
+        ids: Vec<String>,
+    },
     /// Print live statusline & telemetry summary for the active or specified conversation
     Status {
         #[arg(short, long, default_value = "")]
@@ -68,6 +77,30 @@ fn print_status(conv: &str) {
     );
 }
 
+fn print_live(ids: Vec<String>) {
+    let Some(ls) = ls::LsClient::connect() else {
+        eprintln!("language_server not found");
+        std::process::exit(1);
+    };
+    let app_data = find_app_data_dir();
+    let cfg = config::load_config(&find_plugin_data_dir(&app_data));
+    let mut eng = live::Engine::new(ls);
+    eng.tick(&Default::default());
+    let mut panes: std::collections::HashSet<String> = ids.into_iter().collect();
+    if panes.is_empty()
+        && let Some((id, _)) = eng
+            .summaries()
+            .iter()
+            .filter(|(_, s)| s.root.is_none())
+            .max_by_key(|(_, s)| s.modified_ms)
+    {
+        panes.insert(id.clone());
+    }
+    eng.tick(&panes);
+    let payload = eng.build_payload(&panes, &cfg);
+    println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
@@ -78,6 +111,7 @@ fn main() {
             }
         }
         Some(Commands::Hook) => hook::run_hook(),
+        Some(Commands::Live { ids }) => print_live(ids),
         Some(Commands::Status { conversation }) => print_status(&conversation),
         None => {
             if std::env::var("ANTIGRAVITY_SIDECAR_WEB_PORT").is_ok() {

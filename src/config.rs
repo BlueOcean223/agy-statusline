@@ -43,6 +43,11 @@ pub struct Config {
     pub five_hour_token_limit: u64,
     pub seven_day_token_limit: u64,
     pub include_subagents: bool,
+    /// In-page statusline above the chat input (drawn over CDP).
+    pub bar_enabled: bool,
+    pub bar_show_cost: bool,
+    pub bar_show_subagents: bool,
+    pub bar_show_quota: bool,
     pub models: Vec<ModelRule>,
 }
 
@@ -58,6 +63,10 @@ impl Default for Config {
             five_hour_token_limit: 15_000_000,
             seven_day_token_limit: 80_000_000,
             include_subagents: true,
+            bar_enabled: true,
+            bar_show_cost: true,
+            bar_show_subagents: true,
+            bar_show_quota: true,
             models: default_model_rules(),
         }
     }
@@ -74,6 +83,10 @@ pub struct ConfigPatch {
     pub five_hour_token_limit: Option<u64>,
     pub seven_day_token_limit: Option<u64>,
     pub include_subagents: Option<bool>,
+    pub bar_enabled: Option<bool>,
+    pub bar_show_cost: Option<bool>,
+    pub bar_show_subagents: Option<bool>,
+    pub bar_show_quota: Option<bool>,
 }
 
 pub fn default_model_rules() -> Vec<ModelRule> {
@@ -88,6 +101,9 @@ pub fn default_model_rules() -> Vec<ModelRule> {
     };
 
     vec![
+        rule("neon", "Gemini 4 Neon", "Neon", 1_000_000, 3.0, 0.15, 15.0),
+        // Orchestrator's executor model; the backend labels it "Gemini 4 Hydrogen (Orchestrator)".
+        rule("flash-worker", "Gemini 4 Hydrogen", "Hydrogen", 1_000_000, 1.50, 0.075, 7.50),
         rule("carbon", "Gemini 4 Carbon", "Carbon", 1_000_000, 2.0, 0.10, 10.0),
         rule("argon", "Gemini 4 Argon", "Argon", 1_000_000, 2.0, 0.10, 10.0),
         rule("hydrogen", "Gemini 4 Hydrogen", "Hydrogen", 1_000_000, 1.50, 0.075, 7.50),
@@ -151,6 +167,17 @@ pub fn load_config(plugin_data: &Path) -> Config {
     {
         if cfg.models.is_empty() {
             cfg.models = default_model_rules();
+        } else {
+            // Rules are matched in order and older files end with a broad "gemini" rule,
+            // so default rules missing from the file go in front.
+            let mut missing: Vec<ModelRule> = default_model_rules()
+                .into_iter()
+                .filter(|d| !cfg.models.iter().any(|m| m.pattern == d.pattern))
+                .collect();
+            if !missing.is_empty() {
+                missing.append(&mut cfg.models);
+                cfg.models = missing;
+            }
         }
         return cfg;
     }
@@ -189,6 +216,18 @@ pub fn apply_config_patch(plugin_data: &Path, patch: ConfigPatch) -> Config {
     }
     if let Some(v) = patch.include_subagents {
         cfg.include_subagents = v;
+    }
+    if let Some(v) = patch.bar_enabled {
+        cfg.bar_enabled = v;
+    }
+    if let Some(v) = patch.bar_show_cost {
+        cfg.bar_show_cost = v;
+    }
+    if let Some(v) = patch.bar_show_subagents {
+        cfg.bar_show_subagents = v;
+    }
+    if let Some(v) = patch.bar_show_quota {
+        cfg.bar_show_quota = v;
     }
     let path = plugin_data.join("config.toml");
     if let Ok(toml_str) = toml::to_string_pretty(&cfg) {

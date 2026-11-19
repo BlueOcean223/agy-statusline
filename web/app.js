@@ -395,6 +395,31 @@
     const c = snap.config;
     panelSettings.innerHTML = `
       <div class="section">
+        <div class="sec-head"><span class="sec-title">输入框状态栏 (In-page Statusline)</span></div>
+        <div class="form-hint" id="live-status" style="margin-bottom:8px;line-height:1.6">…</div>
+
+        <div class="form-row">
+          <div class="form-label">
+            <span>Show Statusline Above Input</span>
+            <span class="form-hint">需要 Antigravity 带 --remote-debugging-port 启动</span>
+          </div>
+          <input id="cfg-bar-on" type="checkbox" ${c.bar_enabled ? 'checked' : ''} />
+        </div>
+        <div class="form-row">
+          <div class="form-label"><span>Cost (conversation · today)</span></div>
+          <input id="cfg-bar-cost" type="checkbox" ${c.bar_show_cost ? 'checked' : ''} />
+        </div>
+        <div class="form-row">
+          <div class="form-label"><span>5h / Weekly Quota</span><span class="form-hint">来自 Antigravity 后台的真实额度</span></div>
+          <input id="cfg-bar-quota" type="checkbox" ${c.bar_show_quota ? 'checked' : ''} />
+        </div>
+        <div class="form-row">
+          <div class="form-label"><span>Running Subagent Rows</span></div>
+          <input id="cfg-bar-subs" type="checkbox" ${c.bar_show_subagents ? 'checked' : ''} />
+        </div>
+      </div>
+
+      <div class="section">
         <div class="sec-head"><span class="sec-title">Context &amp; Rolling Budgets (config.toml)</span></div>
 
         <div class="form-row">
@@ -473,6 +498,10 @@
         five_hour_token_limit: Number($('cfg-5h-tok').value) || 15000000,
         seven_day_token_limit: Number($('cfg-7d-tok').value) || 80000000,
         include_subagents: $('cfg-sub').checked,
+        bar_enabled: $('cfg-bar-on').checked,
+        bar_show_cost: $('cfg-bar-cost').checked,
+        bar_show_quota: $('cfg-bar-quota').checked,
+        bar_show_subagents: $('cfg-bar-subs').checked,
       };
       const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
       const res = await f('/api/config', {
@@ -487,11 +516,27 @@
     });
   }
 
+  async function updateLiveStatus() {
+    const box = document.getElementById('live-status');
+    if (!box) return;
+    try {
+      const r = await fetch('/api/live-status', { cache: 'no-store' });
+      const j = await r.json();
+      box.innerHTML = `CDP: ${esc(j.cdp || '—')}<br>language_server: ${esc(j.ls || '—')}` +
+        (j.panes && j.panes.length ? `<br>showing: ${j.panes.map((x) => esc(String(x).slice(0, 8))).join(', ')}` : '');
+    } catch (e) {
+      box.textContent = 'live status unavailable';
+    }
+  }
+
   function renderPanels(snap, forceSettings = false) {
     turnsCountEl.textContent = snap.summary.turns ? String(snap.summary.turns) : '';
     if (activeTab === 'overview') renderOverview(snap);
     else if (activeTab === 'turns') renderTurns(snap);
-    else if (activeTab === 'settings') renderSettings(snap, forceSettings);
+    else if (activeTab === 'settings') {
+      renderSettings(snap, forceSettings);
+      updateLiveStatus();
+    }
   }
 
   async function poll() {
