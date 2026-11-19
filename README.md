@@ -1,21 +1,67 @@
 # AGY CometixLine (`agy-statusline`)
 
-纯 Rust 单二进制实现的 Google Antigravity 2.0 桌面端原生右侧辅助面板（`AUX_PANE`）与遥测状态栏插件，设计理念源自 [CCometixLine](https://github.com/Haleclipse/CCometixLine)。
+Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行 [CCometixLine](https://github.com/Haleclipse/CCometixLine) 风格的状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)。
 
-## 架构特点
+```
+✦ Gemini 4 Neon (XHigh) | ◔ 43% · 222k / 512k | ⛁ 212k · 97% hit | $ $21.8 · $43.2 today | ● running
+⧗ 4.0s | ϟ 857 tok/s | 5h ▮▮▮▯▯▯▯▯▯▯ 33% · 19:18 | 7d ▮▮▯▯▯▯▯▯▯▯ 18% · Wed 09:31 · ↓1%
+  ▣ research · API Researcher | ✦ Gemini 4 Neon (XHigh) | ◔ … | ⧗ 4.9s | ϟ 427 tok/s | ● running
+```
 
-- **100% 纯 Rust 单体二进制 (`bin/agy-ccline`)**：零 Python、零 Node.js、零外部悬浮窗口。前端静态资源通过 `include_str!` 直接编译进单个 ~1.5MB 二进制文件。
-- **双入口合一**：
-  - `agy-ccline sidecar`：由 `sidecars/statusline/sidecar.json` 自动拉起，直接监听 `ANTIGRAVITY_SIDECAR_WEB_PORT` 提供原生右侧辅助栏视图。
-  - `agy-ccline hook`：由 `hooks.json` 在模型调用前后触发（冷启动 `< 1ms`），记录毫秒级精确推理耗时用于计算 TPS。
-  - `agy-ccline status`：在终端直接输出双行真彩 CCometixLine 状态条。
-- **原生宿主融合视觉**：严格遵循 Antigravity 内置面板（如 `swarm_board`）的无边框极简规范，100% 继承宿主的 `--background` / `--foreground` / `--muted-foreground` / `Google Sans` 主题变量，顶部内嵌无外框双行 CCometixLine 状态条（Catppuccin Latte / Mocha 自动随深浅色切换）。
-- **TOML 配置**：配置位于 `~/.gemini/antigravity/plugin_data/agy-statusline/config.toml`。
+## 结构
 
-## 构建与更新
+方案对比和字段来源见 [docs/architecture.html](docs/architecture.html)。简单说：
+
+| 部分 | 做什么 |
+|---|---|
+| `agy-ccline sidecar` | 由 `sidecars/statusline/sidecar.json` 拉起、Antigravity 负责重启。里面三件事：live 引擎调 language_server 只读 API 取数；CDP 画师把渲染脚本注入主窗口并推数据；HTTP 服务提供右侧面板 |
+| `agy-ccline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms）；同时写旧面板用的 bridge 文件 |
+| `web/bar.js` | 注入页面的纯渲染脚本：找输入框、回报对话 ID、画状态栏。没有任何取数逻辑 |
+| `web/index.html` 等 | 右侧面板（Overview / Turns / Settings） |
+
+数据来源（都是本机 language_server 的只读接口，地址和 token 由 Antigravity 通过 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 交给 sidecar）：
+
+- `GetAllCascadeTrajectories`：对话状态、步数、父子关系
+- `GetCascadeTrajectoryGeneratorMetadata`：每次模型调用的 token、首字时间、生成时长、实际模型、上下文估算（按 offset 增量拉）
+- `RetrieveUserQuotaSummary`：5 小时和每周额度
+
+不修改 Antigravity 发出的任何请求。
+
+## 启用输入框上方的状态栏
+
+Antigravity 2.33.0 起，只有带调试端口参数启动才能注入。先完全退出 Antigravity，再：
 
 ```bash
-cd /Users/gongshuisanye/code/agy-statusline
-cargo build --release
-cp target/release/agy-ccline bin/agy-ccline
+open -a Antigravity --args --remote-debugging-port=0
 ```
+
+`0` 表示随机端口，端口号写在 `~/Library/Application Support/Antigravity/DevToolsActivePort`，sidecar 每 3 秒检查一次，连上后自动注入，不需要刷新窗口。不带参数启动时，右侧面板照常工作，Settings 里会显示 “no debugging port”。
+
+注意：开了调试端口后，本机任何进程都可以通过它控制 Antigravity 窗口。
+
+## 设置
+
+右侧面板的 Settings 页（写入 `~/.gemini/antigravity/plugin_data/agy-statusline/config.toml`）：
+
+- 输入框状态栏：总开关、费用、额度、子代理行；顶部显示 CDP 和 language_server 的连接状态
+- 上下文上限覆盖、模型单价（`[[models]]`，按顺序匹配 `responseModel + 显示名`）
+
+费用 = token × 单价，是公开 API 标准价的折算，不是订阅实际扣费。
+
+## 开发
+
+```bash
+cargo build --release && cp target/release/agy-ccline bin/.new && mv -f bin/.new bin/agy-ccline
+```
+
+替换后结束旧的 sidecar 进程（`pkill -f 'agy-ccline sidecar'`），Antigravity 会用新二进制重新拉起。
+
+- `agy-ccline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
+- `AGY_DEVTOOLS_PORT_FILE=<path> agy-ccline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
+- `agy-ccline status`：旧的终端预览（transcript 引擎）。
+
+## 已知限制
+
+- 压缩次数（`checkpointIndex` 前进或上下文估算骤降）没有在真正被压缩过的对话上验证过。
+- 右侧面板的 Overview / Turns 仍用旧的 transcript 引擎出数。
+- 输入框和对话 ID 的 DOM 选择器沿用 agy-zh-pack（Windows 版验证过），macOS 真实窗口里尚未验证。
