@@ -4,21 +4,21 @@
     "SessionStart": [
       {
         "type": "command",
-        "command": "exec ./bin/agy-statusline hook",
+        "command": "\"bin/agy-statusline\" hook",
         "timeout": 5
       }
     ],
     "PreInvocation": [
       {
         "type": "command",
-        "command": "exec ./bin/agy-statusline hook",
+        "command": "\"bin/agy-statusline\" hook",
         "timeout": 5
       }
     ],
     "PostInvocation": [
       {
         "type": "command",
-        "command": "exec ./bin/agy-statusline hook",
+        "command": "\"bin/agy-statusline\" hook",
         "timeout": 5
       }
     ],
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "exec ./bin/agy-statusline hook",
+            "command": "\"bin/agy-statusline\" hook",
             "timeout": 5
           }
         ]
@@ -37,7 +37,7 @@
     "Stop": [
       {
         "type": "command",
-        "command": "exec ./bin/agy-statusline hook",
+        "command": "\"bin/agy-statusline\" hook",
         "timeout": 5
       }
     ]

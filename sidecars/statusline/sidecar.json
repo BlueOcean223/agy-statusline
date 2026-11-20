@@ -1,6 +1,6 @@
 {
-  "command": "/bin/sh",
-  "args": ["-c", "exec ../../bin/agy-statusline sidecar"],
+  "command": "../../bin/agy-statusline",
+  "args": ["sidecar"],
   "restart_policy": "always",
   "display_name": "Statusline",
   "description": "Statusline and telemetry pane for context, cache hit rate, cost, TPS, subagents, and 5h/7d quotas.",
