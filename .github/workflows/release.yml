@@ -1,0 +1,102 @@
+name: Release
+
+# Push a tag such as v0.3.0 to build the plugin for macOS and Windows and publish a GitHub release.
+# The tag must match the version in Cargo.toml and plugin.json.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          cargo_v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          plugin_v=$(python3 -c 'import json; print(json.load(open("plugin.json"))["version"])')
+          echo "tag=$tag Cargo.toml=$cargo_v plugin.json=$plugin_v"
+          if [ "$tag" != "$cargo_v" ] || [ "$tag" != "$plugin_v" ]; then
+            echo "::error::tag v$tag does not match Cargo.toml ($cargo_v) and plugin.json ($plugin_v)"
+            exit 1
+          fi
+          echo "version=$tag" >> "$GITHUB_OUTPUT"
+
+  build-macos:
+    needs: check-version
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo build --locked --release --target aarch64-apple-darwin
+          cargo build --locked --release --target x86_64-apple-darwin
+          mkdir -p out
+          lipo -create -output out/agy-statusline \
+            target/aarch64-apple-darwin/release/agy-statusline \
+            target/x86_64-apple-darwin/release/agy-statusline
+          lipo -info out/agy-statusline
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-macos
+          path: out/agy-statusline
+
+  build-windows:
+    needs: check-version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bin-windows
+          path: target/release/agy-statusline.exe
+
+  publish:
+    needs: [check-version, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Assemble plugin packages
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Each archive holds one agy-statusline/ folder, ready to drop into the plugins directory.
+          assemble() {
+            local dir="pkg/$1/agy-statusline"
+            mkdir -p "$dir/bin"
+            cp -R plugin.json hooks.json sidecars assets LICENSE README.md "$dir/"
+            cp "$2" "$dir/bin/"
+            chmod +x "$dir/bin/"*
+          }
+          assemble macos artifacts/bin-macos/agy-statusline
+          assemble windows artifacts/bin-windows/agy-statusline.exe
+          mkdir -p dist
+          tar -C pkg/macos -czf "dist/agy-statusline-v$VERSION-macos-universal.tar.gz" agy-statusline
+          (cd pkg/windows && zip -qr "../../dist/agy-statusline-v$VERSION-windows-x64.zip" agy-statusline)
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

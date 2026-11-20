@@ -8,6 +8,15 @@ Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显
   ▣ research · API Researcher | ✦ Gemini 4 Neon (XHigh) | ◔ … | ⧗ 4.9s | ϟ 427 tok/s | ● running
 ```
 
+## 安装
+
+从 [Releases](https://github.com/BlueOcean223/agy-statusline/releases) 下载对应平台的包，解压出的 `agy-statusline/` 文件夹放进 Antigravity 的插件目录 `~/.gemini/config/plugins/`，Antigravity 会自动加载。
+
+- macOS：`agy-statusline-v<版本>-macos-universal.tar.gz`（Apple 芯片和 Intel 通用）。二进制没有签名，用浏览器下载的话先去掉隔离标记，否则系统会拦下它：`xattr -dr com.apple.quarantine ~/.gemini/config/plugins/agy-statusline`
+- Windows：`agy-statusline-v<版本>-windows-x64.zip`，放到 `%USERPROFILE%\.gemini\config\plugins\`。Windows 包还没有在真实的 Antigravity 上验证过。
+
+`SHA256SUMS` 里是各个包的校验和。
+
 ## 结构
 
 方案对比和字段来源见 [docs/architecture.html](docs/architecture.html)。简单说：
@@ -67,6 +76,18 @@ cargo build --release && cp target/release/agy-statusline bin/.new && mv -f bin/
 - `agy-statusline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
 - `AGY_DEVTOOLS_PORT_FILE=<path> agy-statusline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
 - `agy-statusline status [-c 对话ID]`：终端里的两行预览，默认取最近看过的对话。
+
+### CI 和发版
+
+- `.github/workflows/ci.yml`：推到 main 或开 PR 时，检查格式（`cargo fmt --check`）、JS 语法和 JSON 清单，并在 macOS、Windows、Linux 上跑 `cargo clippy -D warnings` 和 `cargo test`。
+- `.github/workflows/release.yml`：推 `v*` 标签时构建 macOS 通用二进制和 Windows 二进制，打成插件包发到 GitHub Release。标签必须和 `Cargo.toml`、`plugin.json` 里的版本一致，否则直接失败。
+
+发一个新版本：
+
+```bash
+# 先把 Cargo.toml 和 plugin.json 的 version 改成 0.3.0 并提交
+git tag v0.3.0 && git push origin v0.3.0
+```
 
 ## 已知限制
 
