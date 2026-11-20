@@ -18,7 +18,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: v
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -35,7 +35,7 @@ jobs:
     needs: check-version
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
@@ -48,7 +48,7 @@ jobs:
             target/aarch64-apple-darwin/release/agy-statusline \
             target/x86_64-apple-darwin/release/agy-statusline
           lipo -info out/agy-statusline
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-macos
           path: out/agy-statusline
@@ -57,11 +57,11 @@ jobs:
     needs: check-version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bin-windows
           path: target/release/agy-statusline.exe
@@ -72,8 +72,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
       - name: Assemble plugin packages
@@ -96,7 +96,7 @@ jobs:
           (cd pkg/windows && zip -qr "../../dist/agy-statusline-v$VERSION-windows-x64.zip" agy-statusline)
           (cd dist && sha256sum * > SHA256SUMS)
           ls -l dist
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
           generate_release_notes: true
