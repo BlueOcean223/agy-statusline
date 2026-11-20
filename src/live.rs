@@ -11,8 +11,8 @@
 //! show up right after the call ends instead of on the next poll.
 
 use crate::config::{Config, ModelRule, find_app_data_dir, find_plugin_data_dir, load_config, write_atomic};
-use crate::ls::LsClient;
 use crate::git::GitInfo;
+use crate::ls::LsClient;
 use crate::transcript::Transcript;
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -271,7 +271,9 @@ impl Engine {
                 sub_role: spec["role"].as_str().map(str::to_string),
                 workspace: s["workspaces"][0]["repository"]["computedName"]
                     .as_str()
-                    .or_else(|| s["workspaces"][0]["workspaceFolderAbsoluteUri"].as_str().and_then(|u| u.rsplit('/').next()))
+                    .or_else(|| {
+                        s["workspaces"][0]["workspaceFolderAbsoluteUri"].as_str().and_then(|u| u.rsplit('/').next())
+                    })
                     .map(str::to_string),
                 branch: s["workspaces"][0]["branchName"].as_str().map(str::to_string),
                 workspace_path: s["workspaces"][0]["workspaceFolderAbsoluteUri"]
@@ -614,10 +616,8 @@ impl Engine {
         }
 
         let summary = self.summaries.get(id);
-        let git = summary
-            .and_then(|s| s.workspace_path.as_ref())
-            .and_then(|p| self.git.get(p))
-            .and_then(|(_, g)| g.clone());
+        let git =
+            summary.and_then(|s| s.workspace_path.as_ref()).and_then(|p| self.git.get(p)).and_then(|(_, g)| g.clone());
         View {
             git,
             workspace: summary.and_then(|s| s.workspace_path.clone()),
@@ -809,7 +809,10 @@ pub fn run(shared: SharedRef) {
                 // server that started this sidecar is still running, it starts a fresh one with the
                 // new address; if it is gone (Windows leaves children running), this one stops.
                 if down.is_some_and(|d| d >= LS_GONE_AFTER) {
-                    eprintln!("[agy-statusline] language_server at {addr} unreachable for {}s, exiting", LS_GONE_AFTER.as_secs());
+                    eprintln!(
+                        "[agy-statusline] language_server at {addr} unreachable for {}s, exiting",
+                        LS_GONE_AFTER.as_secs()
+                    );
                     std::process::exit(1);
                 }
             } else if down.is_some() || err.as_deref().is_some_and(|e| e.contains("HTTP 401")) {

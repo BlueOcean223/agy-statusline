@@ -70,9 +70,26 @@ fn print_status(conv: &str) {
     let max = m["ctxMax"].as_u64().unwrap_or(0);
     let mut l1 = vec![
         c((180, 190, 254), format!("✦ {}", m["model"].as_str().unwrap_or("–"))),
-        c((203, 166, 247), format!("◔ {}% · {} / {}", if max > 0 { used * 100 / max } else { 0 }, fmt_tok(used), fmt_tok(max))),
-        c((137, 220, 235), format!("⛁ {} · {:.0}% hit", fmt_tok(m["cacheRead"].as_u64().unwrap_or(0)), m["cacheHit"].as_f64().unwrap_or(0.0) * 100.0)),
-        c((245, 194, 231), format!("$ ${:.2} · ${:.2} today", v["costConv"].as_f64().unwrap_or(0.0), p["bar"]["today"].as_f64().unwrap_or(0.0))),
+        c(
+            (203, 166, 247),
+            format!("◔ {}% · {} / {}", (used * 100).checked_div(max).unwrap_or(0), fmt_tok(used), fmt_tok(max)),
+        ),
+        c(
+            (137, 220, 235),
+            format!(
+                "⛁ {} · {:.0}% hit",
+                fmt_tok(m["cacheRead"].as_u64().unwrap_or(0)),
+                m["cacheHit"].as_f64().unwrap_or(0.0) * 100.0
+            ),
+        ),
+        c(
+            (245, 194, 231),
+            format!(
+                "$ ${:.2} · ${:.2} today",
+                v["costConv"].as_f64().unwrap_or(0.0),
+                p["bar"]["today"].as_f64().unwrap_or(0.0)
+            ),
+        ),
     ];
     if m["running"].as_bool() == Some(true) {
         l1.push(c((166, 227, 161), "● running".into()));
@@ -101,11 +118,8 @@ fn print_live(ids: Vec<String>) {
     eng.tick(&Default::default());
     let mut panes: std::collections::HashSet<String> = ids.into_iter().collect();
     if panes.is_empty()
-        && let Some((id, _)) = eng
-            .summaries()
-            .iter()
-            .filter(|(_, s)| s.root.is_none())
-            .max_by_key(|(_, s)| s.modified_ms)
+        && let Some((id, _)) =
+            eng.summaries().iter().filter(|(_, s)| s.root.is_none()).max_by_key(|(_, s)| s.modified_ms)
     {
         panes.insert(id.clone());
     }

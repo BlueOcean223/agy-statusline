@@ -87,9 +87,7 @@ fn call_agentapi(args: &[&str], app_data: &Path) -> Value {
     cmd.args(args);
 
     match cmd.output() {
-        Ok(out) if out.status.success() => {
-            serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({}))
-        }
+        Ok(out) if out.status.success() => serde_json::from_slice(&out.stdout).unwrap_or_else(|_| json!({})),
         _ => json!({}),
     }
 }
@@ -147,18 +145,9 @@ fn handle_client(stream: TcpStream, ui_token: String) {
 
     // Validate sidecar UI token on non-GET requests (same contract as sidecar_sdk)
     if method != "GET" && !ui_token.is_empty() {
-        let provided = headers
-            .get("x-sidecar-token")
-            .or_else(|| query.get("token"))
-            .map(String::as_str)
-            .unwrap_or("");
+        let provided = headers.get("x-sidecar-token").or_else(|| query.get("token")).map(String::as_str).unwrap_or("");
         if provided != ui_token {
-            send_response(
-                stream,
-                401,
-                "application/json",
-                br#"{"error":"unauthorized"}"#,
-            );
+            send_response(stream, 401, "application/json", br#"{"error":"unauthorized"}"#);
             return;
         }
     }
@@ -174,20 +163,10 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             send_response(stream, 200, "text/css; charset=utf-8", STYLES_CSS.as_bytes());
         }
         ("GET", "/app.js") => {
-            send_response(
-                stream,
-                200,
-                "application/javascript; charset=utf-8",
-                APP_JS.as_bytes(),
-            );
+            send_response(stream, 200, "application/javascript; charset=utf-8", APP_JS.as_bytes());
         }
         ("GET", "/preload.js") => {
-            send_response(
-                stream,
-                200,
-                "application/javascript; charset=utf-8",
-                PRELOAD_JS.as_bytes(),
-            );
+            send_response(stream, 200, "application/javascript; charset=utf-8", PRELOAD_JS.as_bytes());
         }
         ("GET", "/healthz" | "/api/health") => {
             send_response(stream, 200, "application/json", br#"{"ok":true}"#);
@@ -255,15 +234,9 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         },
         ("POST", "/_sidecar/get-conversation-metadata") => {
             let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
-            let cid = payload
-                .get("conversationId")
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let res = if cid.is_empty() {
-                json!({})
-            } else {
-                call_agentapi(&["get-conversation-metadata", cid], &app_data)
-            };
+            let cid = payload.get("conversationId").and_then(Value::as_str).unwrap_or("");
+            let res =
+                if cid.is_empty() { json!({}) } else { call_agentapi(&["get-conversation-metadata", cid], &app_data) };
             let out = serde_json::to_vec(&res).unwrap_or_default();
             send_response(stream, 200, "application/json", &out);
         }
@@ -321,11 +294,7 @@ fn start_live() {
 pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
     start_live();
     let port = explicit_port
-        .or_else(|| {
-            env::var("ANTIGRAVITY_SIDECAR_WEB_PORT")
-                .ok()
-                .and_then(|p| p.parse::<u16>().ok())
-        })
+        .or_else(|| env::var("ANTIGRAVITY_SIDECAR_WEB_PORT").ok().and_then(|p| p.parse::<u16>().ok()))
         .unwrap_or(19847);
 
     let ui_token = env::var("ANTIGRAVITY_SIDECAR_UI_TOKEN").unwrap_or_default();
@@ -333,11 +302,9 @@ pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
     let bound_port = listener.local_addr()?.port();
     eprintln!("[agy-statusline] listening on 127.0.0.1:{bound_port}");
 
-    for incoming in listener.incoming() {
-        if let Ok(stream) = incoming {
-            let tok = ui_token.clone();
-            thread::spawn(move || handle_client(stream, tok));
-        }
+    for stream in listener.incoming().flatten() {
+        let tok = ui_token.clone();
+        thread::spawn(move || handle_client(stream, tok));
     }
     Ok(())
 }

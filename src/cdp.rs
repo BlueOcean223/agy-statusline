@@ -49,7 +49,8 @@ fn devtools_port() -> Option<u16> {
 }
 
 fn list_pages(port: u16) -> Option<Vec<Value>> {
-    let res = http::request(&format!("127.0.0.1:{port}"), "GET", "/json/list", &[], &[], Duration::from_millis(1500)).ok()?;
+    let res =
+        http::request(&format!("127.0.0.1:{port}"), "GET", "/json/list", &[], &[], Duration::from_millis(1500)).ok()?;
     let v: Value = serde_json::from_slice(&res.body).ok()?;
     Some(v.as_array()?.clone())
 }
@@ -68,7 +69,12 @@ pub fn run(shared: SharedRef) {
                         let id = t["id"].as_str().unwrap_or("").to_string();
                         let ws = t["webSocketDebuggerUrl"].as_str().unwrap_or("").to_string();
                         // `data:` pages are Antigravity's splash/overlay windows, never a chat.
-                        if kind != "page" || url.starts_with("devtools://") || url.starts_with("data:") || id.is_empty() || ws.is_empty() {
+                        if kind != "page"
+                            || url.starts_with("devtools://")
+                            || url.starts_with("data:")
+                            || id.is_empty()
+                            || ws.is_empty()
+                        {
                             continue;
                         }
                         if !connected.lock().map(|mut c| c.insert(id.clone())).unwrap_or(false) {
@@ -119,10 +125,7 @@ impl Page {
 }
 
 fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(), String> {
-    let host = ws_url
-        .strip_prefix("ws://")
-        .and_then(|r| r.split('/').next())
-        .ok_or("bad websocket url")?;
+    let host = ws_url.strip_prefix("ws://").and_then(|r| r.split('/').next()).ok_or("bad websocket url")?;
     let stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
     let (ws, _) = tungstenite::client(ws_url, stream).map_err(|e| e.to_string())?;
     ws.get_ref().set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
@@ -167,8 +170,12 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
                 if poll_id.is_some() && v["id"].as_u64() == poll_id {
                     poll_id = None;
                     let r = &v["result"]["result"]["value"];
-                    let panes: Vec<String> =
-                        r["panes"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+                    let panes: Vec<String> = r["panes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect();
                     let changed = shared
                         .0
                         .lock()
@@ -205,7 +212,10 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
                     page.send("Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": sid }))?;
                 }
                 // Stops translating new text; text already translated stays until the window reloads.
-                page.send("Runtime.evaluate", json!({ "expression": "window.__agyI18n && window.__agyI18n.disable()" }))?;
+                page.send(
+                    "Runtime.evaluate",
+                    json!({ "expression": "window.__agyI18n && window.__agyI18n.disable()" }),
+                )?;
             }
             zh_applied = Some(want_zh);
         }

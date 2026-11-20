@@ -60,7 +60,8 @@ impl Engine {
         if !is_sub && cfg.include_subagents {
             ids.extend(self.tree(&root).into_iter().filter(|x| *x != id));
         }
-        let own: Vec<&Call> = self.convs.get(&id).map(|c| c.calls.iter().filter(|c| c.has_usage).collect()).unwrap_or_default();
+        let own: Vec<&Call> =
+            self.convs.get(&id).map(|c| c.calls.iter().filter(|c| c.has_usage).collect()).unwrap_or_default();
         let all: Vec<&Call> = ids
             .iter()
             .filter_map(|cid| self.convs.get(cid))
@@ -101,7 +102,11 @@ impl Engine {
 
         // Context
         let last = own.last().copied();
-        let ctx_max = if cfg.context_limit_override > 0 { cfg.context_limit_override } else { last.map(|c| c.ctx_max).unwrap_or(0) };
+        let ctx_max = if cfg.context_limit_override > 0 {
+            cfg.context_limit_override
+        } else {
+            last.map(|c| c.ctx_max).unwrap_or(0)
+        };
         let ctx_used = last.map(|c| c.ctx_used).unwrap_or(0);
         let ctx_series: Vec<u64> = own.iter().rev().take(SERIES_LEN).rev().map(|c| c.ctx_used).collect();
         let deltas: Vec<i64> = ctx_series.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
@@ -137,8 +142,11 @@ impl Engine {
                 .filter(|x| *x != root)
                 .map(|sid| {
                     let s = self.summaries.get(&sid).cloned().unwrap_or_default();
-                    let calls: Vec<&Call> =
-                        self.convs.get(&sid).map(|c| c.calls.iter().filter(|c| c.has_usage).collect()).unwrap_or_default();
+                    let calls: Vec<&Call> = self
+                        .convs
+                        .get(&sid)
+                        .map(|c| c.calls.iter().filter(|c| c.has_usage).collect())
+                        .unwrap_or_default();
                     json!({
                         "id": sid,
                         "type": s.sub_type,

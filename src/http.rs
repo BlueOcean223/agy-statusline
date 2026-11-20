@@ -24,10 +24,8 @@ pub fn request(
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 
-    let mut req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n",
-        body.len()
-    );
+    let mut req =
+        format!("{method} {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\nContent-Length: {}\r\n", body.len());
     for (k, v) in headers {
         req.push_str(k);
         req.push_str(": ");
@@ -74,17 +72,11 @@ fn is_complete(raw: &[u8]) -> bool {
 }
 
 fn parse_response(raw: &[u8]) -> std::io::Result<Response> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::other("no header terminator"))?;
+    let split =
+        raw.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| std::io::Error::other("no header terminator"))?;
     let head = String::from_utf8_lossy(&raw[..split]);
     let mut lines = head.split("\r\n");
-    let status = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
+    let status = lines.next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse().ok()).unwrap_or(0);
     let chunked = lines.any(|l| {
         let l = l.to_ascii_lowercase();
         l.starts_with("transfer-encoding:") && l.contains("chunked")
@@ -96,8 +88,7 @@ fn parse_response(raw: &[u8]) -> std::io::Result<Response> {
 
 fn dechunk(mut data: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len());
-    loop {
-        let Some(eol) = data.windows(2).position(|w| w == b"\r\n") else { break };
+    while let Some(eol) = data.windows(2).position(|w| w == b"\r\n") {
         let size_str = String::from_utf8_lossy(&data[..eol]);
         let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16).unwrap_or(0);
         data = &data[eol + 2..];

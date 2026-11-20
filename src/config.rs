@@ -152,10 +152,7 @@ pub fn find_app_data_dir() -> PathBuf {
             p = parent.to_path_buf();
         }
     }
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".gemini")
-        .join("antigravity")
+    dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".gemini").join("antigravity")
 }
 
 pub fn find_plugin_data_dir(app_data: &Path) -> PathBuf {

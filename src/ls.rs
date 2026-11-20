@@ -78,7 +78,8 @@ impl LsClient {
             Duration::from_secs(8),
         );
         // Judged by error kind: the OS message is localized (e.g. Chinese on Windows).
-        let refused = matches!(&res, Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable));
+        let refused =
+            matches!(&res, Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable));
         if let Ok(mut d) = self.down_since.lock() {
             if !refused {
                 *d = None;
