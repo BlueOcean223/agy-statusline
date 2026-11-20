@@ -2,7 +2,7 @@
 //! Only plain HTTP is supported; both targets listen on 127.0.0.1 without TLS.
 
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::TcpStream;
 use std::time::Duration;
 
 pub struct Response {
@@ -18,12 +18,9 @@ pub fn request(
     body: &[u8],
     timeout: Duration,
 ) -> std::io::Result<Response> {
-    let sock = addr
-        .to_socket_addrs()?
-        // `localhost` may resolve to ::1 first while the server only binds 127.0.0.1.
-        .min_by_key(|a| if a.is_ipv4() { 0 } else { 1 })
-        .ok_or_else(|| std::io::Error::other("address did not resolve"))?;
-    let mut stream = TcpStream::connect_timeout(&sock, timeout)?;
+    // Only loopback addresses are used here, where connecting succeeds or is refused at once, so no
+    // connect timeout is needed. `connect` tries each address `localhost` resolves to in turn.
+    let mut stream = TcpStream::connect(addr)?;
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
 

@@ -108,6 +108,7 @@
   <h2>还要你决定或注意的</h2>
   <ul>
     <li><strong>重启后的对话</strong>：Antigravity 重启后 language_server 只列出已加载的对话。sidecar 每 30 秒扫一遍 <code>brain/</code>，今天动过的对话主动查一次（查询会让后台加载它）；面板的“自动跟随”和最近对话列表按 <code>annotations/</code> 的最后查看时间排。</li>
+    <li><strong>language_server 换端口</strong>：sidecar 的地址来自启动时的环境变量，进程里不会变。连续 20 秒连不上（按错误类型判断，不看本地化的错误文字）就退出：Antigravity 还在管它就会带新地址重新拉起；Windows 上父进程退出后留下的孤儿 sidecar 也会这样自己结束。</li>
     <li><strong>为什么轮询而不用 binding</strong>：<code>Runtime.addBinding</code> 绑定在添加它的 CDP 会话上。sidecar 升级或被重启后，旧进程注入的页面还在调用已失效的 binding，新进程收不到。</li>
     <li><strong>调试端口</strong>：2.33.0 起只有带 <code>--remote-debugging-port</code> 启动才有。开了以后本机任何进程都能通过它控制 Antigravity 窗口。</li>
     <li>单价是公开 API 标准价折算，不是订阅实际扣费。</li>

@@ -738,6 +738,8 @@ pub fn port_file(plugin_data: &Path) -> PathBuf {
 /// The engine is shared with the side panel's HTTP handlers, which read details from it directly.
 pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
+const LS_GONE_AFTER: Duration = Duration::from_secs(20);
+
 pub fn run(shared: SharedRef) {
     let app_data = find_app_data_dir();
     let plugin_data = find_plugin_data_dir(&app_data);
@@ -800,8 +802,18 @@ pub fn run(shared: SharedRef) {
                     None => format!("connected to {addr}"),
                 };
             });
-            // language_server restarted (new port/token): rebuild the client next round.
-            if err.as_deref().is_some_and(|e| e.contains("refused") || e.contains("HTTP 401")) {
+            // The language_server went away or moved to a new port.
+            let down = eng.ls.unreachable_for();
+            if eng.ls.from_env {
+                // The address from the environment never changes in this process. If the language
+                // server that started this sidecar is still running, it starts a fresh one with the
+                // new address; if it is gone (Windows leaves children running), this one stops.
+                if down.is_some_and(|d| d >= LS_GONE_AFTER) {
+                    eprintln!("[agy-statusline] language_server at {addr} unreachable for {}s, exiting", LS_GONE_AFTER.as_secs());
+                    std::process::exit(1);
+                }
+            } else if down.is_some() || err.as_deref().is_some_and(|e| e.contains("HTTP 401")) {
+                // Found via ps/lsof: look it up again next round.
                 *engine = None;
             }
         }

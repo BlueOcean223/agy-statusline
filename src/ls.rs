@@ -5,8 +5,10 @@
 
 use crate::http;
 use serde_json::Value;
+use std::io::ErrorKind;
 use std::process::Command;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 const SERVICE: &str = "/exa.language_server_pb.LanguageServerService/";
 
@@ -14,6 +16,10 @@ const SERVICE: &str = "/exa.language_server_pb.LanguageServerService/";
 pub struct LsClient {
     pub addr: String,
     csrf: String,
+    /// The address came from the sidecar environment, so it can't be looked up again in-process.
+    pub from_env: bool,
+    /// Since when every call has failed to connect (nothing listening at `addr`).
+    down_since: Arc<Mutex<Option<Instant>>>,
 }
 
 impl LsClient {
@@ -23,7 +29,7 @@ impl LsClient {
         if addr.trim().is_empty() || csrf.trim().is_empty() {
             return None;
         }
-        Some(Self { addr: addr.trim().to_string(), csrf: csrf.trim().to_string() })
+        Some(Self::new(addr.trim(), csrf.trim(), true))
     }
 
     /// Finds the desktop app's language_server via `ps`/`lsof` and probes its listening ports.
@@ -38,13 +44,22 @@ impl LsClient {
             let (pid, args) = line.split_once(' ')?;
             let csrf = arg_value(args, "--csrf_token")?;
             for port in listening_ports(pid) {
-                let c = Self { addr: format!("127.0.0.1:{port}"), csrf: csrf.clone() };
+                let c = Self::new(&format!("127.0.0.1:{port}"), &csrf, false);
                 if c.call("GetAllCascadeTrajectories", &Value::Object(Default::default())).is_ok() {
                     return Some(c);
                 }
             }
         }
         None
+    }
+
+    fn new(addr: &str, csrf: &str, from_env: bool) -> Self {
+        Self { addr: addr.to_string(), csrf: csrf.to_string(), from_env, down_since: Arc::default() }
+    }
+
+    /// How long the language_server has refused connections, if it currently does.
+    pub fn unreachable_for(&self) -> Option<Duration> {
+        self.down_since.lock().ok()?.map(|t| t.elapsed())
     }
 
     pub fn connect() -> Option<Self> {
@@ -61,8 +76,23 @@ impl LsClient {
             &[("Content-Type", "application/json"), ("x-codeium-csrf-token", &self.csrf)],
             &payload,
             Duration::from_secs(8),
-        )
-        .map_err(|e| format!("{method}: {e}"))?;
+        );
+        // Judged by error kind: the OS message is localized (e.g. Chinese on Windows).
+        let refused = matches!(&res, Err(e) if matches!(e.kind(), ErrorKind::ConnectionRefused | ErrorKind::AddrNotAvailable));
+        if let Ok(mut d) = self.down_since.lock() {
+            if !refused {
+                *d = None;
+            } else if d.is_none() {
+                *d = Some(Instant::now());
+            }
+        }
+        let res = res.map_err(|e| {
+            if refused {
+                format!("{method}: nothing is listening at {} ({e})", self.addr)
+            } else {
+                format!("{method}: {e}")
+            }
+        })?;
         if res.status != 200 {
             let snippet = String::from_utf8_lossy(&res.body[..res.body.len().min(200)]).to_string();
             return Err(format!("{method}: HTTP {} {snippet}", res.status));
