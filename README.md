@@ -1,100 +1,125 @@
-# AGY Statusline (`agy-statusline`)
+<div align="center">
 
-Google Antigravity 2.x 桌面端的状态栏插件：在聊天输入框上方显示两行状态栏，右侧辅助面板（`AUX_PANE`）放详细数据和设置。外观参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack)，可选的中文界面直接用它的词典和翻译脚本（MIT，见 `i18n/LICENSE`）。
+# AGY Statusline
 
-```
-✦ Gemini 4 Neon (XHigh) | ⑂ main* · ↑1 · +525 −353 | ◔ 43% · 222k / 512k | ⛁ 212k · 97% hit | $ $21.8 · $43.2 today | ● running
-⧗ 4.0s | ϟ 857 tok/s | 5h ▮▮▮▯▯▯▯▯▯▯ 33% · 19:18 | 7d ▮▮▯▯▯▯▯▯▯▯ 18% · Wed 09:31 · ↓1%
-  ▣ research · API Researcher | ✦ Gemini 4 Neon (XHigh) | ◔ … | ⧗ 4.9s | ϟ 427 tok/s | ● running
-```
+[简体中文](README.md) | [English](README.en.md)
 
-## 安装
+**Google Antigravity 2.x 桌面端的原生 Rust 状态栏与用量遥测插件（macOS / Windows）**
 
-从 [Releases](https://github.com/BlueOcean223/agy-statusline/releases) 下载对应平台的包，解压出的 `agy-statusline/` 文件夹放进 Antigravity 的插件目录 `~/.gemini/config/plugins/`，Antigravity 会自动加载。
+输入框上方实时状态栏 · 侧边栏用量看板与调用明细 · 8 套明暗主题 · 可选中文界面 · 一键校验自更新
 
-- macOS：`agy-statusline-v<版本>-macos-universal.tar.gz`（Apple 芯片和 Intel 通用）。二进制没有签名，用浏览器下载的话先去掉隔离标记，否则系统会拦下它：`xattr -dr com.apple.quarantine ~/.gemini/config/plugins/agy-statusline`
-- Windows：`agy-statusline-v<版本>-windows-x64.zip`，放到 `%USERPROFILE%\.gemini\config\plugins\`。Windows 包还没有在真实的 Antigravity 上验证过。
+[![Release](https://img.shields.io/github/v/release/BlueOcean223/agy-statusline?label=Release)](https://github.com/BlueOcean223/agy-statusline/releases/latest)
+[![License](https://img.shields.io/github/license/BlueOcean223/agy-statusline)](LICENSE)
+![macOS](https://img.shields.io/badge/platform-macOS%20Universal-555555)
+![Windows](https://img.shields.io/badge/platform-Windows%20x64-0078D6)
 
-`SHA256SUMS` 里是各个包的校验和。
+<br>
 
-## 结构
+![AGY Statusline 输入框上方状态栏预览](assets/preview.png)
 
-方案对比和字段来源见 [docs/architecture.html](docs/architecture.html)。简单说：
+</div>
 
-| 部分 | 做什么 |
+> [!NOTE]
+> 这是一个第三方开源插件。所有遥测数据均只读获取自本机 `language_server` 与本地文件，**不拦截、不修改任何发往 Google 的请求**。视觉风格参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack) 与 [CCometixLine](https://github.com/Haleclipse/CCometixLine)。
+
+---
+
+## 核心特性
+
+- **原生轻量 Rust Sidecar**：单二进制运行，直接读取本机只读接口并配合 Hooks 即时刷新，**无需 Hook `fetch`、无需刷新窗口即可生效**。
+- **输入框上方状态栏**：两行展示模型、Git 仓库状态（分支/脏状态/领先落后/增删行数）、上下文占比与压缩徽章、Prompt 缓存命中率、对话/今日折算花费、首字延迟、输出速度、5h/7d 额度与节奏，以及树形列对齐的子代理行。
+- **五标签页右侧面板（`AUX_PANE`）**：顶部常驻实时状态栏预览，下方提供 **Overview / Turns / Usage / Theme / Settings** 完整视图。
+- **每日用量看板与历史补算**：7/30 天按模型堆叠柱状图、单日逐次调用明细下钻、首次启动只读补算历史对话库，以及按账号隔离的每周额度净变化与容量/耗尽预估。
+- **分层外观定制**：8 套明暗双版配色（`Theme` 页每张卡片均为当前对话的实时预览）、3 种外形、4 种额度进度条、紧凑/完整信息密度与 4 种内联图标样式（不依赖外部图标字体）。
+- **可选中文界面**：集成 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack) 词典与翻译器 v10，打开与关闭均**立刻生效**（关闭即时还原英文，无需刷新窗口），报错信息悬停显示英文原文。
+- **跨平台重启与更新中心**：支持 macOS / Windows 调试模式重启与防误重启进程校验；内置 GitHub Releases 一键 `SHA256SUMS` 校验自更新，以及可选的词典与官方价格表在线同步。
+
+---
+
+## 快速安装
+
+从 [Releases](https://github.com/BlueOcean223/agy-statusline/releases/latest) 下载对应平台的压缩包，解压出 `agy-statusline/` 文件夹放入 Antigravity 插件目录，Antigravity 会自动加载：
+
+| 平台 | 安装包 | 插件目录 |
+|---|---|---|
+| **macOS**（Apple Silicon & Intel 通用） | `agy-statusline-v<版本>-macos-universal.tar.gz` | `~/.gemini/config/plugins/agy-statusline` |
+| **Windows**（x64） | `agy-statusline-v<版本>-windows-x64.zip` | `%USERPROFILE%\.gemini\config\plugins\agy-statusline` |
+
+> **macOS 提示**：二进制未签名，如通过浏览器下载，请先移除隔离属性：
+> ```bash
+> xattr -dr com.apple.quarantine ~/.gemini/config/plugins/agy-statusline
+> ```
+
+Release 页面附带 `SHA256SUMS` 供校验。装好后在 Antigravity 右上角插件菜单中打开 **Statusline** 即可使用右侧面板；后续有新版本可直接在 `Settings → 更新中心` 一键更新。
+
+---
+
+## 启用输入框状态栏与中文界面
+
+Antigravity 2.33.0 起，需要带 `--remote-debugging-port=0` 启动参数才能向主窗口注入状态栏和中文界面（不带参数时，右侧面板照常工作）。
+
+- **推荐方式**：打开右侧面板 `Settings`，点击 **「以调试模式重启 Antigravity」**（二次确认，支持 macOS 与 Windows），插件会自动退出并带参数重新拉起。
+- **可选自动策略**：在 `Settings` 的 **「未带调试端口启动时」** 可切换 `不处理（默认）`、`弹框询问` 或 `自动重开`。触发前会先核验主进程命令行确实缺少参数，避免端口繁忙时误重启。
+- **手动启动**：
+  ```bash
+  # macOS
+  open -a Antigravity --args --remote-debugging-port=0
+  ```
+  ```powershell
+  # Windows
+  & "$env:LOCALAPPDATA\Programs\antigravity\Antigravity.exe" --remote-debugging-port=0
+  ```
+
+`0` 表示分配随机本机端口，sidecar 每 3 秒自动检测并注入，无需刷新窗口。
+
+> [!WARNING]
+> 开启 `--remote-debugging-port` 会在本机 `127.0.0.1` 暴露 Chromium 调试端口，本机其他进程可通过该端口访问 Antigravity 窗口。如介意此项，可不启用调试端口，仅使用右侧辅助面板。
+
+---
+
+## 功能一览
+
+### 输入框状态栏
+
+所有段均带自绘悬停提示（不被重绘打断），并在 `Settings` 提供 12 个独立显示开关：
+
+| 区域 | 显示项 | 说明 |
+|---|---|---|
+| **第一行** | 模型 · Git · 上下文 · 缓存 · 花费 · 运行状态 | 接口实际返回模型与界面名不符时标黄提醒；Git 显示分支/未提交 `*`/领先落后/相对 HEAD 行数变化；上下文配动态圆环仪表与紧凑压缩徽章 `↻N×`；`running` 空闲占位防止跳行 |
+| **第二行** | 首字延迟 · 输出速度 · `5h` 额度 · `7d` 额度 | 额度提供细条/10 格/圆环/隐藏四种样式；`7d` 附带相对一周匀速进度的超前（`↑` 标黄）或富余（`↓` 标绿）百分点 |
+| **子代理行** | `├` / `└` 树形多列对齐 | 自动展示活跃及刚结束（保留 10 秒）的子代理：角色、模型、上下文、缓存、自身花费与状态（`● 实时耗时` / `● waiting` 等待审批 / `✓ done 用时 · 步数`），悬停看当前动作与最近 5 步时间线 |
+
+### 右侧辅助面板（5 个标签页）
+
+| 标签页 | 内容 |
 |---|---|
-| `agy-statusline sidecar` | 由 `sidecars/statusline/sidecar.json` 拉起、Antigravity 负责重启。里面三件事：live 引擎调 language_server 只读 API 取数；CDP 画师把渲染脚本注入主窗口并推数据；HTTP 服务提供右侧面板 |
-| `agy-statusline hook` | `hooks.json` 里的各事件调用。只发一个 UDP 包告诉 sidecar“哪个对话发生了什么”，不等回应（≤10ms） |
-| `web/bar.js` | 注入页面的纯渲染脚本：找输入框、回报对话 ID、画状态栏。没有任何取数逻辑 |
-| `web/index.html` 等 | 右侧面板（Overview / Turns / Settings），数据来自 `/api/panel`，顶部状态条也由 `bar.js` 绘制 |
+| **Overview** | 当前对话上下文趋势与剩余轮次估算、Prompt 缓存命中/热度倒计时/节省金额、Token 与费用明细（含 Claude 缓存写入）、速度/TTFT 折线图、5h & 7d 双条额度进度及子代理跳转列表 |
+| **Turns** | 按倒序展示当前对话每次模型调用的时间、上下文大小、命中率、输出量、费用、速度与操作摘要 |
+| **Usage** | 今日 4 格 KPI、7/30 天按模型堆叠柱状图（含日均虚线与图例联动高亮）、每日汇总表、**点击任意日期下钻查看逐次调用明细**，以及按账号隔离的每周额度容量（`cap ≈`）与重置预估（`est`）；首次运行自动只读补算历史数据 |
+| **Theme** | 8 套明暗双版配色画廊（Cometix / Catppuccin / Tokyo Night / Rosé Pine / Gruvbox / Nord / Dracula / Mono，每张卡片实时渲染当前对话），以及外形（`plain` / `pill` / `powerline`）、额度进度条（`thin` / `cells` / `ring` / `none`）、信息密度（`compact` / `full`）与图标样式（`solid` / `outline` / `unicode` / `off`） |
+| **Settings** | 状态栏总开关与 12 个分段开关、中文界面开关、无调试端口启动策略与重启按钮、**更新中心**（插件自更新 + 词典/价格表在线同步）以及计算口径配置 |
 
-数据来源（都是本机 language_server 的只读接口，地址和 token 由 Antigravity 通过 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN` 交给 sidecar）：
+---
 
-- `GetAllCascadeTrajectories`：对话状态、步数、父子关系、工作区和分支
-- `GetCascadeTrajectoryGeneratorMetadata`：每次模型调用的 token、首字时间、生成时长、实际模型、上下文估算（按 offset 增量拉）
-- `RetrieveUserQuotaSummary`：5 小时和每周额度
+## 费用口径、隐私与网络
 
-Git 段在 sidecar 里对对话所在工作区（`workspaces[0].workspaceFolderAbsoluteUri`）跑 `git status --porcelain=v2 --branch` 和 `git diff HEAD --numstat`，每个工作区最多 5 秒一次，带 `GIT_OPTIONAL_LOCKS=0`，不抢你自己 git 命令要的锁。
+- **折算费用**：`费用 = token × 公开 API 标准价`，仅用于参考，不代表订阅实际扣费。内置单价覆盖 Gemini 4（含 Carbon/Argon `2026-12-01` 与 3.8 Flash `2027-01-01` 分时调价）、Claude Opus/Sonnet/Haiku（含 5 分钟缓存写入）及常见第三方模型，可在 `config.toml` 的 `[[models]]` 中自定义。
+- **本地隐私**：仅在 `plugin_data/agy-statusline/` 写入配置、数值汇总与额度采样，不存储对话正文或完整邮箱（账号仅存打码邮箱与哈希键）。
+- **联网行为**：默认仅两类只读下载（均可在 `Settings → 更新中心` 关闭，自动适配环境变量与 macOS/Windows 系统代理）：
+  1. 检查/下载本仓库 GitHub Releases 安装包与 `SHA256SUMS`（仅在手动点击更新后安装，开发仓库含 `.git` 时禁止覆盖）；
+  2. 按最新 commit SHA 从 `ncdeng/agy-zh-pack`（jsDelivr 多镜像 + GitHub raw 回退）同步词典、规则与官方价格表。
 
-另外读两类本地文件：`brain/<id>/.system_generated/logs/transcript.jsonl`（按字节偏移增量读，给每次调用补开始时间和“这一轮做了什么”的标签）和 `annotations/<id>.pbtxt`（对话标题）。
+---
 
-不修改 Antigravity 发出的任何请求。
+## 开发与文档
 
-## 启用输入框上方的状态栏
+- 架构原理、数据源、本地构建与发版流程：[docs/development.md](docs/development.md)
+- 方案对比与数据流图解：[docs/architecture.html](docs/architecture.html)
 
-Antigravity 2.33.0 起，只有带调试端口参数启动才能注入。最简单的是在右侧面板 Settings 里点“以调试模式重启 Antigravity”（点两次确认，会中断正在运行的对话）；它会退出 Antigravity，等进程结束后用下面的命令重新打开。也可以自己退出后运行：
+---
 
-```bash
-open -a Antigravity --args --remote-debugging-port=0
-```
+## 致谢与许可
 
-`0` 表示随机端口，端口号写在 `~/Library/Application Support/Antigravity/DevToolsActivePort`，sidecar 每 3 秒检查一次，连上后自动注入，不需要刷新窗口。不带参数启动时，右侧面板照常工作，Settings 里会显示 “no debugging port”。
-
-注意：开了调试端口后，本机任何进程都可以通过它控制 Antigravity 窗口。
-
-## 设置
-
-右侧面板的 Settings 页（写入 `~/.gemini/antigravity/plugin_data/agy-statusline/config.toml`）：
-
-- 面板顶部的状态条就是输入框状态栏的预览，跟着下面的设置立刻变化；设置改动 0.4 秒后自动保存
-- 输入框状态栏：总开关，以及模型、Git、上下文、缓存命中、对话花费、今日花费、首字延迟、输出速度、5 小时额度、7 天额度、运行状态、子代理行各自的开关
-- 中文界面：把 Antigravity 的菜单、按钮等界面文字换成中文，不动对话内容和代码。打开时立刻生效，窗口刷新后仍然生效；关闭后已经翻译的文字要刷新窗口（或重启）才恢复英文。同样需要调试端口
-- 调试端口状态和“以调试模式重启 Antigravity”按钮（目前只支持 macOS）
-- 上下文上限覆盖、缓存 TTL、面板合计是否含子代理
-- 模型单价在 config.toml 的 `[[models]]` 里改，按顺序匹配 `responseModel + 显示名`
-
-费用 = token × 单价，是公开 API 标准价的折算，不是订阅实际扣费。
-
-## 开发
-
-```bash
-cargo build --release && cp target/release/agy-statusline bin/.new && mv -f bin/.new bin/agy-statusline
-```
-
-替换后结束旧的 sidecar 进程（`pkill -f 'agy-statusline sidecar'`），Antigravity 会用新二进制重新拉起。
-
-- `agy-statusline live [对话ID…]`：打印推给页面的 JSON，不传 ID 时取最近修改的主对话。可在 sidecar 外单独运行（通过 `ps`/`lsof` 找 language_server）。
-- `AGY_DEVTOOLS_PORT_FILE=<path> agy-statusline sidecar --port 47811`：让 CDP 连到别的浏览器，用来在无头 Chrome 上测渲染。
-- `agy-statusline status [-c 对话ID]`：终端里的两行预览，默认取最近看过的对话。
-
-### CI 和发版
-
-- `.github/workflows/ci.yml`：推到 main 或开 PR 时，检查格式（`cargo fmt --check`）、JS 语法和 JSON 清单，并在 macOS、Windows、Linux 上跑 `cargo clippy -D warnings` 和 `cargo test`。
-- `.github/workflows/release.yml`：推 `v*` 标签时构建 macOS 通用二进制和 Windows 二进制，打成插件包发到 GitHub Release。标签必须和 `Cargo.toml`、`plugin.json` 里的版本一致，否则直接失败。
-
-发一个新版本：
-
-```bash
-# 先把 Cargo.toml 和 plugin.json 的 version 改成 0.3.0 并提交
-git tag v0.3.0 && git push origin v0.3.0
-```
-
-## 已知限制
-
-- 压缩次数只在一个对话上验证过（上下文估算从 481k 降到 22k）；那份数据里没有 `checkpointIndex`。
-- 重启按钮的“退出后重新打开”没有在真实窗口里完整走过一遍；确认流程和脚本语法已检查。
-- 子代理标签页（`subagent-tab-conversation`）的选择器沿用 agy-zh-pack，macOS 上还没在真实窗口里验证；主对话和首页已验证。
-
-## 许可
-
-MIT，见 [LICENSE](LICENSE)。`i18n/` 下的词典和翻译脚本来自 agy-zh-pack，按它自己的 MIT 许可（`i18n/LICENSE`）。`web/preload.js` 是 Antigravity 自带的 sidecar 前端桥接脚本，不在本项目许可范围内。
+- 状态栏视觉设计、配色思路与中文词典/翻译器来自或参考 [agy-zh-pack](https://github.com/ncdeng/agy-zh-pack) 与 [CCometixLine](https://github.com/Haleclipse/CCometixLine)。
+- 配色色值取自 Catppuccin、Tokyo Night、Rosé Pine、Gruvbox、Nord 与 Dracula 公开规范。
+- 本项目采用 **MIT** 许可，见 [LICENSE](LICENSE)。`i18n/` 下的词典与翻译脚本沿用 agy-zh-pack 的 MIT 许可（[i18n/LICENSE](i18n/LICENSE)）。`web/preload.js` 为 Antigravity 自带的 sidecar 桥接脚本，不在本项目许可范围内。
