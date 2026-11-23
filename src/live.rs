@@ -1,23 +1,34 @@
-//! Live data engine for the in-page statusline.
+//! Live data engine for the in-page statusline and side panel.
 //!
 //! Data comes from the language_server's read-only API, not from scraping the page:
 //! - `GetAllCascadeTrajectories`: every conversation's run status, step count, parent/root, subagent spec.
 //! - `GetCascadeTrajectoryGeneratorMetadata`: one record per model call with token usage,
 //!   time to first token, streaming duration, response model and context window usage.
 //!   `generatorMetadataOffset = N` returns records N.. so calls are fetched incrementally.
+//! - `GetCascadeTrajectorySteps`: incremental steps for active/recent subagents (waiting state,
+//!   elapsed time, current action and recent timeline).
 //! - `RetrieveUserQuotaSummary`: 5h / weekly quota buckets per model group.
+//! - `GetUserStatus`: masked account identity and subscription tier for per-account quota history.
 //!
 //! Hooks only tell the engine *when* to look (UDP datagram, see `hook.rs`), so a turn's numbers
 //! show up right after the call ends instead of on the next poll.
 
-use crate::config::{Config, ModelRule, find_app_data_dir, find_plugin_data_dir, load_config, write_atomic};
+use crate::config::{
+    Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_plugin_data_dir, load_config,
+    write_atomic,
+};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::transcript::Transcript;
+use crate::usage::{
+    AccountInfo, CallRecord, ModelAgg, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status,
+    load_history, load_samples, needs_backfill, quota_group_id, run_backfill, save_history, save_samples, today_str,
+    update_today,
+};
 use chrono::{DateTime, Local};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::UdpSocket;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SUB_DONE_SHOW_MS: i64 = 10_000;
 const MAX_SUBS: usize = 4;
+const SUB_STEPS_KEEP: usize = 30;
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -48,6 +60,21 @@ fn dur_ms(v: &Value) -> Option<f64> {
     s.strip_suffix('s')?.parse::<f64>().ok().map(|x| x * 1000.0)
 }
 
+fn clip(s: &str, max_chars: usize) -> String {
+    let compact: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let count = compact.chars().count();
+    if count <= max_chars {
+        compact
+    } else {
+        format!("{}…", compact.chars().take(max_chars.saturating_sub(1)).collect::<String>())
+    }
+}
+
+fn file_base(p: &str) -> String {
+    let stripped = p.trim_start_matches("file://");
+    stripped.rsplit(['/', '\\']).find(|s| !s.is_empty()).unwrap_or("").to_string()
+}
+
 // ---------------------------------------------------------------- model calls
 
 #[derive(Clone, Debug, Default)]
@@ -56,6 +83,7 @@ pub struct Call {
     pub resp_model: String,
     pub input: u64,
     pub cache: u64,
+    pub cache_write: u64,
     pub output: u64,
     pub ctx_used: u64,
     pub ctx_max: u64,
@@ -71,6 +99,8 @@ pub struct Call {
     pub live_seen: bool,
     /// From transcript.jsonl: what the model did with this response.
     pub label: Option<String>,
+    /// Optional requestId for cross-source deduplication in day-call breakdowns.
+    pub request_id: Option<String>,
 }
 
 impl Call {
@@ -80,12 +110,16 @@ impl Call {
         let ctx = &cm["chatStartMetadata"]["contextWindowMetadata"];
         let input = num(&usage["inputTokens"]);
         let cache = num(&usage["cacheReadTokens"]);
-        let output = num(&usage["outputTokens"]);
+        let cache_write = num(&usage["cacheWriteTokens"]);
+        let raw_out = num(&usage["outputTokens"]);
+        let split_out = num(&usage["thinkingOutputTokens"]).saturating_add(num(&usage["responseOutputTokens"]));
+        let output = raw_out.max(split_out);
         Call {
             display: cm["modelDisplayName"].as_str().unwrap_or("").to_string(),
             resp_model: cm["responseModel"].as_str().unwrap_or("").to_string(),
             input,
             cache,
+            cache_write,
             output,
             ctx_used: num(&ctx["estimatedTokensUsed"]),
             ctx_max: num(&ctx["maxContextTokens"]),
@@ -94,16 +128,27 @@ impl Call {
             stream_ms: dur_ms(&cm["streamingDuration"]),
             steps: g["stepIndices"].as_array().map(|a| a.iter().map(num).collect()).unwrap_or_default(),
             // Aborted/placeholder records can carry an empty `usage: {}` object with all-zero tokens.
-            has_usage: usage.is_object() && (input > 0 || cache > 0 || output > 0),
+            has_usage: usage.is_object() && (input > 0 || cache > 0 || cache_write > 0 || output > 0),
             at_ms: if live_seen { seen_at } else { 0 },
             dated: false,
             live_seen,
             label: None,
+            request_id: usage["requestId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         }
     }
 
-    fn price_key(&self) -> String {
+    pub(crate) fn price_key(&self) -> String {
         format!("{} {}", self.resp_model, self.display).to_lowercase()
+    }
+
+    pub(crate) fn model_bucket_key(&self) -> String {
+        if !self.resp_model.is_empty() {
+            self.resp_model.clone()
+        } else if !self.display.is_empty() {
+            self.display.clone()
+        } else {
+            "unknown".to_string()
+        }
     }
 
     pub fn tps(&self) -> Option<f64> {
@@ -112,7 +157,7 @@ impl Call {
     }
 }
 
-fn price_for<'a>(rules: &'a [ModelRule], call: &Call) -> Option<&'a ModelRule> {
+pub fn price_for<'a>(rules: &'a [ModelRule], call: &Call) -> Option<&'a ModelRule> {
     let key = call.price_key();
     rules.iter().find(|r| !r.pattern.is_empty() && key.contains(&r.pattern.to_lowercase()))
 }
@@ -122,30 +167,34 @@ pub struct Cost {
     #[serde(rename = "in")]
     pub input: f64,
     pub cache: f64,
+    pub cw: f64,
     pub out: f64,
 }
 
 impl Cost {
     pub fn total(&self) -> f64 {
-        self.input + self.cache + self.out
+        self.input + self.cache + self.cw + self.out
     }
 }
 
 pub fn call_cost(rules: &[ModelRule], c: &Call) -> Cost {
     let Some(r) = price_for(rules, c) else { return Cost::default() };
+    let (p_in, p_cr, p_cw, p_out) = r.rates_at(c.at_ms, now_ms());
     Cost {
-        input: c.input as f64 * r.input_per_m / 1e6,
-        cache: c.cache as f64 * r.cache_read_per_m / 1e6,
-        out: c.output as f64 * r.output_per_m / 1e6,
+        input: c.input as f64 * p_in / 1e6,
+        cache: c.cache as f64 * p_cr / 1e6,
+        cw: c.cache_write as f64 * p_cw / 1e6,
+        out: c.output as f64 * p_out / 1e6,
     }
 }
 
-// ---------------------------------------------------------------- conversations
+// ---------------------------------------------------------------- conversations & subagent steps
 
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
     pub status: String,
     pub step_count: u64,
+    pub created_ms: i64,
     pub modified_ms: i64,
     pub root: Option<String>,
     pub sub_type: Option<String>,
@@ -176,7 +225,112 @@ struct HookState {
     at_ms: i64,
 }
 
-// ---------------------------------------------------------------- shared state (engine ⇄ CDP threads)
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SubStep {
+    pub status: String,
+    pub text: String,
+    pub t0: i64,
+    pub t1: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SubStepCache {
+    pub next_offset: usize,
+    pub total: usize,
+    pub first_at: i64,
+    pub steps: BTreeMap<usize, SubStep>,
+    pub fetched_at: Option<Instant>,
+    pub final_fetched: bool,
+}
+
+fn parse_sub_step(st: &Value) -> Option<SubStep> {
+    let md = &st["metadata"];
+    let raw_type = st["type"].as_str().unwrap_or("").trim_start_matches("CORTEX_STEP_TYPE_");
+    if raw_type == "SYSTEM_MESSAGE" {
+        return None;
+    }
+    let tc = &md["toolCall"];
+    let tool_name = tc["name"].as_str().unwrap_or("");
+    let kind = match (raw_type, tool_name) {
+        ("GENERIC", "run_command") => "RUN_COMMAND",
+        ("GENERIC", "read_file" | "view_file") => "VIEW_FILE",
+        ("GENERIC", "edit_file" | "write_file") => "CODE_ACTION",
+        ("GENERIC", "search_web") => "SEARCH_WEB",
+        ("GENERIC", "invoke_subagent") => "INVOKE_SUBAGENT",
+        (t, _) => t,
+    };
+    let status = st["status"].as_str().unwrap_or("").trim_start_matches("CORTEX_STEP_STATUS_").to_string();
+
+    let args_val: Value = st["generic"]["args"]
+        .as_object()
+        .map(|o| Value::Object(o.clone()))
+        .or_else(|| tc["argumentsJson"].as_str().and_then(|s| serde_json::from_str(s).ok()))
+        .unwrap_or(Value::Null);
+    let payload = if st["generic"]["result"]["payload"].is_object() { &st["generic"]["result"]["payload"] } else { st };
+
+    let text = if let Some(s) = args_val["toolSummary"].as_str().filter(|s| !s.is_empty()) {
+        clip(s, 64)
+    } else {
+        match kind {
+            "RUN_COMMAND" => {
+                let cmd = payload["runCommand"]["commandLine"]
+                    .as_str()
+                    .or_else(|| args_val["CommandLine"].as_str())
+                    .unwrap_or("");
+                if cmd.is_empty() { "run_command".into() } else { format!("run_command: {}", clip(cmd, 52)) }
+            }
+            "VIEW_FILE" => {
+                let p =
+                    payload["viewFile"]["absolutePathUri"].as_str().or_else(|| args_val["Path"].as_str()).unwrap_or("");
+                let name = if tool_name.is_empty() { "read_file" } else { tool_name };
+                let base = file_base(p);
+                if base.is_empty() { name.into() } else { format!("{name}: {base}") }
+            }
+            "CODE_ACTION" => {
+                let p = args_val["Path"]
+                    .as_str()
+                    .or_else(|| args_val["TargetFile"].as_str())
+                    .or_else(|| args_val["path"].as_str())
+                    .unwrap_or("");
+                let name = if tool_name.is_empty() { "edit_file" } else { tool_name };
+                let base = file_base(p);
+                if base.is_empty() { name.into() } else { format!("{name}: {base}") }
+            }
+            "SEARCH_WEB" => {
+                let q = payload["searchWeb"]["query"].as_str().or_else(|| args_val["query"].as_str()).unwrap_or("");
+                if q.is_empty() { "search_web".into() } else { format!("search_web: {}", clip(q, 48)) }
+            }
+            "INVOKE_SUBAGENT" => {
+                let r = args_val["Role"].as_str().or_else(|| args_val["TypeName"].as_str()).unwrap_or("");
+                if r.is_empty() { "invoke_subagent".into() } else { format!("subagent: {}", clip(r, 44)) }
+            }
+            "PLANNER_RESPONSE" => {
+                let writing = st["plannerResponse"]["response"].as_str().is_some_and(|s| !s.is_empty());
+                if status == "GENERATING" {
+                    if writing { "writing response".into() } else { "thinking".into() }
+                } else {
+                    "planner response".into()
+                }
+            }
+            "USER_INPUT" => "prompt".into(),
+            _ => {
+                let desc = args_val["Description"]
+                    .as_str()
+                    .or_else(|| args_val["Task"].as_str())
+                    .or_else(|| args_val["task"].as_str())
+                    .unwrap_or("");
+                let label = if !tool_name.is_empty() { tool_name.to_string() } else { kind.to_lowercase() };
+                if desc.is_empty() { label } else { format!("{label}: {}", clip(desc, 48)) }
+            }
+        }
+    };
+
+    let t0 = md["startedAt"].as_str().or_else(|| md["createdAt"].as_str()).and_then(parse_ts).unwrap_or(0);
+    let t1 = md["completedAt"].as_str().and_then(parse_ts).unwrap_or(0);
+    Some(SubStep { status, text, t0, t1 })
+}
+
+// ---------------------------------------------------------------- shared state (engine ⇄ CDP / HTTP threads)
 
 #[derive(Default)]
 pub struct Shared {
@@ -188,11 +342,20 @@ pub struct Shared {
     /// Pages currently connected over CDP (page id → url), for the settings panel.
     pub pages: HashMap<String, String>,
     pub cdp_status: String,
+    /// CDP debugging port reachability & timestamp of last state transition (for relaunch guard).
+    pub cdp_port_ok: Option<bool>,
+    pub cdp_port_since: Option<Instant>,
     pub ls_status: String,
     /// Hook datagrams received since the engine last looked: (event, conversation id).
     pub hook_events: Vec<(String, String)>,
     /// Mirrors `config.ui_zh` for the CDP threads.
     pub ui_zh: bool,
+    /// Optional online i18n dictionary/rules (merged with bundled), pushed when `i18n_rev` increments.
+    pub i18n_dict: Option<String>,
+    pub i18n_rules: Option<String>,
+    pub i18n_rev: u64,
+    /// Optional online price table from `ncdeng/agy-zh-pack`'s `data/prices.json`.
+    pub online_prices: Option<OnlinePrices>,
     /// Conversations currently running, for the restart button's warning.
     pub running: usize,
     /// Conversations the side panel asked about, with the time of its last poll.
@@ -210,6 +373,51 @@ pub fn wake(shared: &SharedRef) {
     cv.notify_all();
 }
 
+// ---------------------------------------------------------------- usage store (shared with HTTP)
+
+pub struct UsageStore {
+    pub history: UsageHistory,
+    pub samples: QuotaSamples,
+    pub plugin_data: PathBuf,
+    pub last_saved: Instant,
+}
+
+pub static USAGE: Mutex<Option<UsageStore>> = Mutex::new(None);
+
+fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf) {
+    let history = load_history(&plugin_data);
+    let samples = load_samples(&plugin_data);
+    let need_bf = needs_backfill(&history);
+    if let Ok(mut guard) = USAGE.lock() {
+        *guard = Some(UsageStore { history, samples, plugin_data: plugin_data.clone(), last_saved: Instant::now() });
+    }
+    if need_bf {
+        std::thread::spawn(move || {
+            let mut local_h = USAGE
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().map(|u| u.history.clone()))
+                .unwrap_or_else(|| load_history(&plugin_data));
+            let changed = run_backfill(&app_data, &mut local_h, now_ms());
+            if changed
+                && let Ok(mut guard) = USAGE.lock()
+                && let Some(store) = guard.as_mut()
+            {
+                // Merge backfilled past days without losing any live updates to today.
+                let today = today_str();
+                for (day, rec) in local_h.days {
+                    if day < today {
+                        store.history.days.insert(day, rec);
+                    }
+                }
+                store.history.bf = local_h.bf;
+                save_history(&store.plugin_data, &store.history);
+                store.last_saved = Instant::now();
+            }
+        });
+    }
+}
+
 // ---------------------------------------------------------------- engine
 
 pub struct Engine {
@@ -221,8 +429,12 @@ pub struct Engine {
     pub(crate) dirty: HashSet<String>,
     /// When a subagent was first seen idle after being active (for the short "done" row).
     pub(crate) sub_done: HashMap<String, i64>,
+    pub(crate) sub_steps: HashMap<String, SubStepCache>,
     pub(crate) quota: Value,
     pub(crate) quota_at: Option<Instant>,
+    pub(crate) quota_at_ms: i64,
+    pub(crate) account: Option<AccountInfo>,
+    user_status_at: Option<Instant>,
     pub(crate) summaries_at: Option<Instant>,
     /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
     pub(crate) disk: HashMap<String, i64>,
@@ -244,8 +456,12 @@ impl Engine {
             hooks: HashMap::new(),
             dirty: HashSet::new(),
             sub_done: HashMap::new(),
+            sub_steps: HashMap::new(),
             quota: Value::Null,
             quota_at: None,
+            quota_at_ms: 0,
+            account: None,
+            user_status_at: None,
             summaries_at: None,
             disk: HashMap::new(),
             disk_at: None,
@@ -279,6 +495,7 @@ impl Engine {
             let next = Summary {
                 status: s["status"].as_str().unwrap_or("").to_string(),
                 step_count: num(&s["stepCount"]),
+                created_ms: s["createdTime"].as_str().and_then(parse_ts).unwrap_or(0),
                 modified_ms: s["lastModifiedTime"].as_str().and_then(parse_ts).unwrap_or(0),
                 root: tm["rootConversationId"].as_str().filter(|r| *r != id).map(str::to_string),
                 sub_type: spec["typeName"].as_str().map(str::to_string),
@@ -300,10 +517,16 @@ impl Engine {
                 }
                 if prev.active() && !next.active() {
                     self.sub_done.insert(id.clone(), now);
+                    if let Some(sc) = self.sub_steps.get_mut(id) {
+                        sc.final_fetched = false;
+                    }
                 }
             }
             if next.active() {
                 self.sub_done.remove(id);
+                if let Some(sc) = self.sub_steps.get_mut(id) {
+                    sc.final_fetched = false;
+                }
             }
             self.summaries.insert(id.clone(), next);
         }
@@ -352,6 +575,51 @@ impl Engine {
         }
         self.sync_transcript(id, true);
         Ok(())
+    }
+
+    /// Incrementally fetches steps for an active or recently-completed subagent so the bar can
+    /// show `waiting`, live elapsed duration, total steps, and a recent-steps timeline tooltip.
+    fn refresh_sub_steps(&mut self, id: &str) {
+        let running = self.is_running(id);
+        let cache = self.sub_steps.entry(id.to_string()).or_default();
+        if running {
+            if cache.fetched_at.is_some_and(|t| t.elapsed() < Duration::from_secs(3)) {
+                return;
+            }
+        } else if cache.final_fetched || cache.fetched_at.is_some_and(|t| t.elapsed() < Duration::from_millis(1200)) {
+            return;
+        }
+        let from = cache.next_offset;
+        cache.fetched_at = Some(Instant::now());
+        if !running {
+            cache.final_fetched = true;
+        }
+        let Ok(j) = self.ls.call("GetCascadeTrajectorySteps", &json!({ "cascadeId": id, "stepOffset": from })) else {
+            return;
+        };
+        let Some(arr) = j["steps"].as_array() else { return };
+        if arr.is_empty() {
+            return;
+        }
+        let cache = self.sub_steps.entry(id.to_string()).or_default();
+        for (i, st) in arr.iter().enumerate() {
+            let idx = from + i;
+            if let Some(parsed) = parse_sub_step(st) {
+                if parsed.t0 > 0 && (cache.first_at == 0 || parsed.t0 < cache.first_at) {
+                    cache.first_at = parsed.t0;
+                }
+                cache.steps.insert(idx, parsed);
+            }
+        }
+        cache.total = cache.total.max(from + arr.len());
+        cache.next_offset = from.max((from + arr.len()).saturating_sub(2));
+        while cache.steps.len() > SUB_STEPS_KEEP {
+            if let Some(&first_k) = cache.steps.keys().next() {
+                cache.steps.remove(&first_k);
+            } else {
+                break;
+            }
+        }
     }
 
     /// Dates calls and labels turns from transcript.jsonl (read incrementally).
@@ -414,7 +682,17 @@ impl Engine {
     pub(crate) fn refresh_quota(&mut self) -> Result<(), String> {
         let j = self.ls.call("RetrieveUserQuotaSummary", &json!({}))?;
         self.quota = j.get("response").cloned().unwrap_or(j);
+        self.quota_at_ms = now_ms();
         Ok(())
+    }
+
+    fn refresh_user_status(&mut self) {
+        if let Ok(j) = self.ls.call("GetUserStatus", &json!({}))
+            && let Some(acct) = account_from_user_status(&j)
+        {
+            self.account = Some(acct);
+        }
+        self.user_status_at = Some(Instant::now());
     }
 
     /// One engine step: refresh what is stale, then rebuild the payload for the given panes.
@@ -433,6 +711,9 @@ impl Engine {
                 Ok(()) => self.quota_at = Some(Instant::now()),
                 Err(e) => errors.push(e),
             }
+        }
+        if self.user_status_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(300)) {
+            self.refresh_user_status();
         }
 
         // Which conversations need (re)loading: everything touched today (for today's cost),
@@ -453,6 +734,8 @@ impl Engine {
                 want.insert(id.clone());
             }
         }
+        let mut visible_subs: HashSet<String> = HashSet::new();
+        let now = now_ms();
         for p in panes {
             want.insert(p.clone());
             let root = self.root_of(p);
@@ -460,6 +743,9 @@ impl Engine {
             for (id, s) in &self.summaries {
                 if s.root.as_deref() == Some(root.as_str()) {
                     want.insert(id.clone());
+                    if self.is_running(id) || self.sub_done.get(id).is_some_and(|t| now - t < SUB_DONE_SHOW_MS) {
+                        visible_subs.insert(id.clone());
+                    }
                 }
             }
         }
@@ -472,7 +758,8 @@ impl Engine {
                     (Some(c), Some(s)) => c.loaded_steps != s.step_count,
                     _ => false,
                 };
-                let running_on_screen = self.summaries.get(id).is_some_and(Summary::active) && panes.contains(id);
+                let running_on_screen = self.summaries.get(id).is_some_and(Summary::active)
+                    && (panes.contains(id) || visible_subs.contains(id));
                 !loaded || steps_changed || self.dirty.contains(id) || running_on_screen
             })
             .collect();
@@ -489,6 +776,11 @@ impl Engine {
                 Err(e) => errors.push(e),
             }
             self.dirty.remove(&id);
+        }
+
+        // Fetch steps for visible active/recently-finished subagents.
+        for sid in visible_subs {
+            self.refresh_sub_steps(&sid);
         }
 
         // Backfill historical subagents for panes on screen so restarts don't omit subagent cost.
@@ -551,6 +843,94 @@ impl Engine {
         }
     }
 
+    pub fn sync_usage_store(&self) {
+        let midnight = local_midnight_ms();
+        let today = today_str();
+        let mut live_by_conv: HashMap<String, HashMap<String, ModelAgg>> = HashMap::new();
+        for (cid, conv) in &self.convs {
+            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
+                live_by_conv.entry(cid.clone()).or_default().entry(c.model_bucket_key()).or_default().add(
+                    c.input,
+                    c.cache,
+                    c.cache_write,
+                    c.output,
+                );
+            }
+        }
+        let buckets = self.quota_bucket_samples();
+
+        if let Ok(mut guard) = USAGE.lock()
+            && let Some(store) = guard.as_mut()
+        {
+            let (hd, sd) = update_today(
+                &mut store.history,
+                &mut store.samples,
+                &today,
+                &live_by_conv,
+                &buckets,
+                self.account.as_ref(),
+                self.quota_at_ms,
+            );
+            if sd {
+                save_samples(&store.plugin_data, &store.samples);
+            }
+            if hd && store.last_saved.elapsed() >= Duration::from_secs(15) {
+                save_history(&store.plugin_data, &store.history);
+                store.last_saved = Instant::now();
+            }
+        }
+    }
+
+    fn quota_bucket_samples(&self) -> Vec<QuotaBucketSample> {
+        let mut out = Vec::new();
+        for g in self.quota["groups"].as_array().into_iter().flatten() {
+            let name = g["displayName"].as_str().unwrap_or("");
+            for b in g["buckets"].as_array().into_iter().flatten() {
+                let window = b["window"].as_str().unwrap_or("");
+                let Some(rem) = b["remainingFraction"].as_f64() else { continue };
+                let reset_ms = b["resetTime"].as_str().and_then(parse_ts).unwrap_or(0);
+                if window.is_empty() || !(0.0..=1.0).contains(&rem) {
+                    continue;
+                }
+                out.push(QuotaBucketSample {
+                    id: quota_group_id(name, window),
+                    name: name.to_string(),
+                    window: window.to_string(),
+                    used: (1.0 - rem).clamp(0.0, 1.0),
+                    reset_ms,
+                });
+            }
+        }
+        out
+    }
+
+    /// Exports live in-memory calls for the `/api/usage/day` call-breakdown view.
+    pub fn live_call_records(&self) -> Vec<CallRecord> {
+        let mut out = Vec::new();
+        for (cid, conv) in &self.convs {
+            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms > 0) {
+                let dedup_key = c
+                    .request_id
+                    .clone()
+                    .unwrap_or_else(|| format!("{}:{}:{}:{}", cid, c.at_ms / 1000, c.input, c.output));
+                out.push(CallRecord {
+                    conv_id: cid.clone(),
+                    at_ms: c.at_ms,
+                    model_raw: c.resp_model.clone(),
+                    model_display: c.display.clone(),
+                    input: c.input,
+                    cache_read: c.cache,
+                    cache_write: c.cache_write,
+                    output: c.output,
+                    ttft_ms: c.ttft_ms,
+                    stream_ms: c.stream_ms,
+                    dedup_key,
+                });
+            }
+        }
+        out
+    }
+
     pub fn root_of(&self, id: &str) -> String {
         let mut cur = id.to_string();
         for _ in 0..8 {
@@ -608,19 +988,57 @@ impl Engine {
         quota_views(group)
     }
 
-    pub fn build_payload(&self, panes: &HashSet<String>, cfg: &Config) -> Value {
-        let rules = &cfg.models;
+    /// Computes today's total cost and tokens (combining live memory + persisted today snapshot
+    /// so Antigravity restarts never reset today's counter).
+    pub(crate) fn today_totals(&self, rules: &[ModelRule]) -> (f64, u64) {
         let midnight = local_midnight_ms();
-        let mut today = 0.0;
+        let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
             for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
-                today += call_cost(rules, c).total();
+                live_cost += call_cost(rules, c).total();
+                live_tok += c.input + c.cache + c.cache_write + c.output;
             }
         }
+        let persisted = USAGE.lock().ok().and_then(|g| {
+            let store = g.as_ref()?;
+            let day = store.history.days.get(&today_str())?;
+            let now = now_ms();
+            let mut usd = 0.0;
+            let mut tok = 0u64;
+            for (model, agg) in &day.raw {
+                let (_, u) = crate::usage::price_tokens(
+                    rules,
+                    model,
+                    agg.input,
+                    agg.cache_read,
+                    agg.cache_write,
+                    agg.output,
+                    now,
+                    now,
+                );
+                usd += u;
+                tok += agg.total_tokens();
+            }
+            Some((usd, tok))
+        });
+        match persisted {
+            Some((p_cost, p_tok)) => (live_cost.max(p_cost), live_tok.max(p_tok)),
+            None => (live_cost, live_tok),
+        }
+    }
+
+    pub fn build_payload(&self, panes: &HashSet<String>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
+        let rules = effective_model_rules(&cfg.models, online);
+        let (today, _) = self.today_totals(&rules);
+        let price_src = match online {
+            Some(p) if !p.updated.is_empty() => format!("online ({})", p.updated),
+            Some(_) => "online".to_string(),
+            None => "bundled".to_string(),
+        };
 
         let mut views = serde_json::Map::new();
         for id in panes {
-            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg)).unwrap_or(Value::Null));
+            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &rules)).unwrap_or(Value::Null));
         }
         let groups: Vec<Value> = self.quota["groups"]
             .as_array()
@@ -638,17 +1056,19 @@ impl Engine {
             .unwrap_or_default();
         json!({
             "today": today,
+            "priceSource": price_src,
             "quotaGroups": groups,
             "views": views,
             "opts": {
                 "enabled": cfg.bar_enabled,
                 "seg": cfg.bar_segments,
+                "look": cfg.bar_look,
             },
             "error": self.last_error,
         })
     }
 
-    pub(crate) fn agent_line(&self, id: &str, cfg: &Config) -> AgentLine {
+    pub(crate) fn agent_line(&self, id: &str, cfg: &Config, rules: &[ModelRule]) -> AgentLine {
         let calls = self.convs.get(id).map(|c| c.calls.as_slice()).unwrap_or(&[]);
         let last = self.last_call(id);
         let ctx_max = if cfg.context_limit_override > 0 {
@@ -656,14 +1076,17 @@ impl Engine {
         } else {
             last.map(|c| c.ctx_max).unwrap_or(0)
         };
-        // Compaction count, two signals (whichever sees more): checkpointIndex moving forward,
-        // or the context estimate falling by more than 40% between consecutive calls.
-        // TODO: confirm both against a conversation that actually got compacted.
         let mut by_ck = 0;
         let mut by_drop = 0;
         let mut prev_ck = -1;
         let mut prev_used = 0u64;
+        let mut own_cost = 0.0;
+        let mut first_call_at = 0i64;
         for c in calls.iter().filter(|c| c.has_usage) {
+            own_cost += call_cost(rules, c).total();
+            if c.at_ms > 0 && (first_call_at == 0 || c.at_ms < first_call_at) {
+                first_call_at = c.at_ms;
+            }
             if c.checkpoint > prev_ck {
                 if c.checkpoint >= 0 {
                     by_ck += 1;
@@ -679,17 +1102,62 @@ impl Engine {
         }
         let compactions = by_ck.max(by_drop);
         let s = self.summaries.get(id);
+        let sc = self.sub_steps.get(id);
+
+        let started_ms = [s.map(|x| x.created_ms).unwrap_or(0), sc.map(|x| x.first_at).unwrap_or(0), first_call_at]
+            .into_iter()
+            .filter(|&t| t > 0)
+            .min();
+
+        let (waiting, current_step, timeline, ended_ms, step_total) = if let Some(sc) = sc {
+            let active_step = sc
+                .steps
+                .iter()
+                .rev()
+                .find(|(_, st)| st.status.contains("WAIT") || st.status == "RUNNING" || st.status == "GENERATING")
+                .or_else(|| sc.steps.iter().next_back());
+            let waiting = active_step.is_some_and(|(_, st)| st.status.contains("WAIT"));
+            let cur = active_step.map(|(k, st)| format!("{} (step {})", st.text, k + 1));
+            let tl: Vec<String> = sc
+                .steps
+                .iter()
+                .rev()
+                .take(5)
+                .rev()
+                .map(|(k, st)| {
+                    let sym = if st.status.contains("WAIT") {
+                        "?"
+                    } else if st.status == "ERROR" {
+                        "✗"
+                    } else if st.status == "DONE" {
+                        "✓"
+                    } else {
+                        "●"
+                    };
+                    format!("{sym} #{} {}", k + 1, st.text)
+                })
+                .collect();
+            let end = sc.steps.values().map(|st| st.t1.max(st.t0)).max().filter(|&t| t > 0);
+            (waiting, cur, tl, end, sc.total)
+        } else {
+            (false, None, Vec::new(), None, s.map(|x| x.step_count as usize).unwrap_or(0))
+        };
+
+        let ended_ms = ended_ms.or_else(|| last.map(|c| c.at_ms).filter(|&t| t > 0));
+
         AgentLine {
             id: id.to_string(),
             sub_type: s.and_then(|s| s.sub_type.clone()),
             sub_role: s.and_then(|s| s.sub_role.clone()),
             running: self.is_running(id),
+            waiting,
             model: last.map(|c| c.display.clone()),
             resp_model: last.map(|c| c.resp_model.clone()),
             ctx_used: last.map(|c| c.ctx_used),
             ctx_max,
             compactions,
             cache_read: last.map(|c| c.cache),
+            cache_write: last.map(|c| c.cache_write),
             cache_hit: last.and_then(|c| {
                 let denom = c.cache + c.input;
                 (denom > 0).then(|| c.cache as f64 / denom as f64)
@@ -697,16 +1165,21 @@ impl Engine {
             ttft_ms: last.and_then(|c| c.ttft_ms),
             tps: last.and_then(Call::tps),
             out_tokens: last.map(|c| c.output),
+            cost: own_cost,
+            started_ms,
+            ended_ms,
+            step_total,
+            current_step,
+            timeline,
             last_at: last.map(|c| c.at_ms),
             calls: calls.iter().filter(|c| c.has_usage).count(),
         }
     }
 
-    pub(crate) fn view(&self, id: &str, cfg: &Config) -> View {
-        let rules = &cfg.models;
+    pub(crate) fn view(&self, id: &str, cfg: &Config, rules: &[ModelRule]) -> View {
         let root = self.root_of(id);
         let is_sub = root != id;
-        let main = self.agent_line(id, cfg);
+        let main = self.agent_line(id, cfg, rules);
         let includes_subagents = !is_sub && cfg.include_subagents;
         let ids = if includes_subagents { self.tree(&root) } else { vec![id.to_string()] };
         let midnight = local_midnight_ms();
@@ -744,7 +1217,7 @@ impl Engine {
                 .collect();
             ids.sort_by_key(|sid| (!self.is_running(sid), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms))));
             let more = ids.len().saturating_sub(MAX_SUBS);
-            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg)).collect();
+            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, rules)).collect();
             if more > 0 {
                 subs.push(AgentLine { id: format!("+{more}"), ..Default::default() });
             }
@@ -813,16 +1286,24 @@ pub struct AgentLine {
     pub sub_type: Option<String>,
     pub sub_role: Option<String>,
     pub running: bool,
+    pub waiting: bool,
     pub model: Option<String>,
     pub resp_model: Option<String>,
     pub ctx_used: Option<u64>,
     pub ctx_max: u64,
     pub compactions: usize,
     pub cache_read: Option<u64>,
+    pub cache_write: Option<u64>,
     pub cache_hit: Option<f64>,
     pub ttft_ms: Option<f64>,
     pub tps: Option<f64>,
     pub out_tokens: Option<u64>,
+    pub cost: f64,
+    pub started_ms: Option<i64>,
+    pub ended_ms: Option<i64>,
+    pub step_total: usize,
+    pub current_step: Option<String>,
+    pub timeline: Vec<String>,
     pub last_at: Option<i64>,
     pub calls: usize,
 }
@@ -916,9 +1397,11 @@ const LS_GONE_AFTER: Duration = Duration::from_secs(20);
 pub fn run(shared: SharedRef) {
     let app_data = find_app_data_dir();
     let plugin_data = find_plugin_data_dir(&app_data);
+    init_usage_store(app_data.clone(), plugin_data.clone());
     spawn_hook_listener(&plugin_data, shared.clone());
 
     let mut last_payload = String::new();
+    let mut last_usage_sync = Instant::now() - Duration::from_secs(60);
     loop {
         let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
         if engine.is_none() {
@@ -932,7 +1415,7 @@ pub fn run(shared: SharedRef) {
             }
         }
 
-        let (panes, interest, events) = {
+        let (panes, interest, events, online_prices) = {
             let (m, _) = &*shared;
             m.lock()
                 .map(|mut s| {
@@ -940,7 +1423,7 @@ pub fn run(shared: SharedRef) {
                     s.panel.retain(|_, at| at.elapsed() < Duration::from_secs(15));
                     let mut interest = panes.clone();
                     interest.extend(s.panel.keys().cloned());
-                    (panes, interest, std::mem::take(&mut s.hook_events))
+                    (panes, interest, std::mem::take(&mut s.hook_events), s.online_prices.clone())
                 })
                 .unwrap_or_default()
         };
@@ -951,13 +1434,18 @@ pub fn run(shared: SharedRef) {
             }
             let cfg = load_config(&plugin_data);
             eng.tick(&interest);
+            if last_usage_sync.elapsed() >= Duration::from_secs(5) {
+                eng.sync_usage_store();
+                last_usage_sync = Instant::now();
+            }
             let running = eng.summaries.values().filter(|s| s.active()).count();
             let ui_zh = cfg.ui_zh;
             set_status(&shared, |s| {
                 s.ui_zh = ui_zh;
                 s.running = running;
             });
-            let payload = eng.build_payload(&panes, &cfg).to_string();
+            let active_online = cfg.online_data_sync.then_some(online_prices).flatten();
+            let payload = eng.build_payload(&panes, &cfg, active_online.as_ref()).to_string();
             if payload != last_payload {
                 last_payload = payload.clone();
                 let (m, cv) = &*shared;
@@ -978,9 +1466,6 @@ pub fn run(shared: SharedRef) {
             // The language_server went away or moved to a new port.
             let down = eng.ls.unreachable_for();
             if eng.ls.from_env {
-                // The address from the environment never changes in this process. If the language
-                // server that started this sidecar is still running, it starts a fresh one with the
-                // new address; if it is gone (Windows leaves children running), this one stops.
                 if down.is_some_and(|d| d >= LS_GONE_AFTER) {
                     eprintln!(
                         "[agy-statusline] language_server at {addr} unreachable for {}s, exiting",
@@ -989,7 +1474,6 @@ pub fn run(shared: SharedRef) {
                     std::process::exit(1);
                 }
             } else if down.is_some() || err.as_deref().is_some_and(|e| e.contains("HTTP 401")) {
-                // Found via ps/lsof: look it up again next round.
                 *engine = None;
             }
         }
@@ -1052,14 +1536,26 @@ mod tests {
 
         let real = json!({
             "chatModel": {
-                "modelDisplayName": "Gemini 4 Neon",
-                "usage": { "inputTokens": "100", "cacheReadTokens": "900", "outputTokens": "50" }
+                "modelDisplayName": "Claude Opus 5.5",
+                "responseModel": "claude-opus-5-5",
+                "usage": {
+                    "inputTokens": "100",
+                    "cacheReadTokens": "900",
+                    "cacheWriteTokens": "500",
+                    "thinkingOutputTokens": "80",
+                    "responseOutputTokens": "40"
+                }
             },
             "stepIndices": [1]
         });
         let c2 = Call::from_json(&real, 9_999, true);
         assert!(c2.has_usage);
-        assert_eq!(c2.at_ms, 9_999);
+        assert_eq!(c2.cache_write, 500);
+        assert_eq!(c2.output, 120);
+        let rules = crate::config::default_model_rules();
+        let cost = call_cost(&rules, &c2);
+        // 500 tokens * $5.0/M = $0.0025
+        assert!((cost.cw - 0.0025).abs() < 1e-9);
     }
 
     #[test]
@@ -1073,7 +1569,6 @@ mod tests {
         steps.insert(5, StepInfo { at_ms: day1 + 10_000, label: Some("step 5".into()) });
         steps.insert(10, StepInfo { at_ms: day2, label: Some("step 10".into()) });
 
-        // Old conversation with trailing undated call (e.g. e3094148 loaded days later):
         let mut old_calls = vec![
             Call { steps: vec![1], has_usage: true, ..Default::default() },
             Call { steps: vec![], has_usage: true, ..Default::default() },
@@ -1084,7 +1579,6 @@ mod tests {
         assert_eq!(old_calls[1].at_ms, day1_end);
         assert!(!old_calls[1].dated);
 
-        // Cross-day conversation with leading & mid-conv undated calls and a live-seen trailing call:
         let mut cross = vec![
             Call { steps: vec![], has_usage: true, ..Default::default() },
             Call { steps: vec![1], has_usage: true, ..Default::default() },
@@ -1094,18 +1588,30 @@ mod tests {
             Call { steps: vec![12], has_usage: true, at_ms: day2 + 5_000, live_seen: true, ..Default::default() },
         ];
         date_calls(&mut cross, &steps, day2);
-        assert_eq!(cross[0].at_ms, day1); // leading -> next dated (day1), not day2
+        assert_eq!(cross[0].at_ms, day1);
         assert_eq!(cross[1].at_ms, day1);
-        assert_eq!(cross[2].at_ms, day1); // middle -> prev dated (day1), not day2
+        assert_eq!(cross[2].at_ms, day1);
         assert_eq!(cross[3].at_ms, day1 + 10_000);
         assert_eq!(cross[4].at_ms, day2);
-        assert_eq!(cross[5].at_ms, day2 + 5_000); // live-seen kept until transcript flushes
+        assert_eq!(cross[5].at_ms, day2 + 5_000);
 
-        // Once step 12 flushes to transcript.jsonl, exact created_at replaces seen_at:
         steps.insert(12, StepInfo { at_ms: day2 + 4_500, label: Some("Final reply".into()) });
         date_calls(&mut cross, &steps, day2 + 5_000);
         assert_eq!(cross[5].at_ms, day2 + 4_500);
         assert!(cross[5].dated);
         assert_eq!(cross[5].label.as_deref(), Some("Final reply"));
+    }
+
+    #[test]
+    fn parses_subagent_waiting_step() {
+        let st = json!({
+            "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
+            "status": "CORTEX_STEP_STATUS_WAITING",
+            "runCommand": { "commandLine": "cargo test" },
+            "metadata": { "createdAt": "2026-11-23T06:00:00Z" }
+        });
+        let p = parse_sub_step(&st).unwrap();
+        assert_eq!(p.status, "WAITING");
+        assert!(p.text.contains("cargo test"));
     }
 }

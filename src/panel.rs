@@ -1,7 +1,7 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
-use crate::config::Config;
-use crate::live::{Call, Engine, call_cost, local_midnight_ms, now_ms};
+use crate::config::{Config, OnlinePrices, effective_model_rules};
+use crate::live::{Call, Engine, call_cost, now_ms};
 use crate::transcript::{annotated_ids, read_annotation};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -59,7 +59,7 @@ impl Engine {
         }
     }
 
-    pub fn panel(&mut self, requested: Option<&str>, cfg: &Config) -> Value {
+    pub fn panel(&mut self, requested: Option<&str>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
         let id = match requested.filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
             None => match self.top_level_recent().into_iter().next() {
@@ -68,7 +68,7 @@ impl Engine {
             },
         };
         self.ensure_loaded(&id);
-        let rules = &cfg.models;
+        let rules = effective_model_rules(&cfg.models, online);
         let root = self.root_of(&id);
         let is_sub = root != id;
         let summary = self.summaries.get(&id).cloned().unwrap_or_default();
@@ -87,36 +87,31 @@ impl Engine {
             .collect();
 
         // Tokens and cost
-        let (mut fresh, mut cache, mut out) = (0u64, 0u64, 0u64);
-        let (mut c_in, mut c_cache, mut c_out) = (0.0, 0.0, 0.0);
+        let (mut fresh, mut cache, mut cache_write, mut out) = (0u64, 0u64, 0u64, 0u64);
+        let (mut c_in, mut c_cache, mut c_cw, mut c_out) = (0.0, 0.0, 0.0, 0.0);
         let mut saved = 0.0;
         for c in &all {
             fresh += c.input;
             cache += c.cache;
+            cache_write += c.cache_write;
             out += c.output;
-            let k = call_cost(rules, c);
+            let k = call_cost(&rules, c);
             c_in += k.input;
             c_cache += k.cache;
+            c_cw += k.cw;
             c_out += k.out;
             // What the cached tokens would have cost as fresh input.
             if c.cache > 0 && c.input > 0 && k.input > 0.0 {
                 saved += c.cache as f64 * (k.input / c.input as f64) - k.cache;
             }
         }
-        let cost = c_in + c_cache + c_out;
+        let cost = c_in + c_cache + c_cw + c_out;
         let first_at = own.iter().map(|c| c.at_ms).min().unwrap_or(0);
         let last_at = own.iter().map(|c| c.at_ms).max().unwrap_or(0);
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let midnight = local_midnight_ms();
-        let (mut today_cost, mut today_tokens) = (0.0, 0u64);
-        for conv in self.convs.values() {
-            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
-                today_cost += call_cost(rules, c).total();
-                today_tokens += c.input + c.cache + c.output;
-            }
-        }
+        let (today_cost, today_tokens) = self.today_totals(&rules);
 
         // Context
         let last = own.last().copied();
@@ -170,8 +165,8 @@ impl Engine {
                         "type": s.sub_type,
                         "role": s.sub_role,
                         "model": calls.last().map(|c| c.display.clone()),
-                        "tokens": calls.iter().map(|c| c.input + c.cache + c.output).sum::<u64>(),
-                        "cost": calls.iter().map(|c| call_cost(rules, c).total()).sum::<f64>(),
+                        "tokens": calls.iter().map(|c| c.input + c.cache + c.cache_write + c.output).sum::<u64>(),
+                        "cost": calls.iter().map(|c| call_cost(&rules, c).total()).sum::<f64>(),
                         "running": self.is_running(&sid),
                         "lastAt": calls.last().map(|c| c.at_ms),
                     })
@@ -191,7 +186,7 @@ impl Engine {
                     "ctx": c.ctx_used,
                     "hit": hit(c),
                     "out": c.output,
-                    "cost": call_cost(rules, c).total(),
+                    "cost": call_cost(&rules, c).total(),
                     "tps": c.tps(),
                     "ttftMs": c.ttft_ms,
                     "label": c.label.clone().unwrap_or_else(|| "…".into()),
@@ -218,20 +213,22 @@ impl Engine {
             "activity": if running { last.and_then(|c| c.label.clone()).map(|l| format!("Running · {l}")).unwrap_or_else(|| "Running".into()) } else { "Idle".into() },
             "workspace": summary.workspace,
             "branch": summary.branch,
+            "account": self.account,
             "recent": recent,
-            "bar": self.build_payload(&panes, cfg),
+            "bar": self.build_payload(&panes, cfg, online),
             "ctx": {
                 "used": ctx_used, "max": ctx_max, "left": ctx_left, "delta": last_delta,
                 "turnsLeft": turns_left, "series": ctx_series,
-                "compactions": self.view(&id, cfg).main.compactions,
+                "compactions": self.view(&id, cfg, &rules).main.compactions,
             },
             "cache": {
                 "lastHit": last.map(hit), "sessionHit": session_hit, "misses": misses,
                 "savedUsd": saved, "warmLeftSec": warm_left, "ttlSec": cfg.cache_ttl_sec,
             },
             "tokens": {
-                "fresh": fresh, "cache": cache, "out": out, "total": fresh + cache + out,
-                "costIn": c_in, "costCache": c_cache, "costOut": c_out, "cost": cost,
+                "fresh": fresh, "cache": cache, "cacheWrite": cache_write, "out": out,
+                "total": fresh + cache + cache_write + out,
+                "costIn": c_in, "costCache": c_cache, "costCacheWrite": c_cw, "costOut": c_out, "cost": cost,
                 "ratePerHr": rate_per_hr, "todayCost": today_cost, "todayTokens": today_tokens,
                 "includesSubagents": !is_sub && cfg.include_subagents,
             },

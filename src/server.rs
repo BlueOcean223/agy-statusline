@@ -1,4 +1,11 @@
-use crate::config::{ConfigPatch, apply_config_patch, find_app_data_dir, find_plugin_data_dir, load_config};
+use crate::config::{
+    ConfigPatch, OnlinePrices, apply_config_patch, effective_model_rules, find_app_data_dir, find_plugin_data_dir,
+    load_config,
+};
+use crate::live::{ENGINE, USAGE, now_ms, wake};
+use crate::relaunch;
+use crate::updater;
+use crate::usage;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::env;
@@ -60,6 +67,7 @@ fn parse_query(q: &str) -> HashMap<String, String> {
 fn send_response(mut stream: TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let reason = match status {
         200 => "OK",
+        400 => "Bad Request",
         401 => "Unauthorized",
         404 => "Not Found",
         405 => "Method Not Allowed",
@@ -92,9 +100,16 @@ fn call_agentapi(args: &[&str], app_data: &Path) -> Value {
     }
 }
 
+fn active_online_prices(cfg_enabled: bool) -> Option<OnlinePrices> {
+    if !cfg_enabled {
+        return None;
+    }
+    LIVE.get().and_then(|sh| sh.0.lock().ok().and_then(|s| s.online_prices.clone()))
+}
+
 fn handle_client(stream: TcpStream, ui_token: String) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
 
     let Ok(cloned) = stream.try_clone() else {
         return;
@@ -177,9 +192,10 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         ("GET", "/api/panel") => {
             let conv_id = query.get("conversationId").map(String::as_str).filter(|s| !s.is_empty());
             let cfg = load_config(&plugin_data);
-            let out = match crate::live::ENGINE.lock() {
+            let online = active_online_prices(cfg.online_data_sync);
+            let out = match ENGINE.lock() {
                 Ok(mut guard) => match guard.as_mut() {
-                    Some(eng) => eng.panel(conv_id, &cfg),
+                    Some(eng) => eng.panel(conv_id, &cfg, online.as_ref()),
                     None => json!({ "id": null, "error": "language_server not connected" }),
                 },
                 Err(_) => json!({ "id": null, "error": "engine unavailable" }),
@@ -194,6 +210,47 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             out["config"] = serde_json::to_value(&cfg).unwrap_or(Value::Null);
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
+        ("GET", "/api/usage") => {
+            let days = query.get("days").and_then(|s| s.parse::<usize>().ok()).unwrap_or(7);
+            let cfg = load_config(&plugin_data);
+            let online = active_online_prices(cfg.online_data_sync);
+            let rules = effective_model_rules(&cfg.models, online.as_ref());
+            let price_src = match &online {
+                Some(p) if !p.updated.is_empty() => format!("online ({})", p.updated),
+                Some(_) => "online".to_string(),
+                None => "bundled".to_string(),
+            };
+            // Flush latest live numbers into the usage store before rendering.
+            if let Ok(guard) = ENGINE.lock()
+                && let Some(eng) = guard.as_ref()
+            {
+                eng.sync_usage_store();
+            }
+            let out = match USAGE.lock() {
+                Ok(guard) => match guard.as_ref() {
+                    Some(store) => {
+                        usage::build_usage_view(&store.history, &store.samples, days, &rules, now_ms(), &price_src)
+                    }
+                    None => json!({ "days": [], "error": "usage history initializing" }),
+                },
+                Err(_) => json!({ "days": [], "error": "usage store unavailable" }),
+            };
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
+        ("GET", "/api/usage/day") => {
+            let date = query.get("date").map(String::as_str).unwrap_or("");
+            if date.len() != 10 || !date.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+                send_response(stream, 400, "application/json", br#"{"error":"bad date"}"#);
+                return;
+            }
+            let cfg = load_config(&plugin_data);
+            let online = active_online_prices(cfg.online_data_sync);
+            let rules = effective_model_rules(&cfg.models, online.as_ref());
+            let live_calls =
+                ENGINE.lock().ok().and_then(|g| g.as_ref().map(|e| e.live_call_records())).unwrap_or_default();
+            let out = usage::build_day_calls_view(&app_data, date, &live_calls, &rules, now_ms());
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
         ("GET", "/api/live-status") => {
             let out = match LIVE.get() {
                 Some(shared) => {
@@ -206,6 +263,7 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                             "rev": s.rev,
                             "running": s.running,
                             "debug": !s.pages.is_empty(),
+                            "relaunch": relaunch::status_json(&plugin_data),
                         })
                     });
                     s.unwrap_or_else(|_| json!({}))
@@ -214,6 +272,52 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             };
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
+        ("GET", "/api/update/status") => {
+            let out = updater::status_json(&plugin_data);
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
+        ("POST", "/api/update/check") => match updater::check_release(&plugin_data) {
+            Ok(_) => {
+                let out = updater::status_json(&plugin_data);
+                send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+            }
+            Err(e) => {
+                let out = serde_json::to_vec(
+                    &json!({ "ok": false, "error": e, "status": updater::status_json(&plugin_data) }),
+                )
+                .unwrap_or_default();
+                send_response(stream, 500, "application/json", &out);
+            }
+        },
+        ("POST", "/api/update/install") => match updater::start_install_release(plugin_data.clone()) {
+            Ok(ver) => {
+                let out = serde_json::to_vec(&json!({ "ok": true, "version": ver })).unwrap_or_default();
+                send_response(stream, 200, "application/json", &out);
+            }
+            Err(e) => {
+                let out = serde_json::to_vec(&json!({ "ok": false, "error": e })).unwrap_or_default();
+                send_response(stream, 400, "application/json", &out);
+            }
+        },
+        ("POST", "/api/data-sync") => {
+            let Some(shared) = LIVE.get() else {
+                send_response(stream, 500, "application/json", br#"{"ok":false,"error":"engine not started"}"#);
+                return;
+            };
+            match updater::sync_remote_data(&plugin_data, shared) {
+                Ok(_) => {
+                    let out = updater::status_json(&plugin_data);
+                    send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+                }
+                Err(e) => {
+                    let out = serde_json::to_vec(
+                        &json!({ "ok": false, "error": e, "status": updater::status_json(&plugin_data) }),
+                    )
+                    .unwrap_or_default();
+                    send_response(stream, 500, "application/json", &out);
+                }
+            }
+        }
         ("GET", "/api/config") => {
             let cfg = load_config(&plugin_data);
             let out = serde_json::to_vec(&cfg).unwrap_or_default();
@@ -221,12 +325,22 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         }
         ("POST", "/api/config") => {
             let patch: ConfigPatch = serde_json::from_slice(&body).unwrap_or_default();
+            let toggle_sync = patch.online_data_sync;
             let cfg = apply_config_patch(&plugin_data, patch);
+            if let Some(shared) = LIVE.get() {
+                if let Some(en) = toggle_sync {
+                    updater::apply_remote_cache_to_shared(&plugin_data, shared, en);
+                }
+                wake(shared);
+            }
             let out = serde_json::to_vec(&json!({ "ok": true, "config": cfg })).unwrap_or_default();
             send_response(stream, 200, "application/json", &out);
         }
-        ("POST", "/api/restart-debug") => match restart_debug() {
-            Ok(()) => send_response(stream, 200, "application/json", br#"{"ok":true}"#),
+        ("POST", "/api/restart-debug") => match relaunch::relaunch_now(&plugin_data) {
+            Ok(target) => {
+                let out = serde_json::to_vec(&json!({ "ok": true, "target": target })).unwrap_or_default();
+                send_response(stream, 200, "application/json", &out);
+            }
             Err(e) => {
                 let out = serde_json::to_vec(&json!({ "ok": false, "error": e })).unwrap_or_default();
                 send_response(stream, 500, "application/json", &out);
@@ -246,49 +360,21 @@ fn handle_client(stream: TcpStream, ui_token: String) {
     }
 }
 
-/// Quits Antigravity and reopens it with `--remote-debugging-port=0`. The script runs in its own
-/// process group so it outlives this sidecar, which Antigravity stops when it quits.
-#[cfg(target_os = "macos")]
-fn restart_debug() -> Result<(), String> {
-    use std::os::unix::process::CommandExt;
-    const SCRIPT: &str = r#"
-sleep 1
-osascript -e 'tell application "Antigravity" to quit'
-i=0
-while pgrep -xq Antigravity; do
-  i=$((i+1))
-  [ "$i" -ge 120 ] && exit 1
-  sleep 0.5
-done
-sleep 1
-open -a Antigravity --args --remote-debugging-port=0
-"#;
-    std::process::Command::new("/bin/sh")
-        .arg("-c")
-        .arg(SCRIPT)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .process_group(0)
-        .spawn()
-        .map(|_| ())
-        .map_err(|e| format!("spawn restart script: {e}"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn restart_debug() -> Result<(), String> {
-    Err("restart is only implemented on macOS; relaunch Antigravity with --remote-debugging-port=0".into())
-}
-
 static LIVE: std::sync::OnceLock<crate::live::SharedRef> = std::sync::OnceLock::new();
 
-/// Starts the live engine (language_server polling) and the CDP painter next to the HTTP server.
+/// Starts the live engine (language_server polling), CDP painter, relaunch watcher, and updater.
 fn start_live() {
+    let app_data = find_app_data_dir();
+    let plugin_data = find_plugin_data_dir(&app_data);
     let shared: crate::live::SharedRef = std::sync::Arc::default();
     let _ = LIVE.set(shared.clone());
+
     let s1 = shared.clone();
     thread::spawn(move || crate::live::run(s1));
-    thread::spawn(move || crate::cdp::run(shared));
+    let s2 = shared.clone();
+    thread::spawn(move || crate::cdp::run(s2));
+    relaunch::start_watch(shared.clone(), plugin_data.clone());
+    updater::start_background(plugin_data, shared);
 }
 
 pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {

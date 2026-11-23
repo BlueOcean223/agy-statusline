@@ -6,8 +6,11 @@ mod http;
 mod live;
 mod ls;
 mod panel;
+mod relaunch;
 mod server;
 mod transcript;
+mod updater;
+mod usage;
 
 use clap::{Parser, Subcommand};
 use config::{find_app_data_dir, find_plugin_data_dir};
@@ -57,7 +60,7 @@ fn print_status(conv: &str) {
     let cfg = config::load_config(&find_plugin_data_dir(&find_app_data_dir()));
     let mut eng = live::Engine::new(ls);
     eng.tick(&Default::default());
-    let p = eng.panel(Some(conv).filter(|c| !c.is_empty()), &cfg);
+    let p = eng.panel(Some(conv).filter(|c| !c.is_empty()), &cfg, None);
     let Some(id) = p["id"].as_str() else {
         println!("no conversations");
         return;
@@ -125,7 +128,7 @@ fn print_live(ids: Vec<String>) {
         panes.insert(id.clone());
     }
     eng.tick(&panes);
-    let payload = eng.build_payload(&panes, &cfg);
+    let payload = eng.build_payload(&panes, &cfg, None);
     println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
 }
 

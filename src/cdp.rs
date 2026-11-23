@@ -25,8 +25,10 @@ const I18N_TRANSLATOR: &str = include_str!("../i18n/translator.js");
 const I18N_DICT: &str = include_str!("../i18n/zh-CN.json");
 const I18N_RULES: &str = include_str!("../i18n/zh-CN.rules.json");
 
-fn i18n_source() -> String {
-    format!("try {{ ({I18N_TRANSLATOR})({I18N_DICT}, {I18N_RULES}); }} catch (e) {{ console.warn('agy i18n', e); }}")
+fn i18n_source(dict: Option<&str>, rules: Option<&str>) -> String {
+    let d = dict.unwrap_or(I18N_DICT);
+    let r = rules.unwrap_or(I18N_RULES);
+    format!("try {{ ({I18N_TRANSLATOR})({d}, {r}); }} catch (e) {{ console.warn('agy i18n', e); }}")
 }
 const POLL_EVERY: Duration = Duration::from_millis(1000);
 
@@ -58,10 +60,10 @@ fn list_pages(port: u16) -> Option<Vec<Value>> {
 pub fn run(shared: SharedRef) {
     let connected: Arc<Mutex<HashSet<String>>> = Arc::default();
     loop {
-        let status = match devtools_port() {
-            None => "no debugging port: launch Antigravity with --remote-debugging-port=0".to_string(),
+        let (port_ok, status) = match devtools_port() {
+            None => (false, "no debugging port: launch Antigravity with --remote-debugging-port=0".to_string()),
             Some(port) => match list_pages(port) {
-                None => format!("debugging port {port} not answering (stale DevToolsActivePort?)"),
+                None => (false, format!("debugging port {port} not answering (stale DevToolsActivePort?)")),
                 Some(targets) => {
                     for t in targets {
                         let kind = t["type"].as_str().unwrap_or("");
@@ -95,12 +97,16 @@ pub fn run(shared: SharedRef) {
                         });
                     }
                     let n = connected.lock().map(|c| c.len()).unwrap_or(0);
-                    format!("port {port}, {n} page(s) attached")
+                    (true, format!("port {port}, {n} page(s) attached"))
                 }
             },
         };
         if let Ok(mut s) = shared.0.lock() {
             s.cdp_status = status;
+            if s.cdp_port_ok != Some(port_ok) {
+                s.cdp_port_ok = Some(port_ok);
+                s.cdp_port_since = Some(Instant::now());
+            }
         }
         thread::sleep(Duration::from_secs(3));
     }
@@ -139,16 +145,14 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
         s.pages.insert(id.to_string(), url.to_string());
     }
 
-    // The page is polled for the conversations its inputs show rather than calling back through a
-    // Runtime binding: a binding stays tied to the CDP session that added it, so after the sidecar
-    // restarts, a page injected by the previous process would keep calling a dead binding.
     let mut pushed_rev = 0u64;
     let mut poll_id: Option<u64> = None;
-    // Chinese UI: whether it is applied, and the id of its registered new-document script.
-    // None on attach, so a page left translated by an earlier sidecar run is also switched off.
+    // Chinese UI: whether it is applied, which i18n revision is active, and registered script IDs.
     let mut zh_applied: Option<bool> = None;
+    let mut zh_rev = u64::MAX;
     let mut zh_add_id: Option<u64> = None;
     let mut zh_script: Option<String> = None;
+    let mut zh_old_script: Option<String> = None;
     let mut polled_at = Instant::now() - POLL_EVERY;
     loop {
         if poll_id.is_none() && polled_at.elapsed() >= POLL_EVERY {
@@ -166,6 +170,9 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
                 if zh_add_id.is_some() && v["id"].as_u64() == zh_add_id {
                     zh_add_id = None;
                     zh_script = v["result"]["identifier"].as_str().map(str::to_string);
+                    if let Some(old) = zh_old_script.take() {
+                        let _ = page.send("Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": old }));
+                    }
                 }
                 if poll_id.is_some() && v["id"].as_u64() == poll_id {
                     poll_id = None;
@@ -197,24 +204,43 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
             Err(e) => return Err(e.to_string()),
         }
 
-        let (rev, payload, want_zh) = match shared.0.lock() {
-            Ok(s) => (s.rev, if s.rev != pushed_rev { s.payload.clone() } else { String::new() }, s.ui_zh),
+        let (rev, payload, want_zh, i18n_rev, i18n_dict, i18n_rules) = match shared.0.lock() {
+            Ok(s) => {
+                let need_zh_src = s.ui_zh && (zh_applied != Some(true) || zh_rev != s.i18n_rev);
+                (
+                    s.rev,
+                    if s.rev != pushed_rev { s.payload.clone() } else { String::new() },
+                    s.ui_zh,
+                    s.i18n_rev,
+                    if need_zh_src { s.i18n_dict.clone() } else { None },
+                    if need_zh_src { s.i18n_rules.clone() } else { None },
+                )
+            }
             Err(_) => return Err("state poisoned".into()),
         };
-        if zh_applied != Some(want_zh) && zh_add_id.is_none() {
+        if zh_add_id.is_none() && (zh_applied != Some(want_zh) || (want_zh && zh_rev != i18n_rev)) {
             if want_zh {
-                let src = i18n_source();
+                let src = i18n_source(i18n_dict.as_deref(), i18n_rules.as_deref());
+                // Register new script first, then remove old once its identifier arrives (zero-gap).
+                zh_old_script = zh_script.take();
                 page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": src }))?;
                 zh_add_id = Some(page.seq);
                 page.send("Runtime.evaluate", json!({ "expression": src }))?;
+                zh_rev = i18n_rev;
             } else {
                 if let Some(sid) = zh_script.take() {
                     page.send("Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": sid }))?;
                 }
-                // Stops translating new text; text already translated stays until the window reloads.
+                if let Some(old) = zh_old_script.take() {
+                    page.send("Page.removeScriptToEvaluateOnNewDocument", json!({ "identifier": old }))?;
+                }
+                // Translator v10 remembers original English strings in WeakMaps: updating with
+                // empty dict/rules restores all translated text immediately before disconnecting.
                 page.send(
                     "Runtime.evaluate",
-                    json!({ "expression": "window.__agyI18n && window.__agyI18n.disable()" }),
+                    json!({
+                        "expression": "if (window.__agyI18n) { try { window.__agyI18n.update({}, []); } catch (e) {} window.__agyI18n.disable(); }"
+                    }),
                 )?;
             }
             zh_applied = Some(want_zh);
