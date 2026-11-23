@@ -31,13 +31,17 @@
     <nav class="tabs" role="tablist">
       <button type="button" class="tab active" data-tab="overview">Overview</button>
       <button type="button" class="tab" data-tab="turns">Turns <span id="turns-count" class="tab-count"></span></button>
-      <button type="button" class="tab" data-tab="settings">Settings</button>
+      <button type="button" class="tab" data-tab="usage">Usage</button>
+      <button type="button" class="tab" data-tab="theme">Theme</button>
+      <button type="button" class="tab" data-tab="settings">Settings <span id="update-dot" class="tab-dot hidden" title="有新版本可用"></span></button>
     </nav>
   </header>
 
   <main class="main">
     <section id="panel-overview" class="tab-panel"></section>
     <section id="panel-turns" class="tab-panel hidden"></section>
+    <section id="panel-usage" class="tab-panel hidden"></section>
+    <section id="panel-theme" class="tab-panel hidden"></section>
     <section id="panel-settings" class="tab-panel hidden"></section>
   </main>
 
