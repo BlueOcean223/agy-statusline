@@ -19,6 +19,7 @@ use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +29,7 @@ const PROMPT_AFTER: Duration = Duration::from_secs(20);
 const COOLDOWN_MS: i64 = 120_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub enum LaunchFlag {
     Flag,
     NoFlag,
