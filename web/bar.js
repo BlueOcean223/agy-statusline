@@ -113,9 +113,21 @@
     return s;
   };
   const costSeg = (v, today, showConv) => {
-    const parts = [showConv ? fmtUsd(v.costConv) : null];
+    const convText = showConv ? fmtUsd(v.costConv) + (v.multiDay ? ' conv' : '') : null;
+    const parts = [convText];
     if (today != null) parts.push(dim(fmtUsd(today) + ' today'));
-    let title = 'Estimated at public API list prices (not what the subscription charges)\nThis conversation incl. subagents: ' + fmtUsd(v.costConv);
+    const scope = v.isSub
+      ? 'This subagent'
+      : v.includesSubagents === false
+        ? 'This conversation (main only)'
+        : 'This conversation (incl. subagents)';
+    let title = 'Estimated at public API list prices (not what the subscription charges)\n' + scope + ': ' + fmtUsd(v.costConv);
+    if (v.multiDay && v.costConvToday != null) {
+      title += ' (' + fmtUsd(v.costConvToday) + ' today)';
+    }
+    if (today != null) {
+      title += '\nToday (all conversations): ' + fmtUsd(today);
+    }
     if (v.costLast) {
       title += '\nLast call: input ' + fmtUsd(v.costLast.in) + ' · cache ' + fmtUsd(v.costLast.cache) + ' · output ' + fmtUsd(v.costLast.out);
     }

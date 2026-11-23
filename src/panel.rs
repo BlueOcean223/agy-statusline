@@ -34,9 +34,27 @@ impl Engine {
         let root = self.root_of(id);
         let mut ids = self.tree(&root);
         ids.push(id.to_string());
+        let mut loaded_unknown = false;
         for cid in ids {
             if !self.convs.contains_key(&cid) {
-                let _ = self.refresh_conv(&cid);
+                let was_in_summaries = self.summaries.contains_key(&cid);
+                if self.refresh_conv(&cid).is_ok() && !was_in_summaries {
+                    loaded_unknown = true;
+                }
+            }
+        }
+        if self.load_subagent_hints(&[id.to_string(), root]) {
+            loaded_unknown = true;
+        }
+        if loaded_unknown && self.refresh_summaries().is_ok() {
+            self.summaries_at = Some(std::time::Instant::now());
+            let root = self.root_of(id);
+            for cid in self.tree(&root) {
+                if !self.convs.contains_key(&cid) {
+                    let _ = self.refresh_conv(&cid);
+                } else {
+                    self.sync_transcript(&cid, false);
+                }
             }
         }
     }

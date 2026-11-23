@@ -35,7 +35,7 @@ pub struct Config {
     /// 0 means use the limit the language_server reports (`maxContextTokens`).
     pub context_limit_override: u64,
     pub cache_ttl_sec: u64,
-    /// Count subagents' calls in a root conversation's token and cost totals (side panel).
+    /// Count subagents' calls in a root conversation's token and cost totals (bar and side panel).
     pub include_subagents: bool,
     /// In-page statusline above the chat input (drawn over CDP).
     pub bar_enabled: bool,

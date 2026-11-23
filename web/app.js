@@ -332,7 +332,7 @@
           <input id="cfg-ttl" type="number" step="30" min="30" class="field-input" value="${c.cache_ttl_sec}" />
         </div>
         <div class="form-row">
-          <div class="form-label"><span>总计包含子代理</span><span class="form-hint">面板 Tokens &amp; Cost 是否计入子代理</span></div>
+          <div class="form-label"><span>总计包含子代理</span><span class="form-hint">状态栏与面板的对话总计是否计入子代理</span></div>
           <input id="cfg-sub" type="checkbox" ${c.include_subagents ? 'checked' : ''} />
         </div>
         <div class="form-hint" style="margin-top:6px">模型单价在 config.toml 的 [[models]] 里改，按顺序匹配“实际模型名 + 显示名”。</div>

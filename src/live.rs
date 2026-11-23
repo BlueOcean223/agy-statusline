@@ -65,29 +65,39 @@ pub struct Call {
     pub steps: Vec<u64>,
     pub has_usage: bool,
     pub at_ms: i64,
+    /// True once `at_ms` has been resolved from `transcript.jsonl`'s `created_at`.
+    pub dated: bool,
+    /// True when this call first appeared incrementally after the conversation was already loaded.
+    pub live_seen: bool,
     /// From transcript.jsonl: what the model did with this response.
     pub label: Option<String>,
 }
 
 impl Call {
-    fn from_json(g: &Value, seen_at: i64) -> Self {
+    pub(crate) fn from_json(g: &Value, seen_at: i64, live_seen: bool) -> Self {
         let cm = &g["chatModel"];
         let usage = &cm["usage"];
         let ctx = &cm["chatStartMetadata"]["contextWindowMetadata"];
+        let input = num(&usage["inputTokens"]);
+        let cache = num(&usage["cacheReadTokens"]);
+        let output = num(&usage["outputTokens"]);
         Call {
             display: cm["modelDisplayName"].as_str().unwrap_or("").to_string(),
             resp_model: cm["responseModel"].as_str().unwrap_or("").to_string(),
-            input: num(&usage["inputTokens"]),
-            cache: num(&usage["cacheReadTokens"]),
-            output: num(&usage["outputTokens"]),
+            input,
+            cache,
+            output,
             ctx_used: num(&ctx["estimatedTokensUsed"]),
             ctx_max: num(&ctx["maxContextTokens"]),
             checkpoint: cm["chatStartMetadata"]["checkpointIndex"].as_i64().unwrap_or(-1),
             ttft_ms: dur_ms(&cm["timeToFirstToken"]),
             stream_ms: dur_ms(&cm["streamingDuration"]),
             steps: g["stepIndices"].as_array().map(|a| a.iter().map(num).collect()).unwrap_or_default(),
-            has_usage: usage.is_object(),
-            at_ms: seen_at,
+            // Aborted/placeholder records can carry an empty `usage: {}` object with all-zero tokens.
+            has_usage: usage.is_object() && (input > 0 || cache > 0 || output > 0),
+            at_ms: if live_seen { seen_at } else { 0 },
+            dated: false,
+            live_seen,
             label: None,
         }
     }
@@ -156,6 +166,7 @@ pub struct Conv {
     pub calls: Vec<Call>,
     loaded_steps: u64,
     loaded_once: bool,
+    last_conv_mod: i64,
     transcript: Option<Transcript>,
 }
 
@@ -216,6 +227,8 @@ pub struct Engine {
     /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
     pub(crate) disk: HashMap<String, i64>,
     disk_at: Option<Instant>,
+    /// Candidate subagent ids from transcripts already probed via `refresh_conv`.
+    probed_hints: HashSet<String>,
     /// Workspace path → (when read, git status).
     git: HashMap<String, (Instant, Option<GitInfo>)>,
     pub last_error: Option<String>,
@@ -236,6 +249,7 @@ impl Engine {
             summaries_at: None,
             disk: HashMap::new(),
             disk_at: None,
+            probed_hints: HashSet::new(),
             git: HashMap::new(),
             last_error: None,
         }
@@ -299,46 +313,102 @@ impl Engine {
     pub(crate) fn refresh_conv(&mut self, id: &str) -> Result<(), String> {
         let now = now_ms();
         let conv = self.convs.entry(id.to_string()).or_default();
+        let was_loaded = conv.loaded_once;
         // Re-read the last record: it may have been written before its usage was filled in.
         let offset = conv.calls.len().saturating_sub(1);
         let j = self.ls.call(
             "GetCascadeTrajectoryGeneratorMetadata",
             &json!({ "cascadeId": id, "generatorMetadataOffset": offset }),
         )?;
+        let prev_last = conv.calls.get(offset).map(|c| (c.at_ms, c.dated, c.live_seen));
         let fresh: Vec<Call> = j["generatorMetadata"]
             .as_array()
-            .map(|a| a.iter().map(|g| Call::from_json(g, now)).collect())
+            .map(|a| {
+                a.iter()
+                    .enumerate()
+                    .map(|(i, g)| {
+                        let live_seen = match prev_last {
+                            Some((_, _, ls)) if i == 0 => ls,
+                            _ => was_loaded,
+                        };
+                        Call::from_json(g, now, live_seen)
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
-        let prev_at = conv.calls.get(offset).map(|c| c.at_ms);
+        if fresh.is_empty() && offset < conv.calls.len() {
+            return Ok(());
+        }
         conv.calls.truncate(offset);
         conv.calls.extend(fresh);
-        if let (Some(t), Some(c)) = (prev_at, conv.calls.get_mut(offset)) {
+        if let (Some((t, dated, live_seen)), Some(c)) = (prev_last, conv.calls.get_mut(offset)) {
             c.at_ms = t;
+            c.dated = dated;
+            c.live_seen = live_seen;
         }
         conv.loaded_once = true;
         if let Some(s) = self.summaries.get(id) {
             conv.loaded_steps = s.step_count;
         }
-        self.sync_transcript(id);
+        self.sync_transcript(id, true);
         Ok(())
     }
 
-    /// Dates calls and labels turns from transcript.jsonl (read incrementally). Calls the transcript
-    /// doesn't cover yet keep the time they were first fetched.
-    fn sync_transcript(&mut self, id: &str) {
+    /// Dates calls and labels turns from transcript.jsonl (read incrementally).
+    /// Undated calls fall back to neighbouring calls or the conversation's modified time rather
+    /// than `now`, so loading a historical conversation never pollutes today's cost.
+    pub(crate) fn sync_transcript(&mut self, id: &str, force: bool) {
         let app_data = self.app_data.clone();
+        let summary_mod = self.summaries.get(id).map(|s| s.modified_ms).unwrap_or(0);
+        let disk_mod = self.disk.get(id).copied().unwrap_or(0);
         let Some(conv) = self.convs.get_mut(id) else { return };
         let t = conv.transcript.get_or_insert_with(|| Transcript::new(&app_data, id));
-        t.sync();
-        for c in &mut conv.calls {
-            let infos: Vec<_> = c.steps.iter().filter_map(|s| t.steps.get(s)).collect();
-            if let Some(at) = infos.iter().map(|i| i.at_ms).filter(|&t| t > 0).min() {
-                c.at_ms = at;
-            }
-            if let Some(l) = infos.iter().find_map(|i| i.label.clone()) {
-                c.label = Some(l);
-            }
+        let parsed_new = t.sync();
+        let file_mod = if disk_mod > 0 { disk_mod } else { t.mtime_ms() };
+        let conv_mod = summary_mod.max(file_mod);
+        if force || parsed_new || conv_mod != conv.last_conv_mod {
+            conv.last_conv_mod = conv_mod;
+            date_calls(&mut conv.calls, &t.steps, conv_mod);
         }
+    }
+
+    /// Probes subagent ids referenced in the transcripts of `seeds` that the language_server has
+    /// not loaded yet (e.g. historical subagents of a conversation opened after restart).
+    /// Returns true if any new conversation was loaded.
+    pub(crate) fn load_subagent_hints(&mut self, seeds: &[String]) -> bool {
+        let mut loaded_any = false;
+        let mut queue: Vec<String> = seeds.to_vec();
+        let mut seen: HashSet<String> = queue.iter().cloned().collect();
+        for _ in 0..3 {
+            let mut next_queue = Vec::new();
+            for cid in queue {
+                let hints: Vec<String> = self
+                    .convs
+                    .get(&cid)
+                    .and_then(|c| c.transcript.as_ref())
+                    .map(|t| t.subagent_hints.iter().cloned().collect())
+                    .unwrap_or_default();
+                for sid in hints {
+                    if sid == cid || self.convs.contains_key(&sid) || !self.probed_hints.insert(sid.clone()) {
+                        continue;
+                    }
+                    if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
+                        continue;
+                    }
+                    if self.refresh_conv(&sid).is_ok() {
+                        loaded_any = true;
+                        if seen.insert(sid.clone()) {
+                            next_queue.push(sid);
+                        }
+                    }
+                }
+            }
+            if next_queue.is_empty() {
+                break;
+            }
+            queue = next_queue;
+        }
+        loaded_any
     }
 
     pub(crate) fn refresh_quota(&mut self) -> Result<(), String> {
@@ -407,11 +477,66 @@ impl Engine {
             })
             .collect();
         todo.sort();
+        let mut loaded_unknown = false;
         for id in todo {
-            if let Err(e) = self.refresh_conv(&id) {
-                errors.push(e);
+            let was_in_summaries = self.summaries.contains_key(&id);
+            match self.refresh_conv(&id) {
+                Ok(()) => {
+                    if !was_in_summaries {
+                        loaded_unknown = true;
+                    }
+                }
+                Err(e) => errors.push(e),
             }
             self.dirty.remove(&id);
+        }
+
+        // Backfill historical subagents for panes on screen so restarts don't omit subagent cost.
+        let mut seeds: Vec<String> = Vec::new();
+        for p in panes {
+            seeds.push(p.clone());
+            let root = self.root_of(p);
+            if root != *p {
+                seeds.push(root);
+            }
+        }
+        if self.load_subagent_hints(&seeds) {
+            loaded_unknown = true;
+        }
+        if loaded_unknown {
+            match self.refresh_summaries() {
+                Ok(()) => {
+                    self.summaries_at = Some(Instant::now());
+                    let mut extra: Vec<String> = Vec::new();
+                    for p in panes {
+                        let root = self.root_of(p);
+                        for cid in self.tree(&root) {
+                            if !self.convs.contains_key(&cid) {
+                                extra.push(cid);
+                            }
+                        }
+                    }
+                    extra.sort();
+                    extra.dedup();
+                    for cid in extra {
+                        if let Err(e) = self.refresh_conv(&cid) {
+                            errors.push(e);
+                        }
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+
+        // Pick up late-flushed transcript.jsonl entries (timestamps/labels) without an LS RPC.
+        let sync_ids: Vec<String> = self
+            .convs
+            .iter()
+            .filter(|(_, c)| c.calls.iter().any(|call| call.has_usage && (!call.dated || call.label.is_none())))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in sync_ids {
+            self.sync_transcript(&id, false);
         }
         self.last_error = errors.into_iter().next();
 
@@ -488,10 +613,8 @@ impl Engine {
         let midnight = local_midnight_ms();
         let mut today = 0.0;
         for conv in self.convs.values() {
-            for c in &conv.calls {
-                if c.at_ms >= midnight {
-                    today += call_cost(rules, c).total();
-                }
+            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
+                today += call_cost(rules, c).total();
             }
         }
 
@@ -584,11 +707,23 @@ impl Engine {
         let root = self.root_of(id);
         let is_sub = root != id;
         let main = self.agent_line(id, cfg);
-        let ids = if is_sub { vec![id.to_string()] } else { self.tree(&root) };
+        let includes_subagents = !is_sub && cfg.include_subagents;
+        let ids = if includes_subagents { self.tree(&root) } else { vec![id.to_string()] };
+        let midnight = local_midnight_ms();
         let mut cost_conv = 0.0;
+        let mut cost_conv_today = 0.0;
+        let mut multi_day = false;
         for cid in &ids {
             if let Some(conv) = self.convs.get(cid) {
-                cost_conv += conv.calls.iter().map(|c| call_cost(rules, c).total()).sum::<f64>();
+                for c in conv.calls.iter().filter(|c| c.has_usage) {
+                    let cost = call_cost(rules, c).total();
+                    cost_conv += cost;
+                    if c.at_ms >= midnight {
+                        cost_conv_today += cost;
+                    } else if c.at_ms > 0 {
+                        multi_day = true;
+                    }
+                }
             }
         }
         let last = self.last_call(id);
@@ -624,6 +759,9 @@ impl Engine {
             main,
             is_sub,
             cost_conv,
+            cost_conv_today,
+            multi_day,
+            includes_subagents,
             cost_last,
             price_name: price,
             quota: self.quota_for(last),
@@ -633,6 +771,38 @@ impl Engine {
 
     pub fn summaries(&self) -> &HashMap<String, Summary> {
         &self.summaries
+    }
+}
+
+pub(crate) fn date_calls(calls: &mut [Call], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
+    for c in calls.iter_mut() {
+        let infos: Vec<_> = c.steps.iter().filter_map(|s| steps.get(s)).collect();
+        if let Some(at) = infos.iter().map(|i| i.at_ms).filter(|&t| t > 0).min() {
+            c.at_ms = at;
+            c.dated = true;
+        }
+        if let Some(l) = infos.iter().find_map(|i| i.label.clone()) {
+            c.label = Some(l);
+        }
+    }
+    let last_dated_idx = calls.iter().rposition(|c| c.dated);
+    let mut prev_dated = 0i64;
+    for i in 0..calls.len() {
+        if calls[i].dated {
+            prev_dated = calls[i].at_ms;
+            continue;
+        }
+        if calls[i].live_seen && calls[i].at_ms > 0 {
+            continue;
+        }
+        let fallback = if last_dated_idx.is_none_or(|last| i > last) {
+            conv_mod_ms.max(prev_dated)
+        } else if prev_dated > 0 {
+            prev_dated
+        } else {
+            calls[i + 1..].iter().find(|c| c.dated).map(|c| c.at_ms).unwrap_or(conv_mod_ms)
+        };
+        calls[i].at_ms = fallback;
     }
 }
 
@@ -663,6 +833,9 @@ pub struct View {
     pub main: AgentLine,
     pub is_sub: bool,
     pub cost_conv: f64,
+    pub cost_conv_today: f64,
+    pub multi_day: bool,
+    pub includes_subagents: bool,
     pub cost_last: Option<Cost>,
     pub price_name: Option<String>,
     pub quota: Vec<QuotaView>,
@@ -856,5 +1029,83 @@ fn spawn_hook_listener(plugin_data: &Path, shared: SharedRef) {
 fn set_status(shared: &SharedRef, f: impl FnOnce(&mut Shared)) {
     if let Ok(mut s) = shared.0.lock() {
         f(&mut s);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transcript::StepInfo;
+
+    #[test]
+    fn empty_usage_object_not_counted_as_has_usage() {
+        let empty = json!({
+            "chatModel": {
+                "modelDisplayName": "Gemini 4 Neon",
+                "usage": {}
+            },
+            "stepIndices": []
+        });
+        let c = Call::from_json(&empty, 9_999, false);
+        assert!(!c.has_usage);
+        assert_eq!(c.at_ms, 0);
+
+        let real = json!({
+            "chatModel": {
+                "modelDisplayName": "Gemini 4 Neon",
+                "usage": { "inputTokens": "100", "cacheReadTokens": "900", "outputTokens": "50" }
+            },
+            "stepIndices": [1]
+        });
+        let c2 = Call::from_json(&real, 9_999, true);
+        assert!(c2.has_usage);
+        assert_eq!(c2.at_ms, 9_999);
+    }
+
+    #[test]
+    fn date_calls_handles_historical_cross_day_and_live_calls() {
+        let day1 = 1_795_079_391_000i64;
+        let day1_end = 1_795_079_455_000i64;
+        let day2 = 1_795_409_479_000i64;
+
+        let mut steps = HashMap::new();
+        steps.insert(1, StepInfo { at_ms: day1, label: Some("step 1".into()) });
+        steps.insert(5, StepInfo { at_ms: day1 + 10_000, label: Some("step 5".into()) });
+        steps.insert(10, StepInfo { at_ms: day2, label: Some("step 10".into()) });
+
+        // Old conversation with trailing undated call (e.g. e3094148 loaded days later):
+        let mut old_calls = vec![
+            Call { steps: vec![1], has_usage: true, ..Default::default() },
+            Call { steps: vec![], has_usage: true, ..Default::default() },
+        ];
+        date_calls(&mut old_calls, &steps, day1_end);
+        assert_eq!(old_calls[0].at_ms, day1);
+        assert!(old_calls[0].dated);
+        assert_eq!(old_calls[1].at_ms, day1_end);
+        assert!(!old_calls[1].dated);
+
+        // Cross-day conversation with leading & mid-conv undated calls and a live-seen trailing call:
+        let mut cross = vec![
+            Call { steps: vec![], has_usage: true, ..Default::default() },
+            Call { steps: vec![1], has_usage: true, ..Default::default() },
+            Call { steps: vec![], has_usage: true, ..Default::default() },
+            Call { steps: vec![5], has_usage: true, ..Default::default() },
+            Call { steps: vec![10], has_usage: true, ..Default::default() },
+            Call { steps: vec![12], has_usage: true, at_ms: day2 + 5_000, live_seen: true, ..Default::default() },
+        ];
+        date_calls(&mut cross, &steps, day2);
+        assert_eq!(cross[0].at_ms, day1); // leading -> next dated (day1), not day2
+        assert_eq!(cross[1].at_ms, day1);
+        assert_eq!(cross[2].at_ms, day1); // middle -> prev dated (day1), not day2
+        assert_eq!(cross[3].at_ms, day1 + 10_000);
+        assert_eq!(cross[4].at_ms, day2);
+        assert_eq!(cross[5].at_ms, day2 + 5_000); // live-seen kept until transcript flushes
+
+        // Once step 12 flushes to transcript.jsonl, exact created_at replaces seen_at:
+        steps.insert(12, StepInfo { at_ms: day2 + 4_500, label: Some("Final reply".into()) });
+        date_calls(&mut cross, &steps, day2 + 5_000);
+        assert_eq!(cross[5].at_ms, day2 + 4_500);
+        assert!(cross[5].dated);
+        assert_eq!(cross[5].label.as_deref(), Some("Final reply"));
     }
 }

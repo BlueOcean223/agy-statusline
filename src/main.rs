@@ -85,8 +85,9 @@ fn print_status(conv: &str) {
         c(
             (245, 194, 231),
             format!(
-                "$ ${:.2} · ${:.2} today",
+                "$ ${:.2}{} · ${:.2} today",
                 v["costConv"].as_f64().unwrap_or(0.0),
+                if v["multiDay"].as_bool() == Some(true) { " conv" } else { "" },
                 p["bar"]["today"].as_f64().unwrap_or(0.0)
             ),
         ),
