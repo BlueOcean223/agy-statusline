@@ -27,13 +27,27 @@
   let last = null;
 
   // Usage tab state
-  let usageSpan = 7;
+  let usageSpan = 7; // 7 | 30 | 'all'
   let usageData = null;
   let usageLoading = false;
   let usageDayDate = null;
   let usageDayData = null;
   let usageHoverCard = null;
   let usageDayRefreshTimer = 0;
+  let dayView = 'calls'; // 'calls' | 'conv'
+  let daySrc = 'all'; // 'all' | 'desktop' | 'cli'
+  let dayModel = '';
+  let dayConv = '';
+  let dayOnlyMiss = false;
+  let dayLimit = 600;
+
+  // Checkpoint viewer state (persists across 1.5s polls while open)
+  let ckptOpenConvId = null;
+  let ckptData = null;
+  let ckptLoading = false;
+
+  // Live status cache (for temporary English toggle button state)
+  let liveStatus = null;
 
   // Update center state
   let updateStatus = null;
@@ -165,6 +179,61 @@
   }
   const kv = (k, v) => `<div class="kv-row"><span class="kv-k">${k}</span><span class="kv-v">${v}</span></div>`;
 
+  const MISS_CAUSE = {
+    user: ['your pause', '你隔了 1 分钟以上才发下一条消息'],
+    turn: ['agent pause', '一轮中间停了 1 分钟以上（长命令、等你批准、等子代理）'],
+    wait: ['pause', '隔了 1 分钟以上才发下一次请求（agy CLI）'],
+    compact: ['compaction', '上下文刚被压缩或截短'],
+    model: ['model switch', '换了模型（新模型的缓存是空的）'],
+    other: ['other', '间隔不到 1 分钟也没命中（服务端缓存未接上或前缀变化）'],
+  };
+  const MISS_ORDER = ['user', 'turn', 'wait', 'compact', 'model', 'other'];
+  function fmtIdle(ms) {
+    const n = Math.max(0, Number(ms) || 0);
+    if (n < 60e3) return Math.round(n / 1000) + ' 秒';
+    if (n < 3600e3) return Math.round(n / 60e3) + ' 分钟';
+    return (n / 3600e3).toFixed(1) + ' 小时';
+  }
+  function missNote(m) {
+    if (!m) return '';
+    const why = m.cause === 'user' ? `你隔了 ${fmtIdle(m.idleMs)} 才发下一条消息`
+      : m.cause === 'turn' ? `一轮中间停了 ${fmtIdle(m.idleMs)}（长命令、等你批准、等子代理）`
+        : m.cause === 'wait' ? `隔了 ${fmtIdle(m.idleMs)} 才发下一次请求（agy CLI）`
+          : m.cause === 'model' ? `换了模型（上一大调用：${m.fromModel || '其他模型'}）`
+            : m.cause === 'other' ? `离上一次调用结束仅隔 ${fmtIdle(m.idleMs)} 也未命中（服务端缓存未接上或前缀变化）`
+              : (MISS_CAUSE[m.cause]?.[1] || m.cause);
+    return `缓存未命中：约 ${Number(m.tok || 0).toLocaleString()} token 未走缓存，多花约 ${fmtUsd(m.usd)}\n原因：${why}`;
+  }
+  function formatResetTip(resets) {
+    if (!Array.isArray(resets) || !resets.length) return '';
+    return resets.map((r) =>
+      `↺ 提前重置（${r.name || r.bucketId}）：${mdHm(r.atMs)} 重置前已用 ${(r.fromUsed * 100).toFixed(1)}%，原定 ${mdHm(r.wasResetMs)} 重置`
+    ).join('\n');
+  }
+  const md = (ms) => { const d = new Date(ms); return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`; };
+
+  async function toggleCheckpointViewer(convId) {
+    if (ckptOpenConvId === convId) {
+      ckptOpenConvId = null;
+      ckptData = null;
+      if (last) renderOverview(last);
+      return;
+    }
+    ckptOpenConvId = convId;
+    ckptData = null;
+    ckptLoading = true;
+    if (last) renderOverview(last);
+    try {
+      const res = await fetch(`/api/checkpoint?conversationId=${encodeURIComponent(convId)}`, { cache: 'no-store' });
+      ckptData = res.ok ? await res.json() : { err: 'HTTP ' + res.status };
+    } catch (e) {
+      ckptData = { err: e.message };
+    } finally {
+      ckptLoading = false;
+      if (last && activeTab === 'overview') renderOverview(last);
+    }
+  }
+
   // Consistent color per model name in charts & legends
   const MODEL_COLORS = [
     'var(--k-model)', 'var(--k-context)', 'var(--k-cache)', 'var(--k-quota)',
@@ -257,6 +326,41 @@
         </div>`).join('')}
       </div>` : '';
 
+    const ckptBtn = ctx.compactions > 0
+      ? ` <button type="button" class="link-btn" id="btn-view-ckpt">${ckptOpenConvId === p.id ? '收起摘要' : '查看摘要'}</button>`
+      : '';
+    let ckptBoxHtml = '';
+    if (ckptOpenConvId === p.id) {
+      if (ckptLoading) {
+        ckptBoxHtml = '<div class="ckpt-box"><div class="ckpt-meta">读取压缩摘要中…</div></div>';
+      } else if (ckptData?.err) {
+        ckptBoxHtml = `<div class="ckpt-box"><div class="ckpt-head"><span>上下文压缩查看器</span><button type="button" class="link-btn" id="btn-close-ckpt">×</button></div><div class="ckpt-meta">${esc(ckptData.err)}</div></div>`;
+      } else if (ckptData) {
+        const atStr = ckptData.at ? mdHm(ckptData.at) : '—';
+        ckptBoxHtml = `
+          <div class="ckpt-box">
+            <div class="ckpt-head">
+              <span>最近一次压缩摘要（共 ${ckptData.n} 次 · #${ckptData.step} · ${atStr}）</span>
+              <button type="button" class="link-btn" id="btn-close-ckpt">×</button>
+            </div>
+            <div class="ckpt-meta">截断前用户请求 ${ckptData.requests} 条 · Artifacts ${ckptData.artifacts} 个 · ${esc(ckptData.log || '')}</div>
+            <pre class="ckpt-summary">${esc(ckptData.summary || '（日志中未找到 <summary> 区块）')}</pre>
+          </div>`;
+      }
+    }
+
+    const ms = cache.missSummary || { count: cache.misses || 0, usd: 0, by: {} };
+    const missPillsHtml = ms.count > 0
+      ? `<div class="miss-pills">${MISS_ORDER.filter((k) => ms.by && ms.by[k]).map((k) => {
+          const b = ms.by[k];
+          const [shortLbl, desc] = MISS_CAUSE[k] || [k, k];
+          return `<span class="miss-chip" title="${esc(desc)}：${b.count} 次，多花约 ${fmtUsd(b.usd)}">${esc(shortLbl)} ${b.count}× ${fmtUsd(b.usd)}</span>`;
+        }).join('')}</div>`
+      : '';
+    const todayVal = t.todayCliCost > 0
+      ? `${fmtUsd(t.todayCost)} <span style="color:var(--fg-muted);font-size:10.5px">(含 CLI ${fmtUsd(t.todayCliCost)})</span>`
+      : fmtUsd(t.todayCost);
+
     panelOverview.innerHTML = `
       <div class="section">
         <div class="sec-head">
@@ -266,11 +370,12 @@
         <div class="meter"><div class="meter-fill" style="width:${Math.min(100, ctxPct).toFixed(1)}%;background:${ctxColor}"></div></div>
         <div class="kv-grid">
           ${kv('Remaining', fmtTok(ctx.left))}
-          ${kv('Compactions', ctx.compactions + '×')}
+          ${kv('Compactions', `${ctx.compactions}×${ckptBtn}`)}
           ${kv('Last Call Δ', (ctx.delta >= 0 ? '+' : '') + fmtTok(ctx.delta))}
           ${kv('Est. Calls Left', ctx.turnsLeft ? '~' + ctx.turnsLeft : '—')}
         </div>
         ${ctx.series.length >= 2 ? `<div class="spark-wrap"><span class="kv-k" style="font-size:11px">Trend</span>${sparkSvg(ctx.series, 'var(--k-context)')}</div>` : ''}
+        ${ckptBoxHtml}
       </div>
 
       <div class="section">
@@ -279,9 +384,10 @@
         <div class="kv-grid">
           ${kv('Session Avg Hit', pct(cache.sessionHit))}
           ${kv(`Warmth (${Math.round(cache.ttlSec / 60)}m TTL)`, cache.warmLeftSec ? fmtDur(cache.warmLeftSec) : 'cold')}
-          ${kv('Low-hit Calls', cache.misses + '×')}
+          ${kv('Cache Misses', ms.count > 0 ? `<span style="color:var(--k-warn)">${ms.count}× · +${fmtUsd(ms.usd)}</span>` : '0×')}
           ${kv('Saved vs. Uncached', fmtUsd(cache.savedUsd))}
         </div>
+        ${missPillsHtml}
       </div>
 
       <div class="section">
@@ -295,7 +401,7 @@
           ${t.cacheWrite > 0 ? kv('Cache Write', `${fmtTok(t.cacheWrite)} (${fmtUsd(t.costCacheWrite)})`) : ''}
           ${kv('Model Output', `${fmtTok(t.out)} (${fmtUsd(t.costOut)})`)}
           ${kv('Burn Rate', t.ratePerHr != null ? fmtUsd(t.ratePerHr) + '/h' : '—')}
-          ${kv('Today, All Convs', fmtUsd(t.todayCost))}
+          ${kv('Today, All Convs', todayVal)}
           ${kv('Today Tokens', fmtTok(t.todayTokens))}
         </div>
       </div>
@@ -319,6 +425,8 @@
       ${subagentsSection}
     `;
 
+    $('btn-view-ckpt')?.addEventListener('click', () => toggleCheckpointViewer(p.id));
+    $('btn-close-ckpt')?.addEventListener('click', () => toggleCheckpointViewer(p.id));
     for (const btn of panelOverview.querySelectorAll('.btn-open-conv')) {
       btn.addEventListener('click', () => {
         const cid = btn.dataset.conv;
@@ -335,17 +443,27 @@
       panelTurns.innerHTML = '<div style="padding:24px 0;color:var(--fg-muted);font-size:12px">暂无模型调用记录</div>';
       return;
     }
-    panelTurns.innerHTML = turns.slice().reverse().map((t) => `
+    panelTurns.innerHTML = turns.slice().reverse().map((t) => {
+      const m = t.miss;
+      const missTag = m
+        ? ` <span class="miss-chip" title="${esc(missNote(m))}">miss +${fmtUsd(m.usd)} · ${esc(MISS_CAUSE[m.cause]?.[0] || m.cause)}</span>`
+        : '';
+      const costCls = t.costly ? 'turn-costly' : '';
+      const costTip = t.costly
+        ? (m ? `高价调用提醒 · ${missNote(m)}` : '高价调用提醒：缓存已命中，主要来自长上下文或大量输出')
+        : '';
+      return `
       <div class="turn-row">
         <div class="turn-left">
-          <span class="turn-step">#${t.step ?? '–'} · ${hms(t.at)} · ctx ${fmtTok(t.ctx)} (${Math.round(t.hit * 100)}% hit)</span>
+          <span class="turn-step">#${t.step ?? '–'} · ${hms(t.at)} · ctx ${fmtTok(t.ctx)} (${Math.round(t.hit * 100)}% hit)${missTag}</span>
           <span class="turn-label">${esc(t.label)}</span>
         </div>
         <div class="turn-right">
-          <div>${fmtUsd(t.cost)} · +${fmtTok(t.out)} out</div>
+          <div class="${costCls}"${costTip ? ` title="${esc(costTip)}"` : ''}>${t.costly ? '!' : ''}${fmtUsd(t.cost)} · +${fmtTok(t.out)} out</div>
           <div style="color:var(--fg-muted)">${t.tps ? Math.round(t.tps) + ' tok/s' : '—'}${t.ttftMs ? ' · ' + (t.ttftMs / 1000).toFixed(1) + 's TTFT' : ''}</div>
         </div>
-      </div>`).join('');
+      </div>`;
+    }).join('');
   }
 
   // ---------------------------------------------------------------- Usage tab
@@ -386,14 +504,29 @@
     }
   }
 
-  async function openUsageDay(date, silent = false) {
+  async function openUsageDay(date, silent = false, opts = null) {
+    if (opts) {
+      dayView = opts.view || 'calls';
+      daySrc = opts.src || 'all';
+      dayModel = opts.model || '';
+      dayConv = opts.conv || '';
+      dayOnlyMiss = !!opts.onlyMiss;
+      dayLimit = opts.limit ?? 600;
+    } else if (!silent && usageDayDate !== date) {
+      dayView = 'calls';
+      daySrc = 'all';
+      dayModel = '';
+      dayConv = '';
+      dayOnlyMiss = false;
+      dayLimit = 600;
+    }
     usageDayDate = date;
     clearInterval(usageDayRefreshTimer);
     if (!silent) {
       panelUsage.innerHTML = `<div style="padding:20px 0;color:var(--fg-muted);font-size:12px">加载 ${esc(date)} 调用明细…</div>`;
     }
     try {
-      const res = await fetch(`/api/usage/day?date=${encodeURIComponent(date)}`, { cache: 'no-store' });
+      const res = await fetch(`/api/usage/day?date=${encodeURIComponent(date)}&limit=${dayLimit}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const next = await res.json();
       const changed = JSON.stringify(next) !== JSON.stringify(usageDayData);
@@ -405,7 +538,6 @@
         const after = panelUsage.querySelector('.u-table-wrap.calls');
         if (after && silent) after.scrollTop = prevTop;
       }
-      // Silently refresh today's breakdown every 30s without jumping scroll.
       const todayKey = usageData?.today?.date;
       if (date === todayKey) {
         usageDayRefreshTimer = setInterval(() => {
@@ -429,25 +561,124 @@
     const d = usageDayData;
     if (!d) return;
     const t = d.totals || {};
-    const calls = d.calls || [];
-    const rows = calls.map((c) => {
-      const cwTxt = c.cw > 0 ? `+${fmtTok(c.cw)}w` : '';
-      return `<tr>
-        <td>${hm(c.at)}</td>
-        <td class="c-conv" title="${esc(c.convTitle)}">${esc(c.convTitle)}</td>
-        <td class="c-mod" title="${esc(c.model)}">${esc(c.model)}</td>
-        <td class="c-cost">${fmtUsd(c.usd)}</td>
-        <td>${fmtTok(c.in)}/${fmtTok(c.out)}</td>
-        <td class="c-hit">${fmtTok(c.cr)}${cwTxt} (${c.hit != null ? Math.round(c.hit * 100) + '%' : '—'})</td>
-        <td>${c.tps ? Math.round(c.tps) + '/s' : '—'}${c.ttftMs ? ' · ' + (c.ttftMs / 1000).toFixed(1) + 's' : ''}</td>
-      </tr>`;
-    }).join('');
+    const ms = d.missSummary || { count: 0, usd: 0, by: {} };
+    const allCalls = d.calls || [];
+    const byConv = d.byConv || [];
+    const models = d.models || [];
+    const legendRef = usageData?.legend || models;
+
+    const filteredCalls = allCalls.filter((c) => {
+      if (daySrc !== 'all' && c.source !== daySrc) return false;
+      if (dayModel && c.model !== dayModel) return false;
+      if (dayConv && c.convId !== dayConv) return false;
+      if (dayOnlyMiss && !c.miss) return false;
+      return true;
+    });
+
+    const filteredConvs = byConv.filter((c) => {
+      if (daySrc !== 'all' && c.source !== daySrc) return false;
+      if (dayModel && !(c.models || []).includes(dayModel)) return false;
+      if (dayOnlyMiss && !(c.missCount > 0)) return false;
+      return true;
+    });
+
+    const convTitle = dayConv
+      ? (byConv.find((x) => x.convId === dayConv)?.convTitle || dayConv.slice(0, 8))
+      : '';
+
+    const srcBtns = d.cliCalls > 0
+      ? `<div class="btn-group">
+          <button class="pill-btn ${daySrc === 'all' ? 'on' : ''}" data-dsrc="all">全部</button>
+          <button class="pill-btn ${daySrc === 'desktop' ? 'on' : ''}" data-dsrc="desktop">桌面端</button>
+          <button class="pill-btn ${daySrc === 'cli' ? 'on' : ''}" data-dsrc="cli">CLI (${d.cliCalls})</button>
+        </div>`
+      : '';
+
+    const modelChips = models.length >= 2
+      ? `<div class="btn-group" style="flex-wrap:wrap">${models.slice(0, 6).map((m) => {
+          const col = modelColor(m.name, legendRef);
+          const on = dayModel === m.name;
+          return `<button class="pill-btn ${on ? 'on' : ''}" data-dmod="${esc(m.name)}"><i class="model-dot" style="--mc:${col}"></i>${esc(m.name)}</button>`;
+        }).join('')}</div>`
+      : '';
+
+    const missToggle = ms.count > 0
+      ? `<button class="pill-btn ${dayOnlyMiss ? 'on' : ''}" id="btn-day-miss" title="只看缓存未命中的调用">仅未命中 (${ms.count})</button>`
+      : '';
+
+    const convChip = dayConv
+      ? `<button class="pill-btn on" id="btn-clear-conv" title="取消对话筛选">对话: ${esc(convTitle.slice(0, 18))} ×</button>`
+      : '';
+
+    let tableHtml = '';
+    if (dayView === 'conv') {
+      const convRows = filteredConvs.map((c) => {
+        const cliTag = c.source === 'cli' ? '<span class="cli-tag">CLI</span>' : '';
+        const spanTxt = c.firstAt === c.lastAt ? hm(c.firstAt) : `${hm(c.firstAt)}–${hm(c.lastAt)}`;
+        const missCell = c.missCount > 0
+          ? `<td class="c-miss-usd" title="缓存未命中 ${c.missCount} 次，多花约 ${fmtUsd(c.missUsd)}">+${fmtUsd(c.missUsd)} (${c.missCount})</td>`
+          : `<td style="color:var(--fg-faint)">—</td>`;
+        return `<tr class="clickable" data-pick-conv="${esc(c.convId)}">
+          <td class="c-conv" title="${esc(c.convTitle)}">${cliTag}${esc(c.convTitle)}</td>
+          <td>${c.calls}</td>
+          <td class="c-cost">${fmtUsd(c.usd)}</td>
+          <td>${Math.round((c.share || 0) * 100)}%</td>
+          <td>${fmtTok(c.tokens)}</td>
+          <td class="c-hit">${c.hit != null ? Math.round(c.hit * 100) + '%' : '—'}</td>
+          ${missCell}
+          <td>${spanTxt}</td>
+          <td class="c-mod" title="${esc((c.models || []).join(', '))}">${esc((c.models || []).slice(0, 2).join(', '))}</td>
+        </tr>`;
+      }).join('');
+      tableHtml = `
+        <table class="u-table">
+          <thead><tr><th>对话</th><th>次数</th><th>花费</th><th>占比</th><th>Token</th><th>命中</th><th>Miss</th><th>时段</th><th>模型</th></tr></thead>
+          <tbody>${convRows || '<tr><td colspan="9" style="text-align:center;color:var(--fg-muted);padding:16px">没有符合筛选条件的对话</td></tr>'}</tbody>
+        </table>`;
+    } else {
+      const rows = filteredCalls.map((c) => {
+        const cwTxt = c.cw > 0 ? `+${fmtTok(c.cw)}w` : '';
+        const cliTag = c.source === 'cli' ? '<span class="cli-tag">CLI</span>' : '';
+        const missTip = c.miss ? missNote(c.miss) : '';
+        const costTip = c.costly
+          ? (c.miss ? `高价调用 · ${missTip}` : '高价调用：缓存已命中，主要来自长上下文或大量输出')
+          : missTip;
+        return `<tr>
+          <td>${hm(c.at)}</td>
+          <td class="c-conv" title="${esc(c.convTitle)}">${cliTag}${esc(c.convTitle)}</td>
+          <td class="c-mod" title="${esc(c.model)}">${esc(c.model)}</td>
+          <td class="c-cost${c.costly ? ' c-costly' : ''}"${costTip ? ` title="${esc(costTip)}"` : ''}>${c.costly ? '!' : ''}${fmtUsd(c.usd)}</td>
+          <td>${fmtTok(c.in)}/${fmtTok(c.out)}</td>
+          <td class="c-hit${c.miss ? ' c-miss' : ''}"${missTip ? ` title="${esc(missTip)}"` : ''}>${fmtTok(c.cr)}${cwTxt} (${c.hit != null ? Math.round(c.hit * 100) + '%' : '—'})</td>
+          <td>${c.tps ? Math.round(c.tps) + '/s' : '—'}${c.ttftMs ? ' · ' + (c.ttftMs / 1000).toFixed(1) + 's' : ''}</td>
+        </tr>`;
+      }).join('');
+      tableHtml = `
+        <table class="u-table">
+          <thead><tr><th>时间</th><th>对话</th><th>模型</th><th>花费</th><th>入/出</th><th>缓存</th><th>速度/首字</th></tr></thead>
+          <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:var(--fg-muted);padding:16px">没有符合筛选条件的调用记录</td></tr>'}</tbody>
+        </table>`;
+    }
+
+    const loadMoreHtml = dayView === 'calls' && d.truncated
+      ? `<div class="load-more-row">
+          <span class="form-hint">当前已加载最新 ${d.shown} / ${d.totalCalls} 条（顶部合计与按对话汇总均覆盖全部）</span>
+          <div class="btn-group">
+            <button type="button" class="pill-btn" id="btn-more-600">再显示 600 条</button>
+            <button type="button" class="pill-btn" id="btn-more-all">显示全部 (${d.totalCalls})</button>
+          </div>
+        </div>`
+      : '';
+
+    const missBadge = ms.count > 0
+      ? ` <span class="miss-chip" title="当日缓存未命中 ${ms.count} 次，多花约 ${fmtUsd(ms.usd)}">miss +${fmtUsd(ms.usd)}</span>`
+      : '';
 
     panelUsage.innerHTML = `
       <div class="usage-bar">
         <button class="pill-btn" id="btn-usage-back">← 返回用量</button>
         <span class="sec-title">${esc(d.date)} 调用明细</span>
-        <span class="sec-value">${d.totalCalls || 0} 次 · ${fmtUsd(t.usd)}</span>
+        <span class="sec-value">${d.totalCalls || 0} 次 · ${fmtUsd(t.usd)}${missBadge}</span>
       </div>
       <div class="kpi-grid">
         <div class="kpi-card"><div class="kpi-label">当日花费</div><div class="kpi-val" style="color:var(--k-cost)">${fmtUsd(t.usd)}</div></div>
@@ -455,15 +686,92 @@
         <div class="kpi-card"><div class="kpi-label">Token 总数</div><div class="kpi-val" style="color:var(--k-tokens)">${fmtTok(t.tokens)}</div></div>
         <div class="kpi-card"><div class="kpi-label">缓存命中</div><div class="kpi-val" style="color:var(--k-cache)">${pct(t.hit, 0)}</div></div>
       </div>
-      <div class="u-table-wrap calls">
-        <table class="u-table">
-          <thead><tr><th>时间</th><th>对话</th><th>模型</th><th>花费</th><th>入/出</th><th>缓存</th><th>速度/首字</th></tr></thead>
-          <tbody>${rows || '<tr><td colspan="7" style="text-align:center;color:var(--fg-muted);padding:16px">当天没有调用记录</td></tr>'}</tbody>
-        </table>
+      <div class="calls-toolbar">
+        <div class="btn-group">
+          <button class="pill-btn ${dayView === 'calls' ? 'on' : ''}" data-dview="calls">逐次调用</button>
+          <button class="pill-btn ${dayView === 'conv' ? 'on' : ''}" data-dview="conv">按对话 (${byConv.length})</button>
+        </div>
+        ${srcBtns}
+        ${missToggle}
+        ${convChip}
+        ${modelChips}
       </div>
-      ${d.truncated ? `<div class="form-hint" style="margin-top:6px">仅展示最新 ${d.shown} 条，顶部合计按全部 ${d.totalCalls} 次调用计算。</div>` : ''}
+      <div class="u-table-wrap calls">${tableHtml}</div>
+      ${loadMoreHtml}
     `;
+
     $('btn-usage-back').addEventListener('click', closeUsageDay);
+    panelUsage.querySelectorAll('[data-dview]').forEach((b) => {
+      b.addEventListener('click', () => { dayView = b.dataset.dview; renderUsageDay(); });
+    });
+    panelUsage.querySelectorAll('[data-dsrc]').forEach((b) => {
+      b.addEventListener('click', () => { daySrc = b.dataset.dsrc; renderUsageDay(); });
+    });
+    panelUsage.querySelectorAll('[data-dmod]').forEach((b) => {
+      b.addEventListener('click', () => {
+        dayModel = dayModel === b.dataset.dmod ? '' : b.dataset.dmod;
+        renderUsageDay();
+      });
+    });
+    $('btn-day-miss')?.addEventListener('click', () => { dayOnlyMiss = !dayOnlyMiss; renderUsageDay(); });
+    $('btn-clear-conv')?.addEventListener('click', () => { dayConv = ''; renderUsageDay(); });
+    panelUsage.querySelectorAll('[data-pick-conv]').forEach((tr) => {
+      tr.addEventListener('click', () => {
+        dayConv = tr.dataset.pickConv;
+        dayView = 'calls';
+        renderUsageDay();
+      });
+    });
+    $('btn-more-600')?.addEventListener('click', () => {
+      dayLimit = (d.shown || 600) + 600;
+      openUsageDay(d.date, false, { view: dayView, src: daySrc, model: dayModel, conv: dayConv, onlyMiss: dayOnlyMiss, limit: dayLimit });
+    });
+    $('btn-more-all')?.addEventListener('click', () => {
+      dayLimit = 0;
+      openUsageDay(d.date, false, { view: dayView, src: daySrc, model: dayModel, conv: dayConv, onlyMiss: dayOnlyMiss, limit: 0 });
+    });
+  }
+
+  function weekBuckets(days) {
+    const out = [];
+    for (let i = 0; i < days.length; i += 7) {
+      const slice = days.slice(i, i + 7);
+      const mMap = new Map();
+      let usd = 0, calls = 0, tokens = 0;
+      const resets = [];
+      for (const d of slice) {
+        usd += Number(d.usd) || 0;
+        calls += d.calls || 0;
+        tokens += d.tokens || 0;
+        if (d.resets?.length) resets.push(...d.resets);
+        for (const m of (d.models || [])) {
+          const prev = mMap.get(m.name) || { name: m.name, usd: 0, calls: 0, tokens: 0, in: 0, cr: 0 };
+          prev.usd += Number(m.usd) || 0;
+          prev.calls += m.calls || 0;
+          prev.tokens += m.tokens || 0;
+          prev.in += m.in || 0;
+          prev.cr += m.cr || 0;
+          mMap.set(m.name, prev);
+        }
+      }
+      const models = [...mMap.values()]
+        .map((m) => ({ ...m, hit: m.cr + m.in > 0 ? m.cr / (m.cr + m.in) : null }))
+        .sort((a, b) => b.usd - a.usd);
+      const first = slice[0].date;
+      const lastD = slice[slice.length - 1].date;
+      out.push({
+        weekly: true,
+        date: lastD,
+        rangeLabel: first === lastD ? first : `${first.slice(5)} ~ ${lastD.slice(5)}`,
+        isToday: slice.some((d) => d.isToday),
+        usd,
+        calls,
+        tokens,
+        resets,
+        models,
+      });
+    }
+    return out;
   }
 
   function renderUsage() {
@@ -474,15 +782,18 @@
     const days = u.days || [];
     const legend = u.legend || [];
     const totals = u.totals || {};
-    const maxUsd = Math.max(0.01, ...days.map((d) => Number(d.usd) || 0));
-    const peakDate = days.reduce((best, d) => ((d.usd || 0) > (best?.usd || 0) ? d : best), null)?.date;
-    const avgPct = totals.avgUsd > 0 ? Math.min(100, (totals.avgUsd / maxUsd) * 100) : 0;
+    const isWeekly = days.length > 62;
+    const barItems = isWeekly ? weekBuckets(days) : days;
+    const maxUsd = Math.max(0.01, ...barItems.map((d) => Number(d.usd) || 0));
+    const peakDate = barItems.reduce((best, d) => ((d.usd || 0) > (best?.usd || 0) ? d : best), null)?.date;
+    const avgVal = isWeekly ? (totals.avgUsd || 0) * 7 : (totals.avgUsd || 0);
+    const avgPct = avgVal > 0 ? Math.min(100, (avgVal / maxUsd) * 100) : 0;
 
     const acct = u.account;
     const acctTxt = acct ? `${acct.masked}${acct.tier ? ' · ' + acct.tier.replace(/^Google AI\s*/i, '') : ''}` : '每日用量统计';
 
-    const barsHtml = days.map((d, idx) => {
-      const showVal = (usageSpan <= 7 && d.usd > 0) || (usageSpan > 7 && d.usd > 0 && (d.isToday || d.date === peakDate));
+    const barsHtml = barItems.map((d, idx) => {
+      const showVal = (!isWeekly && barItems.length <= 7 && d.usd > 0) || (d.usd > 0 && (d.isToday || d.date === peakDate));
       const parts = (d.models || []).slice().reverse().map((m, mi, arr) => {
         const h = Math.max(2, (m.usd / maxUsd) * 100);
         const col = modelColor(m.name, legend);
@@ -493,10 +804,13 @@
       return `<div class="chart-col" data-day-idx="${idx}" data-date="${esc(d.date)}">${parts}${valTag}</div>`;
     }).join('');
 
-    const labelsHtml = days.map((d, idx) => {
+    const step = barItems.length <= 7 ? 1 : Math.max(1, Math.ceil(barItems.length / 7));
+    const labelsHtml = barItems.map((d, idx) => {
       const shortD = d.date.slice(5);
-      const show = usageSpan <= 7 || d.isToday || idx === 0 || idx % 5 === 0;
-      return `<span class="${d.isToday ? 'today' : ''}">${show ? (d.isToday ? '今天' : shortD) : ''}</span>`;
+      const show = barItems.length <= 7 || d.isToday || idx === 0 || idx % step === 0;
+      const rstMark = d.resets?.length ? '↺' : '';
+      const txt = show ? (d.isToday ? '今天' : shortD) + rstMark : rstMark;
+      return `<span class="${d.isToday ? 'today' : ''}" title="${esc(formatResetTip(d.resets))}">${txt}</span>`;
     }).join('');
 
     const legendHtml = legend.map((m) => {
@@ -507,9 +821,12 @@
     const tableRows = days.slice().reverse().map((d) => {
       const qg = d.qGemini != null ? `G +${(d.qGemini * 100).toFixed(1)}%` : '';
       const qc = d.qClaude != null ? `C +${(d.qClaude * 100).toFixed(1)}%` : '';
-      const qTxt = [qg, qc].filter(Boolean).join(' ') || '—';
+      const rstTip = formatResetTip(d.resets);
+      const rstBadge = d.resets?.length ? ` <span class="reset-tag" title="${esc(rstTip)}">↺</span>` : '';
+      const qTxt = ([qg, qc].filter(Boolean).join(' ') || '—') + rstBadge;
+      const cliDot = d.cliCalls > 0 ? `<span class="bf-tag" title="含 ${d.cliCalls} 次 agy CLI 调用">CLI</span>` : '';
       return `<tr class="clickable${d.isToday ? ' today' : ''}" data-date="${esc(d.date)}">
-        <td>${esc(d.date.slice(5))}${d.bf ? '<span class="bf-tag" title="从对话库补算">补</span>' : ''}</td>
+        <td>${esc(d.date.slice(5))}${d.bf ? '<span class="bf-tag" title="从对话库补算">补</span>' : ''}${cliDot}</td>
         <td class="c-cost">${fmtUsd(d.usd)}</td>
         <td>${d.calls || 0}</td>
         <td>${fmtTok(d.tokens)}</td>
@@ -518,11 +835,31 @@
       </tr>`;
     }).join('');
 
+    const mt = u.missToday;
+    let missBannerHtml = '';
+    if (mt && mt.count > 0) {
+      const sharePct = mt.totalUsd > 0 ? ` (${Math.round((mt.usd / mt.totalUsd) * 100)}%)` : '';
+      const causes = MISS_ORDER
+        .filter((k) => mt.by && mt.by[k] && mt.by[k].usd >= 0.05)
+        .map((k) => `${MISS_CAUSE[k][0]} ${fmtUsd(mt.by[k].usd)}`)
+        .join(' · ');
+      const tipLines = MISS_ORDER
+        .filter((k) => mt.by && mt.by[k])
+        .map((k) => `${MISS_CAUSE[k][1]}：${mt.by[k].count} 次，多花约 ${fmtUsd(mt.by[k].usd)}`)
+        .join('\n');
+      missBannerHtml = `
+        <div class="miss-banner" id="btn-miss-today" title="今天缓存未命中 ${mt.count} 次，多花约 ${fmtUsd(mt.usd)}：\n${esc(tipLines)}\n\n点击查看今天未命中的调用明细">
+          <span>今日缓存未命中 +${fmtUsd(mt.usd)}${sharePct}${causes ? ' · ' + esc(causes) : ''}</span>
+          <span>查看 →</span>
+        </div>`;
+    }
+
     const forecastsHtml = (u.forecasts || []).map((f) => {
       const capParts = [];
       if (f.capUsd) capParts.push(`$${Number(f.capUsd).toLocaleString('en-US')}`);
       if (f.capTokens) capParts.push(`${fmtTok(f.capTokens)} tok`);
-      const capStr = capParts.length ? `cap ≈ ${capParts.join(' / ')} (rough)` : 'cap 样本收集中';
+      const capQual = f.capExact ? '按周期起点' : '按整日估算';
+      const capStr = capParts.length ? `cap ≈ ${capParts.join(' / ')} (${capQual})` : 'cap 样本收集中';
       const use24 = f.proj24h != null;
       const proj = use24 ? f.proj24h : f.projWeek;
       const fullAt = use24 ? f.fullAt24h : f.fullAtWeek;
@@ -532,14 +869,28 @@
           ? `重置时约 ${Math.round(proj * 100)}%`
           : '—';
       const basis = use24 ? `按近 ${Math.round(f.spanH)}h 速度` : `按本周均速（已过 ${Math.round(f.elapsedH)}h）`;
-      return `<div class="forecast-card" title="本周期本机已计 ${fmtUsd(f.cycleUsd)} / ${fmtTok(f.cycleTokens)} tok；多设备或家庭组共享时估值会有偏差">
+      const earlyBadge = f.earlyReset
+        ? `<span class="reset-tag" title="本周期始于提前重置：重置前已用 ${(f.earlyReset.fromUsed * 100).toFixed(1)}%，原定 ${mdHm(f.earlyReset.wasResetMs)} 重置">↺ 提前重置</span>`
+        : '';
+      const pastHtml = Array.isArray(f.pastCycles) && f.pastCycles.length
+        ? `<div class="past-cycles">历史周期：${f.pastCycles.map((c) => {
+            const range = `${md(c.startMs)}~${md(c.endMs)}`;
+            const cap = c.capUsd ? `cap≈$${Number(c.capUsd).toLocaleString('en-US')}` : fmtUsd(c.usd);
+            return `${range}${c.early ? '↺' : ''} ${cap} (${Math.round(c.used * 100)}%)`;
+          }).join(' · ')}</div>`
+        : '';
+      return `<div class="forecast-card" title="本周期（${f.startMs ? mdHm(f.startMs) : '—'} 起）本机已计 ${fmtUsd(f.cycleUsd)} / ${fmtTok(f.cycleTokens)} tok；多设备共享时估值会有偏差">
         <div class="forecast-head">
-          <span>${esc(f.label)} 每周额度 · ${Math.round(f.used * 100)}% used</span>
+          <span>${esc(f.label)} 每周额度 · ${Math.round(f.used * 100)}% used${earlyBadge}</span>
           <span>${estStr}</span>
         </div>
         <div class="forecast-meta">${capStr} · 重置 ${mdHm(f.resetMs)} · ${basis}</div>
+        ${pastHtml}
       </div>`;
     }).join('');
+
+    const spanLabel = usageSpan === 'all' ? `全部 ${u.spanDays || days.length} 天` : `近 ${u.span} 天`;
+    const cliNote = u.hasCli ? ' · 含 agy CLI' : '';
 
     panelUsage.innerHTML = `
       <div class="usage-bar">
@@ -547,6 +898,7 @@
         <div class="btn-group">
           <button class="pill-btn ${usageSpan === 7 ? 'on' : ''}" data-span="7">7天</button>
           <button class="pill-btn ${usageSpan === 30 ? 'on' : ''}" data-span="30">30天</button>
+          <button class="pill-btn ${usageSpan === 'all' ? 'on' : ''}" data-span="all">全部</button>
           <button class="pill-btn" id="btn-usage-refresh" title="刷新">↻</button>
         </div>
       </div>
@@ -562,7 +914,7 @@
         <div class="chart-area">
           <div class="chart-bars" id="usage-bars">
             ${barsHtml}
-            ${avgPct > 0 ? `<div class="chart-avg" style="bottom:${avgPct.toFixed(1)}%" title="活跃日均 ${fmtUsd(totals.avgUsd)}"></div>` : ''}
+            ${avgPct > 0 ? `<div class="chart-avg" style="bottom:${avgPct.toFixed(1)}%" title="${isWeekly ? '周均' : '活跃日均'} ${fmtUsd(avgVal)}"></div>` : ''}
           </div>
         </div>
         <div class="chart-labels">${labelsHtml}</div>
@@ -575,35 +927,38 @@
           <tbody>${tableRows}</tbody>
         </table>
       </div>
-      <div class="form-hint" style="margin-top:5px">点击任意日期查看当天逐次调用明细 · 近 ${u.span} 天合计 ${fmtUsd(totals.usd)}（日均 ${fmtUsd(totals.avgUsd)}）· 价格来源：${esc(u.priceSource || 'bundled')}</div>
+      <div class="form-hint" style="margin-top:5px">点击任意日期查看当天逐次调用明细${isWeekly ? '（柱图按周合并）' : ''} · ${spanLabel}合计 ${fmtUsd(totals.usd)}（日均 ${fmtUsd(totals.avgUsd)}）${cliNote} · 价格：${esc(u.priceSource || 'bundled')}</div>
 
+      ${missBannerHtml}
       ${forecastsHtml ? `<div class="forecast-list">${forecastsHtml}</div>` : ''}
     `;
 
-    // Bind span buttons & refresh
     panelUsage.querySelectorAll('[data-span]').forEach((b) => {
       b.addEventListener('click', () => {
-        usageSpan = Number(b.dataset.span);
+        usageSpan = b.dataset.span === 'all' ? 'all' : Number(b.dataset.span);
         usageData = null;
         loadUsage();
       });
     });
     $('btn-usage-refresh')?.addEventListener('click', () => loadUsage(false));
+    $('btn-miss-today')?.addEventListener('click', () => {
+      if (td.date) openUsageDay(td.date, false, { view: 'calls', onlyMiss: true });
+    });
 
-    // Bind chart interactions
     const barsEl = $('usage-bars');
     panelUsage.querySelectorAll('.chart-col').forEach((col) => {
       col.addEventListener('click', () => openUsageDay(col.dataset.date));
       col.addEventListener('mousemove', (ev) => {
-        const d = days[Number(col.dataset.dayIdx)];
+        const d = barItems[Number(col.dataset.dayIdx)];
         if (!d) return;
+        const titleLabel = d.weekly ? `周 ${d.rangeLabel}` : `${d.date}${d.bf ? '（补算）' : ''}`;
         const part = ev.target.closest('.chart-part');
         if (part) {
           const m = (d.models || []).find((x) => x.name === part.dataset.model);
           if (m) {
             const share = d.usd > 0 ? Math.round((m.usd / d.usd) * 100) : 0;
             showHoverCard(
-              `<div class="hc-title">${esc(d.date)} · ${esc(m.name)}</div>` +
+              `<div class="hc-title">${esc(titleLabel)} · ${esc(m.name)}</div>` +
               `<div class="hc-row"><i style="--mc:${modelColor(m.name, legend)}"></i><span>${fmtUsd(m.usd)}</span><span class="val dim">占 ${share}%</span></div>` +
               `<div class="dim">${m.calls} 次 · ${fmtTok(m.tokens)} tok · 命中 ${pct(m.hit, 0)}</div>`,
               ev
@@ -614,17 +969,18 @@
         const rows = (d.models || []).slice(0, 5).map((m) =>
           `<div class="hc-row"><i style="--mc:${modelColor(m.name, legend)}"></i><span>${esc(m.name)}</span><span class="val">${fmtUsd(m.usd)}</span></div>`
         ).join('');
+        const rstHtml = d.resets?.length ? `<div style="color:var(--k-warn);margin-top:2px">${esc(formatResetTip(d.resets))}</div>` : '';
         showHoverCard(
-          `<div class="hc-title">${esc(d.date)}${d.bf ? '（补算）' : ''} · ${fmtUsd(d.usd)}</div>` +
+          `<div class="hc-title">${esc(titleLabel)} · ${fmtUsd(d.usd)}</div>` +
           (rows || '<div class="dim">无调用</div>') +
-          `<div class="dim" style="margin-top:2px">${d.calls || 0} 次 · ${fmtTok(d.tokens)} tok · 点击看明细</div>`,
+          `<div class="dim" style="margin-top:2px">${d.calls || 0} 次 · ${fmtTok(d.tokens)} tok · 点击看明细</div>` +
+          rstHtml,
           ev
         );
       });
       col.addEventListener('mouseleave', hideHoverCard);
     });
 
-    // Legend hover highlights matching model across all days
     panelUsage.querySelectorAll('.legend-item').forEach((item) => {
       item.addEventListener('mouseenter', () => {
         const name = item.dataset.legend;
@@ -637,7 +993,6 @@
       });
     });
 
-    // Table row hover highlights corresponding bar; click drills down into per-day calls
     panelUsage.querySelectorAll('.u-table tbody tr[data-date]').forEach((tr) => {
       const date = tr.dataset.date;
       const barCol = panelUsage.querySelector(`.chart-col[data-date="${date}"]`);
@@ -741,6 +1096,7 @@
       online_data_sync: $('cfg-data-sync').checked,
       context_limit_override: Number($('cfg-ctx-win').value) || 0,
       cache_ttl_sec: Math.max(30, Number($('cfg-ttl').value) || 300),
+      costly_call_usd: Math.max(0, Number($('cfg-costly').value) || 0),
       include_subagents: $('cfg-sub').checked,
     };
   }
@@ -777,8 +1133,12 @@
       <div class="section">
         <div class="sec-head"><span class="sec-title">中文界面与调试端口</span></div>
         <div class="form-row">
-          <div class="form-label"><span>中文界面</span><span class="form-hint">把 Antigravity 界面文字译为中文（不动对话和代码）；打开或关闭均立刻生效，无需刷新窗口。词典来自 agy-zh-pack</span></div>
+          <div class="form-label"><span>中文界面（含 Swarm 面板）</span><span class="form-hint">把 Antigravity 与 Swarm 界面文字译为中文（不动对话和代码）；打开或关闭均立刻生效，无需刷新窗口。词典来自 agy-zh-pack</span></div>
           <input id="cfg-zh" type="checkbox" ${c.ui_zh ? 'checked' : ''} />
+        </div>
+        <div class="form-row">
+          <div class="form-label"><span>临时切回英文</span><span class="form-hint">在任意窗口按 ${/Mac/i.test(navigator.platform || navigator.userAgent) ? 'Ctrl+Option+E' : 'Ctrl+Alt+E'} 也可切换（所有窗口与 Swarm 同步，不改设置、刷新恢复中文）</span></div>
+          <button id="btn-toggle-en" type="button" class="secondary-btn" ${c.ui_zh ? '' : 'disabled'}>${liveStatus?.zhPaused ? '切回中文' : '临时切回英文'}</button>
         </div>
         <div class="form-row">
           <div class="form-label"><span>未带调试端口启动时</span><span class="form-hint">先核验主进程确实未带 --remote-debugging-port 再触发，防止端口繁忙时误重启</span></div>
@@ -821,6 +1181,10 @@
           <input id="cfg-ttl" type="number" step="30" min="30" class="field-input" value="${c.cache_ttl_sec || 300}" />
         </div>
         <div class="form-row">
+          <div class="form-label"><span>高价调用提醒阈值 ($)</span><span class="form-hint">单次调用达到该折算金额在状态栏和明细标红提醒；填 0 关闭</span></div>
+          <input id="cfg-costly" type="number" step="0.1" min="0" class="field-input" value="${c.costly_call_usd ?? 0.5}" />
+        </div>
+        <div class="form-row">
           <div class="form-label"><span>总计包含子代理</span><span class="form-hint">状态栏与面板的对话总计是否计入子代理</span></div>
           <input id="cfg-sub" type="checkbox" ${c.include_subagents !== false ? 'checked' : ''} />
         </div>
@@ -830,7 +1194,19 @@
 
     panelSettings.querySelectorAll('input[type=checkbox], select').forEach((el) => el.addEventListener('change', onSettingsChange));
     $('cfg-ttl').addEventListener('change', onSettingsChange);
+    $('cfg-costly').addEventListener('change', onSettingsChange);
     $('btn-restart').addEventListener('click', onRestart);
+    $('btn-toggle-en')?.addEventListener('click', async () => {
+      const btn = $('btn-toggle-en');
+      if (!btn || btn.disabled) return;
+      btn.disabled = true;
+      try {
+        const res = await postJson('/api/i18n/toggle-english', {});
+        const j = await res.json().catch(() => ({}));
+        if (liveStatus) liveStatus.zhPaused = !!j.paused;
+      } catch (e) {}
+      await updateLiveStatus();
+    });
     updateLiveStatus();
     renderUpdateCenter();
     if (!updateStatus) refreshUpdateStatus();
@@ -992,16 +1368,26 @@
 
   async function updateLiveStatus() {
     const box = document.getElementById('live-status');
-    if (!box) return;
+    const enBtn = document.getElementById('btn-toggle-en');
+    if (!box && !enBtn) return;
     try {
       const j = await (await fetch('/api/live-status', { cache: 'no-store' })).json();
+      liveStatus = j;
+      if (enBtn) {
+        const zhOn = $('cfg-zh') ? $('cfg-zh').checked : !!j.uiZh;
+        enBtn.disabled = !zhOn || !j.debug;
+        enBtn.textContent = j.zhPaused ? '切回中文' : '临时切回英文';
+      }
+      if (!box) return;
       const state = j.debug ? '<span class="ok">调试端口已连接，状态栏和中文界面可用</span>'
         : '<span class="bad">没连上调试端口：状态栏和中文界面需要 Antigravity 以调试模式启动</span>';
       const flag = j.relaunch?.lastFlag ? ` · 进程校验: ${esc(j.relaunch.lastFlag)}` : '';
-      box.innerHTML = state + `<br>CDP: ${esc(j.cdp || '—')}${flag}<br>language_server: ${esc(j.ls || '—')}` +
+      const swarm = j.swarmFrames ? ` · Swarm 面板: ${j.swarmFrames}` : '';
+      const zhNote = j.zhPaused ? ' · <span class="bad">当前临时英文</span>' : '';
+      box.innerHTML = state + zhNote + `<br>CDP: ${esc(j.cdp || '—')}${swarm}${flag}<br>language_server: ${esc(j.ls || '—')}` +
         (j.panes && j.panes.length ? `<br>showing: ${j.panes.map((x) => esc(String(x).slice(0, 8))).join(', ')}` : '');
     } catch (e) {
-      box.textContent = 'live status unavailable';
+      if (box) box.textContent = 'live status unavailable';
     }
   }
 
