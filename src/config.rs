@@ -3,7 +3,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::Duration;
 
 /// Price rates (USD per 1M tokens) effective before `until_ms` (or open-ended when `None`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -249,6 +253,8 @@ pub struct Config {
     pub online_updates: bool,
     /// Periodically sync i18n dictionary & prices.json from ncdeng/agy-zh-pack.
     pub online_data_sync: bool,
+    /// Highlight single model calls at or above this USD threshold (0 disables the alert).
+    pub costly_call_usd: f64,
     pub models: Vec<ModelRule>,
 }
 
@@ -302,6 +308,7 @@ impl Default for Config {
             relaunch_mode: "never".into(),
             online_updates: true,
             online_data_sync: true,
+            costly_call_usd: 0.50,
             models: default_model_rules(),
         }
     }
@@ -319,6 +326,7 @@ pub struct ConfigPatch {
     pub relaunch_mode: Option<String>,
     pub online_updates: Option<bool>,
     pub online_data_sync: Option<bool>,
+    pub costly_call_usd: Option<f64>,
 }
 
 fn sanitize_relaunch_mode(s: &str) -> String {
@@ -583,13 +591,115 @@ pub fn find_plugin_data_dir(app_data: &Path) -> PathBuf {
     app_data.join("plugin_data").join("agy-statusline")
 }
 
+/// Locates `~/.gemini/antigravity-cli` (sibling of `~/.gemini/antigravity`), or `AGY_CLI_DATA_DIR`.
+pub fn find_cli_data_dir(app_data: &Path) -> PathBuf {
+    if let Ok(d) = env::var("AGY_CLI_DATA_DIR") {
+        let trimmed = d.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    app_data.parent().unwrap_or(app_data).join("antigravity-cli")
+}
+
+/// Returns true if any model rule has a date-tiered price transition falling inside `[lo_ms, hi_ms)`.
+pub fn any_price_cut_in(rules: &[ModelRule], lo_ms: i64, hi_ms: i64) -> bool {
+    rules.iter().any(|r| r.tiers.iter().filter_map(|t| t.until_ms).any(|u| u > lo_ms && u <= hi_ms))
+}
+
+static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
+
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("data");
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{fname}.tmp.{}.{seq}", std::process::id()));
     fs::write(&tmp, content)?;
-    fs::rename(&tmp, path)
+    for attempt in 0..3 {
+        match fs::rename(&tmp, path) {
+            Ok(()) => return Ok(()),
+            Err(_) if attempt < 2 => thread::sleep(Duration::from_millis(50)),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                // Windows fallback when rename is transiently blocked by antivirus/indexers.
+                if cfg!(target_os = "windows") {
+                    return fs::write(path, content);
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Outcome of reading a persisted file with retry + corruption preservation (review A1).
+#[derive(Debug)]
+pub enum ReadFile<T> {
+    Ok(T),
+    /// File does not exist yet (`ENOENT`): safe to initialize and persist fresh data.
+    Missing,
+    /// File existed but failed to parse; backed up to `*.bad-YYYYMMDDHHMM.*` if possible.
+    Corrupt {
+        kept: bool,
+    },
+    /// Transient I/O error (`EBUSY`, `EPERM`, etc.) persisted across retries: caller MUST NOT overwrite.
+    Unreadable,
+}
+
+fn backup_corrupt_file(path: &Path, reason: &str) -> bool {
+    let ts = chrono::Local::now().format("%Y%m%d%H%M");
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("json");
+    let bad = path.with_file_name(format!("{stem}.bad-{ts}.{ext}"));
+    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+    match fs::rename(path, &bad) {
+        Ok(()) => {
+            eprintln!(
+                "[agy-statusline] {fname} unreadable ({reason}), kept as {}",
+                bad.file_name().and_then(|s| s.to_str()).unwrap_or("bad")
+            );
+            true
+        }
+        Err(e) => {
+            eprintln!("[agy-statusline] {fname} unreadable ({reason}), could not rename backup: {e}");
+            false
+        }
+    }
+}
+
+/// Reads a UTF-8 file with up to 4 retries on transient errors, distinguishes `NotFound`,
+/// and backs up unparseable files as `.bad-<timestamp>` so data is never silently overwritten.
+pub fn read_file_keep<T, E: std::fmt::Display>(path: &Path, parse: impl FnOnce(&str) -> Result<T, E>) -> ReadFile<T> {
+    let mut text = None;
+    for attempt in 0..=4 {
+        match fs::read_to_string(path) {
+            Ok(s) => {
+                text = Some(s);
+                break;
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => return ReadFile::Missing,
+            Err(e) => {
+                if attempt >= 4 {
+                    let fname = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
+                    eprintln!("[agy-statusline] {fname} could not be read ({e}), skipping writes this session");
+                    return ReadFile::Unreadable;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        }
+    }
+    let raw = text.unwrap_or_default();
+    let clean = raw.trim_start_matches('\u{feff}');
+    match parse(clean) {
+        Ok(v) => ReadFile::Ok(v),
+        Err(e) => ReadFile::Corrupt { kept: backup_corrupt_file(path, &e.to_string()) },
+    }
+}
+
+pub fn read_json_keep<T: serde::de::DeserializeOwned>(path: &Path) -> ReadFile<T> {
+    read_file_keep(path, |s| serde_json::from_str(s))
 }
 
 fn upgrade_model_rules(existing: &mut Vec<ModelRule>) {
@@ -637,19 +747,25 @@ fn upgrade_model_rules(existing: &mut Vec<ModelRule>) {
 
 pub fn load_config(plugin_data: &Path) -> Config {
     let path = plugin_data.join("config.toml");
-    if let Ok(text) = fs::read_to_string(&path)
-        && let Ok(mut cfg) = toml::from_str::<Config>(&text)
-    {
-        cfg.bar_look.sanitize();
-        cfg.relaunch_mode = sanitize_relaunch_mode(&cfg.relaunch_mode);
-        upgrade_model_rules(&mut cfg.models);
-        return cfg;
+    match read_file_keep(&path, |s| toml::from_str::<Config>(s)) {
+        ReadFile::Ok(mut cfg) => {
+            cfg.bar_look.sanitize();
+            cfg.relaunch_mode = sanitize_relaunch_mode(&cfg.relaunch_mode);
+            if !cfg.costly_call_usd.is_finite() || cfg.costly_call_usd < 0.0 {
+                cfg.costly_call_usd = 0.50;
+            }
+            upgrade_model_rules(&mut cfg.models);
+            cfg
+        }
+        ReadFile::Missing | ReadFile::Corrupt { kept: true } => {
+            let def = Config::default();
+            if let Ok(toml_str) = toml::to_string_pretty(&def) {
+                let _ = write_atomic(&path, &toml_str);
+            }
+            def
+        }
+        ReadFile::Unreadable | ReadFile::Corrupt { kept: false } => Config::default(),
     }
-    let def = Config::default();
-    if let Ok(toml_str) = toml::to_string_pretty(&def) {
-        let _ = write_atomic(&path, &toml_str);
-    }
-    def
 }
 
 pub fn apply_config_patch(plugin_data: &Path, patch: ConfigPatch) -> Config {
@@ -684,6 +800,12 @@ pub fn apply_config_patch(plugin_data: &Path, patch: ConfigPatch) -> Config {
     }
     if let Some(v) = patch.online_data_sync {
         cfg.online_data_sync = v;
+    }
+    if let Some(v) = patch.costly_call_usd
+        && v.is_finite()
+        && v >= 0.0
+    {
+        cfg.costly_call_usd = (v * 100.0).round() / 100.0;
     }
     let path = plugin_data.join("config.toml");
     if let Ok(toml_str) = toml::to_string_pretty(&cfg) {
@@ -736,5 +858,23 @@ mod tests {
         let alpha = eff.iter().find(|r| r.pattern == "gemini-5-alpha").unwrap();
         assert_eq!(alpha.short_name, "5 Alpha");
         assert_eq!(alpha.rates_at(0, 0).3, 30.0);
+    }
+
+    #[test]
+    fn detects_price_cut_inside_day_window_and_backs_up_corrupt_config() {
+        let rules = default_model_rules();
+        let cut = pt_midnight_ms("2026-12-01").unwrap();
+        assert!(any_price_cut_in(&rules, cut - 3_600_000, cut + 3_600_000));
+        assert!(!any_price_cut_in(&rules, cut - 86_400_000, cut - 3_600_000));
+
+        let dir = std::env::temp_dir().join(format!("agy-cfg-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("config.toml"), "[[[invalid toml").unwrap();
+        let cfg = load_config(&dir);
+        assert!((cfg.costly_call_usd - 0.50).abs() < 1e-9);
+        let has_bad = fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".bad-"));
+        assert!(has_bad, "corrupt config.toml should be backed up to .bad-*");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

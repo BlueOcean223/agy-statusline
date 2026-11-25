@@ -10,7 +10,7 @@
 //! - Windows: two-stage PowerShell script escaping Antigravity's Job Object via Explorer COM
 //!   `ShellExecute` → WMI `Win32_Process.Create` → `Start-Process`, guarded by a named mutex.
 
-use crate::config::{load_config, write_atomic};
+use crate::config::{ReadFile, load_config, read_json_keep, write_atomic};
 use crate::live::{SharedRef, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -64,11 +64,18 @@ fn state_path(plugin_data: &Path) -> PathBuf {
     plugin_data.join("relaunch-state.json")
 }
 
-fn load_state(plugin_data: &Path) -> RelaunchState {
-    fs::read_to_string(state_path(plugin_data)).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+fn load_state(plugin_data: &Path) -> (RelaunchState, bool) {
+    match read_json_keep(&state_path(plugin_data)) {
+        ReadFile::Ok(st) => (st, true),
+        ReadFile::Missing | ReadFile::Corrupt { kept: true } => (RelaunchState::default(), true),
+        ReadFile::Unreadable | ReadFile::Corrupt { kept: false } => (RelaunchState::default(), false),
+    }
 }
 
-fn save_state(plugin_data: &Path, st: &RelaunchState) {
+fn save_state(plugin_data: &Path, st: &RelaunchState, writable: bool) {
+    if !writable {
+        return;
+    }
     if let Ok(text) = serde_json::to_string_pretty(st) {
         let _ = write_atomic(&state_path(plugin_data), &text);
     }
@@ -349,9 +356,9 @@ Remove-Item -LiteralPath $selfPath -Force -ErrorAction SilentlyContinue
 /// Schedules a detached restart of Antigravity with `--remote-debugging-port=0`.
 pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
     let target = target_app().ok_or_else(|| "未找到 Antigravity 安装路径".to_string())?;
-    let mut st = load_state(plugin_data);
+    let (mut st, writable) = load_state(plugin_data);
     st.last_relaunch_at = now_ms();
-    save_state(plugin_data, &st);
+    save_state(plugin_data, &st, writable);
     append_log(plugin_data, &format!("relaunching Antigravity with {DEBUG_ARG}: {target}"));
     let log_file = log_path(plugin_data);
 
@@ -485,7 +492,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             if mode == "never" {
                 continue;
             }
-            let st = load_state(&plugin_data);
+            let (st, _) = load_state(&plugin_data);
             if st.prompted_for == session_key {
                 continue;
             }
@@ -500,10 +507,10 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             let prev_same = last_check.is_some_and(|(_, f)| f == flag);
             last_check = Some((Instant::now(), flag));
 
-            let mut st = load_state(&plugin_data);
+            let (mut st, writable) = load_state(&plugin_data);
             if st.last_flag != flag.as_str() {
                 st.last_flag = flag.as_str().to_string();
-                save_state(&plugin_data, &st);
+                save_state(&plugin_data, &st, writable);
             }
 
             if flag != LaunchFlag::NoFlag {
@@ -533,7 +540,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             let recent = now - st.last_relaunch_at < COOLDOWN_MS;
             st.prompted_for = session_key.clone();
             st.last_prompt_at = now;
-            save_state(&plugin_data, &st);
+            save_state(&plugin_data, &st, writable);
 
             append_log(
                 &plugin_data,
@@ -556,7 +563,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
 }
 
 pub fn status_json(plugin_data: &Path) -> Value {
-    let st = load_state(plugin_data);
+    let (st, _) = load_state(plugin_data);
     json!({
         "supported": is_supported(),
         "target": target_app(),

@@ -2,6 +2,7 @@
 
 use crate::config::{Config, OnlinePrices, effective_model_rules};
 use crate::live::{Call, Engine, call_cost, now_ms};
+use crate::miss::MissSummary;
 use crate::transcript::{annotated_ids, read_annotation};
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -111,7 +112,7 @@ impl Engine {
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let (today_cost, today_tokens) = self.today_totals(&rules);
+        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&rules);
 
         // Context
         let last = own.last().copied();
@@ -129,13 +130,22 @@ impl Engine {
         let ctx_left = ctx_max.saturating_sub(ctx_used);
         let turns_left = (avg_growth > 0 && ctx_max > 0).then(|| ctx_left as i64 / avg_growth);
 
-        // Cache
+        // Cache & 6-cause miss analysis
         let hit = |c: &Call| {
             let d = c.cache + c.input;
             if d == 0 { 0.0 } else { c.cache as f64 / d as f64 }
         };
         let session_hit = if fresh + cache > 0 { cache as f64 / (fresh + cache) as f64 } else { 0.0 };
-        let misses = own.iter().skip(1).filter(|c| hit(c) < 0.5).count();
+        let own_misses = self.conv_misses(&id, &rules);
+        let mut miss_summary = MissSummary::default();
+        for (c, m) in own.iter().zip(own_misses.iter()) {
+            miss_summary.total_usd += call_cost(&rules, c).total();
+            if let Some(info) = m {
+                miss_summary.add(info);
+            }
+        }
+        miss_summary.round_fields();
+        let misses = miss_summary.count;
         let warm_left = last.map(|c| (c.at_ms + cfg.cache_ttl_sec as i64 * 1000 - now_ms()) / 1000).filter(|s| *s > 0);
 
         // Speed
@@ -179,14 +189,21 @@ impl Engine {
 
         let turns: Vec<Value> = own
             .iter()
-            .map(|c| {
+            .enumerate()
+            .map(|(idx, c)| {
+                let c_usd = call_cost(&rules, c).total();
+                let costly = cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd;
+                let miss = own_misses.get(idx).cloned().flatten();
                 json!({
                     "step": c.steps.first(),
                     "at": c.at_ms,
+                    "model": c.display,
                     "ctx": c.ctx_used,
                     "hit": hit(c),
                     "out": c.output,
-                    "cost": call_cost(&rules, c).total(),
+                    "cost": c_usd,
+                    "costly": costly,
+                    "miss": miss,
                     "tps": c.tps(),
                     "ttftMs": c.ttft_ms,
                     "label": c.label.clone().unwrap_or_else(|| "…".into()),
@@ -223,13 +240,14 @@ impl Engine {
             },
             "cache": {
                 "lastHit": last.map(hit), "sessionHit": session_hit, "misses": misses,
+                "missSummary": miss_summary,
                 "savedUsd": saved, "warmLeftSec": warm_left, "ttlSec": cfg.cache_ttl_sec,
             },
             "tokens": {
                 "fresh": fresh, "cache": cache, "cacheWrite": cache_write, "out": out,
                 "total": fresh + cache + cache_write + out,
                 "costIn": c_in, "costCache": c_cache, "costCacheWrite": c_cw, "costOut": c_out, "cost": cost,
-                "ratePerHr": rate_per_hr, "todayCost": today_cost, "todayTokens": today_tokens,
+                "ratePerHr": rate_per_hr, "todayCost": today_cost, "todayCliCost": today_cli_cost, "todayTokens": today_tokens,
                 "includesSubagents": !is_sub && cfg.include_subagents,
             },
             "speed": {

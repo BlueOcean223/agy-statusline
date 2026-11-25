@@ -13,17 +13,19 @@
 //! Hooks only tell the engine *when* to look (UDP datagram, see `hook.rs`), so a turn's numbers
 //! show up right after the call ends instead of on the next poll.
 
+use crate::cli_usage::CliScanner;
 use crate::config::{
-    Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_plugin_data_dir, load_config,
-    write_atomic,
+    Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir,
+    load_config, write_atomic,
 };
 use crate::git::GitInfo;
 use crate::ls::LsClient;
+use crate::miss::{MissCallInput, MissInfo, miss_scan};
 use crate::transcript::Transcript;
 use crate::usage::{
     AccountInfo, CallRecord, ModelAgg, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status,
-    load_history, load_samples, needs_backfill, quota_group_id, run_backfill, save_history, save_samples, today_str,
-    update_today,
+    load_history, load_samples, maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history,
+    save_samples, today_str, update_today,
 };
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -341,6 +343,10 @@ pub struct Shared {
     pub rev: u64,
     /// Pages currently connected over CDP (page id → url), for the settings panel.
     pub pages: HashMap<String, String>,
+    /// Swarm panel iframes currently connected over CDP for optional Chinese UI.
+    pub swarm_frames: HashSet<String>,
+    /// Bound HTTP port of this sidecar's UI panel (used to auto-reload stuck "plugin unavailable" iframes).
+    pub panel_port: u16,
     pub cdp_status: String,
     /// CDP debugging port reachability & timestamp of last state transition (for relaunch guard).
     pub cdp_port_ok: Option<bool>,
@@ -350,6 +356,11 @@ pub struct Shared {
     pub hook_events: Vec<(String, String)>,
     /// Mirrors `config.ui_zh` for the CDP threads.
     pub ui_zh: bool,
+    /// Temporary English override (Ctrl+Alt+E / Ctrl+Option+E or panel button), synced across pages & Swarm frames.
+    pub ui_zh_paused: bool,
+    pub ui_zh_pause_rev: u64,
+    pub ui_zh_pause_origin: Option<String>,
+    pub ui_zh_pause_quiet: bool,
     /// Optional online i18n dictionary/rules (merged with bundled), pushed when `i18n_rev` increments.
     pub i18n_dict: Option<String>,
     pub i18n_rules: Option<String>,
@@ -378,36 +389,57 @@ pub fn wake(shared: &SharedRef) {
 pub struct UsageStore {
     pub history: UsageHistory,
     pub samples: QuotaSamples,
+    pub samples_writable: bool,
+    pub cli: CliScanner,
+    pub app_data: PathBuf,
+    pub cli_data: PathBuf,
     pub plugin_data: PathBuf,
     pub last_saved: Instant,
 }
 
 pub static USAGE: Mutex<Option<UsageStore>> = Mutex::new(None);
 
-fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf) {
-    let history = load_history(&plugin_data);
-    let samples = load_samples(&plugin_data);
+fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) {
+    let cli_data = find_cli_data_dir(&app_data);
+    let mut history = load_history(&plugin_data);
+    let (samples, samples_writable) = load_samples(&plugin_data);
+    if maybe_replay_samples(&mut history, &samples) {
+        save_history(&plugin_data, &history);
+    }
     let need_bf = needs_backfill(&history);
     if let Ok(mut guard) = USAGE.lock() {
-        *guard = Some(UsageStore { history, samples, plugin_data: plugin_data.clone(), last_saved: Instant::now() });
+        *guard = Some(UsageStore {
+            history,
+            samples,
+            samples_writable,
+            cli: CliScanner::default(),
+            app_data: app_data.clone(),
+            cli_data: cli_data.clone(),
+            plugin_data: plugin_data.clone(),
+            last_saved: Instant::now(),
+        });
     }
     if need_bf {
+        let app_bf = app_data.clone();
+        let pd_bf = plugin_data.clone();
         std::thread::spawn(move || {
             let mut local_h = USAGE
                 .lock()
                 .ok()
                 .and_then(|g| g.as_ref().map(|u| u.history.clone()))
-                .unwrap_or_else(|| load_history(&plugin_data));
-            let changed = run_backfill(&app_data, &mut local_h, now_ms());
+                .unwrap_or_else(|| load_history(&pd_bf));
+            let changed = run_backfill(&app_bf, &mut local_h, now_ms());
             if changed
                 && let Ok(mut guard) = USAGE.lock()
                 && let Some(store) = guard.as_mut()
             {
-                // Merge backfilled past days without losing any live updates to today.
                 let today = today_str();
                 for (day, rec) in local_h.days {
                     if day < today {
-                        store.history.days.insert(day, rec);
+                        let dst = store.history.days.entry(day).or_default();
+                        dst.raw = rec.raw;
+                        dst.convs = rec.convs;
+                        dst.bf = rec.bf;
                     }
                 }
                 store.history.bf = local_h.bf;
@@ -416,6 +448,29 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf) {
             }
         });
     }
+    // Background agy CLI scanner (runs immediately, then every 30s without blocking live::run).
+    std::thread::spawn(move || {
+        loop {
+            let changed = if let Ok(mut guard) = USAGE.lock()
+                && let Some(store) = guard.as_mut()
+            {
+                let cd = store.cli_data.clone();
+                let pd = store.plugin_data.clone();
+                let ch = store.cli.scan(&cd, &pd, &mut store.history, now_ms());
+                if ch {
+                    save_history(&store.plugin_data, &store.history);
+                    store.last_saved = Instant::now();
+                }
+                ch
+            } else {
+                false
+            };
+            if changed {
+                wake(&shared);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        }
+    });
 }
 
 // ---------------------------------------------------------------- engine
@@ -591,17 +646,17 @@ impl Engine {
         }
         let from = cache.next_offset;
         cache.fetched_at = Some(Instant::now());
-        if !running {
-            cache.final_fetched = true;
-        }
         let Ok(j) = self.ls.call("GetCascadeTrajectorySteps", &json!({ "cascadeId": id, "stepOffset": from })) else {
             return;
         };
+        let cache = self.sub_steps.entry(id.to_string()).or_default();
+        if !running {
+            cache.final_fetched = true;
+        }
         let Some(arr) = j["steps"].as_array() else { return };
         if arr.is_empty() {
             return;
         }
-        let cache = self.sub_steps.entry(id.to_string()).or_default();
         for (i, st) in arr.iter().enumerate() {
             let idx = from + i;
             if let Some(parsed) = parse_sub_step(st) {
@@ -872,7 +927,7 @@ impl Engine {
                 self.quota_at_ms,
             );
             if sd {
-                save_samples(&store.plugin_data, &store.samples);
+                save_samples(&store.plugin_data, &store.samples, store.samples_writable);
             }
             if hd && store.last_saved.elapsed() >= Duration::from_secs(15) {
                 save_history(&store.plugin_data, &store.history);
@@ -916,6 +971,7 @@ impl Engine {
                 out.push(CallRecord {
                     conv_id: cid.clone(),
                     at_ms: c.at_ms,
+                    step: c.steps.first().copied(),
                     model_raw: c.resp_model.clone(),
                     model_display: c.display.clone(),
                     input: c.input,
@@ -925,6 +981,7 @@ impl Engine {
                     ttft_ms: c.ttft_ms,
                     stream_ms: c.stream_ms,
                     dedup_key,
+                    source: "desktop",
                 });
             }
         }
@@ -988,9 +1045,9 @@ impl Engine {
         quota_views(group)
     }
 
-    /// Computes today's total cost and tokens (combining live memory + persisted today snapshot
-    /// so Antigravity restarts never reset today's counter).
-    pub(crate) fn today_totals(&self, rules: &[ModelRule]) -> (f64, u64) {
+    /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
+    /// returning `(total_usd, total_tokens, cli_usd)`.
+    pub(crate) fn today_totals(&self, rules: &[ModelRule]) -> (f64, u64, f64) {
         let midnight = local_midnight_ms();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
@@ -999,37 +1056,125 @@ impl Engine {
                 live_tok += c.input + c.cache + c.cache_write + c.output;
             }
         }
-        let persisted = USAGE.lock().ok().and_then(|g| {
-            let store = g.as_ref()?;
-            let day = store.history.days.get(&today_str())?;
+        let persisted = USAGE.lock().ok().and_then(|mut g| {
+            let store = g.as_mut()?;
+            let today = today_str();
             let now = now_ms();
-            let mut usd = 0.0;
-            let mut tok = 0u64;
-            for (model, agg) in &day.raw {
-                let (_, u) = crate::usage::price_tokens(
-                    rules,
-                    model,
-                    agg.input,
-                    agg.cache_read,
-                    agg.cache_write,
-                    agg.output,
-                    now,
-                    now,
-                );
-                usd += u;
-                tok += agg.total_tokens();
+            let (mut desk_usd, mut desk_tok) = (0.0, 0u64);
+            let (mut cli_usd, mut cli_tok) = (0.0, 0u64);
+            if let Some(day) = store.history.days.get(&today) {
+                for (model, agg) in &day.raw {
+                    let (_, u) = crate::usage::price_tokens(
+                        rules,
+                        model,
+                        agg.input,
+                        agg.cache_read,
+                        agg.cache_write,
+                        agg.output,
+                        now,
+                        now,
+                    );
+                    desk_usd += u;
+                    desk_tok += agg.total_tokens();
+                }
+                if !day.cli_raw.is_empty() {
+                    // On price-transition days, price CLI calls at their exact timestamps.
+                    if crate::config::any_price_cut_in(rules, midnight, midnight + 86_400_000) {
+                        let cd = store.cli_data.clone();
+                        let pd = store.plugin_data.clone();
+                        for c in store.cli.calls_for_day(&cd, &pd, &today) {
+                            let key = format!("{} {}", c.model_raw, c.model_display);
+                            let (_, u) = crate::usage::price_tokens(
+                                rules,
+                                &key,
+                                c.input,
+                                c.cache_read,
+                                c.cache_write,
+                                c.output,
+                                c.at_ms,
+                                now,
+                            );
+                            cli_usd += u;
+                            cli_tok += c.input + c.cache_read + c.cache_write + c.output;
+                        }
+                    } else {
+                        for (model, agg) in &day.cli_raw {
+                            let (_, u) = crate::usage::price_tokens(
+                                rules,
+                                model,
+                                agg.input,
+                                agg.cache_read,
+                                agg.cache_write,
+                                agg.output,
+                                now,
+                                now,
+                            );
+                            cli_usd += u;
+                            cli_tok += agg.total_tokens();
+                        }
+                    }
+                }
             }
-            Some((usd, tok))
+            Some((desk_usd, desk_tok, cli_usd, cli_tok))
         });
         match persisted {
-            Some((p_cost, p_tok)) => (live_cost.max(p_cost), live_tok.max(p_tok)),
-            None => (live_cost, live_tok),
+            Some((p_desk_cost, p_desk_tok, cli_cost, cli_tok)) => {
+                (live_cost.max(p_desk_cost) + cli_cost, live_tok.max(p_desk_tok) + cli_tok, cli_cost)
+            }
+            None => (live_cost, live_tok, 0.0),
         }
+    }
+
+    /// Runs 6-cause cache-miss analysis over a conversation's usage calls.
+    pub(crate) fn conv_misses(&self, id: &str, rules: &[ModelRule]) -> Vec<Option<MissInfo>> {
+        let Some(conv) = self.convs.get(id) else {
+            return Vec::new();
+        };
+        let now = now_ms();
+        let inputs: Vec<MissCallInput> = conv
+            .calls
+            .iter()
+            .filter(|c| c.has_usage)
+            .map(|c| {
+                if let Some(r) = price_for(rules, c) {
+                    let (p_in, p_cr, p_cw, _) = r.rates_at(c.at_ms, now);
+                    MissCallInput {
+                        at_ms: c.at_ms,
+                        ttft_ms: c.ttft_ms,
+                        stream_ms: c.stream_ms,
+                        step: c.steps.first().copied(),
+                        model_name: Some(r.short_name.clone()),
+                        input: c.input,
+                        cache_read: c.cache,
+                        cache_write: c.cache_write,
+                        p_in,
+                        p_cache: p_cr,
+                        p_cw,
+                    }
+                } else {
+                    MissCallInput {
+                        at_ms: c.at_ms,
+                        ttft_ms: c.ttft_ms,
+                        stream_ms: c.stream_ms,
+                        step: c.steps.first().copied(),
+                        model_name: None,
+                        input: c.input,
+                        cache_read: c.cache,
+                        cache_write: c.cache_write,
+                        p_in: 0.0,
+                        p_cache: 0.0,
+                        p_cw: 0.0,
+                    }
+                }
+            })
+            .collect();
+        let markers = conv.transcript.as_ref().map(|t| &t.markers);
+        miss_scan(&inputs, markers)
     }
 
     pub fn build_payload(&self, panes: &HashSet<String>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
         let rules = effective_model_rules(&cfg.models, online);
-        let (today, _) = self.today_totals(&rules);
+        let (today, _, today_cli) = self.today_totals(&rules);
         let price_src = match online {
             Some(p) if !p.updated.is_empty() => format!("online ({})", p.updated),
             Some(_) => "online".to_string(),
@@ -1056,6 +1201,8 @@ impl Engine {
             .unwrap_or_default();
         json!({
             "today": today,
+            "todayCli": today_cli,
+            "costlyThreshold": cfg.costly_call_usd,
             "priceSource": price_src,
             "quotaGroups": groups,
             "views": views,
@@ -1201,6 +1348,10 @@ impl Engine {
         }
         let last = self.last_call(id);
         let cost_last = last.map(|c| call_cost(rules, c));
+        let last_usd = cost_last.map(|k| k.total());
+        let last_costly = last_usd.is_some_and(|u| cfg.costly_call_usd > 0.0 && u >= cfg.costly_call_usd);
+        let last_call_key = last.map(|c| format!("{}:{}:{}", id, main.calls, c.at_ms));
+        let last_miss = self.conv_misses(id, rules).into_iter().last().flatten();
         let price = last.and_then(|c| price_for(rules, c)).map(|r| r.display_name.clone());
 
         let mut subs = Vec::new();
@@ -1236,6 +1387,9 @@ impl Engine {
             multi_day,
             includes_subagents,
             cost_last,
+            last_call_costly: last_costly,
+            last_call_key,
+            last_call_miss: last_miss,
             price_name: price,
             quota: self.quota_for(last),
             subs,
@@ -1318,6 +1472,9 @@ pub struct View {
     pub multi_day: bool,
     pub includes_subagents: bool,
     pub cost_last: Option<Cost>,
+    pub last_call_costly: bool,
+    pub last_call_key: Option<String>,
+    pub last_call_miss: Option<MissInfo>,
     pub price_name: Option<String>,
     pub quota: Vec<QuotaView>,
     pub subs: Vec<AgentLine>,
@@ -1397,7 +1554,7 @@ const LS_GONE_AFTER: Duration = Duration::from_secs(20);
 pub fn run(shared: SharedRef) {
     let app_data = find_app_data_dir();
     let plugin_data = find_plugin_data_dir(&app_data);
-    init_usage_store(app_data.clone(), plugin_data.clone());
+    init_usage_store(app_data.clone(), plugin_data.clone(), shared.clone());
     spawn_hook_listener(&plugin_data, shared.clone());
 
     let mut last_payload = String::new();

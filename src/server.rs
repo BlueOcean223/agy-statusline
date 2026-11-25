@@ -4,6 +4,7 @@ use crate::config::{
 };
 use crate::live::{ENGINE, USAGE, now_ms, wake};
 use crate::relaunch;
+use crate::transcript;
 use crate::updater;
 use crate::usage;
 use serde_json::{Value, json};
@@ -210,8 +211,13 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             out["config"] = serde_json::to_value(&cfg).unwrap_or(Value::Null);
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
+        ("GET", "/api/checkpoint") => {
+            let conv_id = query.get("conversationId").map(String::as_str).unwrap_or("");
+            let out = transcript::read_checkpoint(&app_data, conv_id);
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
         ("GET", "/api/usage") => {
-            let days = query.get("days").and_then(|s| s.parse::<usize>().ok()).unwrap_or(7);
+            let span = query.get("days").map(String::as_str).unwrap_or("7");
             let cfg = load_config(&plugin_data);
             let online = active_online_prices(cfg.online_data_sync);
             let rules = effective_model_rules(&cfg.models, online.as_ref());
@@ -220,16 +226,33 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                 Some(_) => "online".to_string(),
                 None => "bundled".to_string(),
             };
-            // Flush latest live numbers into the usage store before rendering.
-            if let Ok(guard) = ENGINE.lock()
+            let live_calls = if let Ok(guard) = ENGINE.lock()
                 && let Some(eng) = guard.as_ref()
             {
                 eng.sync_usage_store();
-            }
+                eng.live_call_records()
+            } else {
+                Vec::new()
+            };
             let out = match USAGE.lock() {
-                Ok(guard) => match guard.as_ref() {
+                Ok(mut guard) => match guard.as_mut() {
                     Some(store) => {
-                        usage::build_usage_view(&store.history, &store.samples, days, &rules, now_ms(), &price_src)
+                        let ad = store.app_data.clone();
+                        let cd = store.cli_data.clone();
+                        let pd = store.plugin_data.clone();
+                        usage::build_usage_view(
+                            &store.history,
+                            &store.samples,
+                            span,
+                            &ad,
+                            &cd,
+                            &pd,
+                            &mut store.cli,
+                            &live_calls,
+                            &rules,
+                            now_ms(),
+                            &price_src,
+                        )
                     }
                     None => json!({ "days": [], "error": "usage history initializing" }),
                 },
@@ -243,12 +266,36 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                 send_response(stream, 400, "application/json", br#"{"error":"bad date"}"#);
                 return;
             }
+            let limit =
+                query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(usage::DEFAULT_DAY_CALLS_LIMIT);
             let cfg = load_config(&plugin_data);
             let online = active_online_prices(cfg.online_data_sync);
             let rules = effective_model_rules(&cfg.models, online.as_ref());
             let live_calls =
                 ENGINE.lock().ok().and_then(|g| g.as_ref().map(|e| e.live_call_records())).unwrap_or_default();
-            let out = usage::build_day_calls_view(&app_data, date, &live_calls, &rules, now_ms());
+            let out = match USAGE.lock() {
+                Ok(mut guard) => match guard.as_mut() {
+                    Some(store) => {
+                        let ad = store.app_data.clone();
+                        let cd = store.cli_data.clone();
+                        let pd = store.plugin_data.clone();
+                        usage::build_day_calls_view(
+                            &ad,
+                            &cd,
+                            &pd,
+                            &mut store.cli,
+                            date,
+                            &live_calls,
+                            &rules,
+                            now_ms(),
+                            cfg.costly_call_usd,
+                            limit,
+                        )
+                    }
+                    None => json!({ "date": date, "calls": [], "error": "usage store initializing" }),
+                },
+                Err(_) => json!({ "date": date, "calls": [], "error": "usage store unavailable" }),
+            };
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
         ("GET", "/api/live-status") => {
@@ -259,16 +306,40 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                             "cdp": s.cdp_status,
                             "ls": s.ls_status,
                             "pages": s.pages.len(),
+                            "swarmFrames": s.swarm_frames.len(),
                             "panes": s.panes.values().flatten().collect::<Vec<_>>(),
                             "rev": s.rev,
                             "running": s.running,
                             "debug": !s.pages.is_empty(),
+                            "uiZh": s.ui_zh,
+                            "zhPaused": s.ui_zh_paused,
                             "relaunch": relaunch::status_json(&plugin_data),
                         })
                     });
                     s.unwrap_or_else(|_| json!({}))
                 }
                 None => json!({ "cdp": "live engine not running", "ls": "" }),
+            };
+            send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
+        }
+        ("POST", "/api/i18n/toggle-english") => {
+            let payload: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+            let out = match LIVE.get() {
+                Some(shared) => {
+                    let paused = if let Ok(mut s) = shared.0.lock() {
+                        let next = payload["paused"].as_bool().unwrap_or(!s.ui_zh_paused);
+                        s.ui_zh_paused = next;
+                        s.ui_zh_pause_rev += 1;
+                        s.ui_zh_pause_origin = None;
+                        s.ui_zh_pause_quiet = false;
+                        next
+                    } else {
+                        false
+                    };
+                    wake(shared);
+                    json!({ "ok": true, "paused": paused })
+                }
+                None => json!({ "ok": false, "error": "engine not started" }),
             };
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
@@ -326,8 +397,16 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         ("POST", "/api/config") => {
             let patch: ConfigPatch = serde_json::from_slice(&body).unwrap_or_default();
             let toggle_sync = patch.online_data_sync;
+            let toggle_zh = patch.ui_zh;
             let cfg = apply_config_patch(&plugin_data, patch);
             if let Some(shared) = LIVE.get() {
+                if toggle_zh.is_some()
+                    && let Ok(mut s) = shared.0.lock()
+                {
+                    s.ui_zh_paused = false;
+                    s.ui_zh_pause_rev += 1;
+                    s.ui_zh_pause_origin = None;
+                }
                 if let Some(en) = toggle_sync {
                     updater::apply_remote_cache_to_shared(&plugin_data, shared, en);
                 }
@@ -363,10 +442,13 @@ fn handle_client(stream: TcpStream, ui_token: String) {
 static LIVE: std::sync::OnceLock<crate::live::SharedRef> = std::sync::OnceLock::new();
 
 /// Starts the live engine (language_server polling), CDP painter, relaunch watcher, and updater.
-fn start_live() {
+fn start_live(panel_port: u16) {
     let app_data = find_app_data_dir();
     let plugin_data = find_plugin_data_dir(&app_data);
     let shared: crate::live::SharedRef = std::sync::Arc::default();
+    if let Ok(mut s) = shared.0.lock() {
+        s.panel_port = panel_port;
+    }
     let _ = LIVE.set(shared.clone());
 
     let s1 = shared.clone();
@@ -378,7 +460,6 @@ fn start_live() {
 }
 
 pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
-    start_live();
     let port = explicit_port
         .or_else(|| env::var("ANTIGRAVITY_SIDECAR_WEB_PORT").ok().and_then(|p| p.parse::<u16>().ok()))
         .unwrap_or(19847);
@@ -386,6 +467,7 @@ pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
     let ui_token = env::var("ANTIGRAVITY_SIDECAR_UI_TOKEN").unwrap_or_default();
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let bound_port = listener.local_addr()?.port();
+    start_live(bound_port);
     eprintln!("[agy-statusline] listening on 127.0.0.1:{bound_port}");
 
     for stream in listener.incoming().flatten() {
