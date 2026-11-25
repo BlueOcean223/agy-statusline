@@ -1,0 +1,50 @@
+# 更新日志 (Changelog)
+
+本项目所有重要变更均记录于此。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；每次推送 `v*` 标签发版时，GitHub Actions 会自动提取本文件中对应版本的变更内容作为 GitHub Release 说明。
+
+## [v0.4.0] - 2026-11-25
+
+### 新增 (Added)
+- **400 天用量看板与 `agy CLI` 合并**：历史保留期扩展至 400 天，新增「全部」视图（超过 62 天自动按周合并）；只读扫描 `~/.gemini/antigravity-cli/conversations/*.db`（配合 `conversation_summaries.db` 与 `cli-index.json`），将桌面端与 `agy CLI` 用量合并统计，状态栏花费悬停可查看今日 CLI 占比。
+- **6 类缓存未命中归因分析与高价提醒**：自动识别上下文压缩、空闲超时、切换模型等 6 类缓存未命中并量化浪费费用；新增可配置单次高价提醒阈值（`costly_call_usd`，默认 `$0.50`），触发时状态栏显示高亮 `⚡` 徽章并在悬停提示展示归因详情。
+- **上下文压缩摘要查看器**：Overview 与 Turns 页支持点击压缩节点按需查看完整压缩摘要（读取本机 `transcript_full.jsonl`，受面板令牌鉴权保护且不落盘复制）。
+- **单日明细与筛选增强**：单日下钻支持「按次调用 / 按对话」双视图切换，新增来源（桌面 / CLI）、模型标签、仅看缓存未命中筛选与加载更多分页。
+- **每周额度周期状态机**：支持同日多周期分段净变化累计、提早重置检测与 `↺` 标记、按周期起点精算容量（`cap ≈`）、过往周期容量记录以及历史采样回放。
+- **中文界面 v12 与 Swarm 同步翻译**：同步 `agy-zh-pack` v2.0.12（3,469 条词典、111 条正则规则）与翻译器 v12；支持 Swarm 面板 iframe 同步翻译，新增全局临时切回英文快捷键（macOS `Ctrl+Option+E` / Windows `Ctrl+Alt+E`，跨窗口与 Swarm 同步，不改配置）。
+- **侧边栏卡死自恢复**：CDP 监听自动检测并重载卡死在 `"plugin unavailable"` 的侧边栏面板。
+
+### 改进与修复 (Fixed & Improved)
+- **鉴权与数据安全**：`GET /api/checkpoint` 强制校验 `X-Sidecar-Token` 面板令牌（前端改经 `window.sidecar.fetch` 请求）；移除原子写入失败时的截断降级路径，损坏的配置文件或历史 JSON 自动备份为 `*.bad-YYYYMMDDHHMM.*` 而不静默覆盖。
+- **并发与用量准确性**：用量页改为短锁快照 + 锁外读取与单请求 `DayCallCache`，避免阻塞状态栏实时刷新；单个损坏的 CLI 会话库不再阻断其余正常库更新；调价日明细不完整时保留持久化日汇总总量；跨午夜首次调用引入前一日对话基准避免漏算缓存未命中；周额度 `capExact` 仅在所有非空边界日均有明细时标记为精算。
+- **界面与翻译细节**：压缩摘要面板增加请求序号防乱序覆写；周视图平均线改按图中活跃周实际花费计算；保存其他设置时不再重置临时英文状态；关闭中文前先执行 `restoreAll()` 彻底还原 Swarm 规则译文；修复子代理结束补拉重试时机并将 CDP `/json/list` 超时提升至 4 秒。
+
+## [v0.3.0] - 2026-11-23
+
+### 新增 (Added)
+- **每日用量看板与历史补算**：右侧面板新增 `Usage` 标签页（今日 4 格 KPI、7/30 天按模型堆叠柱状图、每日汇总表与单日逐次调用下钻）；首次运行后台只读打开 `conversations/*.db` 补算历史天数；按账号隔离追踪每周额度净变化、容量估算（`cap ≈`）与重置预估（`est`）。
+- **分层主题画廊与外观定制**：新增 `Theme` 标签页，提供 8 套明暗双版配色（Cometix / Catppuccin / Tokyo Night / Rosé Pine / Gruvbox / Nord / Dracula / Mono）实时预览卡片，以及外形（`plain`/`pill`/`powerline`）、额度进度条（`thin`/`cells`/`ring`/`none`）、信息密度与 4 种内联图标样式。
+- **更新中心与在线数据同步**：`Settings` 新增更新中心，支持 GitHub Releases `SHA256SUMS` 校验一键自更新（含备份回滚与 `.git` 开发目录保护），以及按 commit SHA 同步 `agy-zh-pack` 词典、规则与官方价格表；自动适配环境变量与 macOS/Windows 系统代理。
+- **价格体系与子代理步骤时间线**：支持 Claude 5 分钟缓存写入计费、按生效时间分时调价（含 Gemini 4 Carbon/Argon 与 3.8 Flash 调价日）及在线价格覆盖；子代理树形行按需增量拉取步骤，展示审批等待（`WAITING`）、实时耗时与最近 5 步时间线悬停提示。
+- **跨平台调试模式重启守卫**：支持 macOS 与 Windows 一键以 `--remote-debugging-port=0` 重启 Antigravity，提供 `不处理 / 弹框询问 / 自动重开` 策略并在触发前核验主进程命令行防误重启。
+- **中文界面翻译器 v10**：同步 `agy-zh-pack` 2.34.0 词典与翻译器 v10，关闭中文时即时还原英文无需刷新窗口。
+
+### 改进与修复 (Fixed & Improved)
+- 修复历史调用按实际时间戳归属日期、历史子代理补算及跨天对话花费显示不准确的问题。
+- 优化状态栏自绘悬停提示（不被重绘打断）与空闲占位防跳行布局。
+- 修复 Linux 目标上的 Clippy 警告；重写中英文 README、补充状态栏预览图并将开发文档迁移至 `docs/`。
+
+## [v0.2.0] - 2026-11-20
+
+### 新增 (Added)
+- **原生 Rust Sidecar 与输入框状态栏**：直接读取本机 `language_server` 只读接口并配合本地 Hooks 即时唤醒，经 CDP 向主窗口输入框上方注入两行状态栏（模型、Git 仓库状态、上下文占比与压缩徽章、Prompt 缓存命中率、折算花费、TTFT、输出速度、5h/7d 额度与子代理行）。
+- **右侧辅助面板（`AUX_PANE`）**：提供顶部实时状态栏预览、Overview、Turns 与自动保存的 Settings（含 12 项分段独立开关）。
+- **可选中文界面与调试重启**：集成 `agy-zh-pack` 中文词典，支持从面板触发带调试端口重启。
+- **跨平台启动与 CI/CD**：移除 sidecar 与 hook 启动对 POSIX shell 的依赖以兼容 Windows；接入 GitHub Actions 自动化检查以及 macOS Universal / Windows x64 发版打包。
+
+### 改进与修复 (Fixed & Improved)
+- 统一由实时引擎驱动右侧辅助面板，移除旧版 transcript 桥接代码。
+- 修复 Antigravity 重启后查找未加载对话、按模型列表匹配首页额度组、跟随系统明暗主题、`language_server` 断开后自动退出以及面板轮询同步等问题。
+
+[v0.4.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.3.0...v0.4.0
+[v0.3.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.2.0...v0.3.0
+[v0.2.0]: https://github.com/BlueOcean223/agy-statusline/releases/tag/v0.2.0

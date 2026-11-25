@@ -87,12 +87,13 @@ cargo test --locked
 ## CI & Releases
 
 - **`.github/workflows/ci.yml`**: runs `cargo fmt --check`, JS syntax checks, JSON manifest validation, `cargo clippy --locked --all-targets -- -D warnings`, and `cargo test --locked` on macOS, Windows, and Linux.
-- **`.github/workflows/release.yml`**: pushing a `v*` tag matching `Cargo.toml` and `plugin.json` builds the macOS universal binary (`aarch64` + `x86_64`) and Windows x64 binary, packages plugin archives with `SHA256SUMS`, and publishes a GitHub Release.
+- **`.github/workflows/release.yml`**: pushing a `v*` tag verifies that the tag matches `Cargo.toml` and `plugin.json` and has a matching section in `CHANGELOG.md`, builds the macOS universal binary (`aarch64` + `x86_64`) and Windows x64 binary, packages plugin archives with `SHA256SUMS`, and publishes the extracted `CHANGELOG.md` section as the GitHub Release notes.
 
 To publish a release:
 
 ```bash
-# 1. Bump version in Cargo.toml, Cargo.lock, and plugin.json and commit
-# 2. Tag and push to trigger the Release workflow
+# 1. Add the target version section (e.g. v0.4.0) to CHANGELOG.md
+# 2. Bump version in Cargo.toml, Cargo.lock, and plugin.json and commit
+# 3. Tag and push to trigger the Release workflow
 git tag v0.4.0 && git push origin v0.4.0
 ```

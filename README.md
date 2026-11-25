@@ -113,6 +113,7 @@ Antigravity 2.33.0 起，需要带 `--remote-debugging-port=0` 启动参数才�
 
 ## 开发与文档
 
+- 版本更新日志：[CHANGELOG.md](CHANGELOG.md)
 - 架构原理、数据源、本地构建与发版流程：[docs/development.md](docs/development.md)
 - 方案对比与数据流图解：[docs/architecture.html](docs/architecture.html)
 

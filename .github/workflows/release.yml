@@ -1,7 +1,7 @@
 name: Release
 
-# Push a tag such as v0.3.0 to build the plugin for macOS and Windows and publish a GitHub release.
-# The tag must match the version in Cargo.toml and plugin.json.
+# Push a tag such as v0.4.0 to build the plugin for macOS and Windows and publish a GitHub release.
+# The tag must match Cargo.toml, plugin.json, and have a corresponding section in CHANGELOG.md.
 on:
   push:
     tags: ['v*']
@@ -29,6 +29,21 @@ jobs:
             echo "::error::tag v$tag does not match Cargo.toml ($cargo_v) and plugin.json ($plugin_v)"
             exit 1
           fi
+          python3 - "$tag" <<'PY'
+          import re, sys
+          ver = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"(?m)^## \[?v?{re.escape(ver)}\]?(?:\s|$).*$", text)
+          if not m:
+              print(f"::error::CHANGELOG.md is missing a section for v{ver}", file=sys.stderr)
+              sys.exit(1)
+          rest = text[m.end():]
+          nxt = re.search(r"(?m)^## |\n\[[^\]]+\]:\s*https?://", rest)
+          body = (rest[:nxt.start()] if nxt else rest).strip()
+          if not body:
+              print(f"::error::CHANGELOG.md section for v{ver} is empty", file=sys.stderr)
+              sys.exit(1)
+          PY
           echo "version=$tag" >> "$GITHUB_OUTPUT"
 
   build-macos:
@@ -85,7 +100,7 @@ jobs:
           assemble() {
             local dir="pkg/$1/agy-statusline"
             mkdir -p "$dir/bin"
-            cp -R plugin.json hooks.json sidecars assets LICENSE README.md "$dir/"
+            cp -R plugin.json hooks.json sidecars assets LICENSE README.md CHANGELOG.md "$dir/"
             cp "$2" "$dir/bin/"
             chmod +x "$dir/bin/"*
           }
@@ -96,7 +111,27 @@ jobs:
           (cd pkg/windows && zip -qr "../../dist/agy-statusline-v$VERSION-windows-x64.zip" agy-statusline)
           (cd dist && sha256sum * > SHA256SUMS)
           ls -l dist
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          python3 - "$VERSION" <<'PY' > release-notes.md
+          import re, sys
+          ver = sys.argv[1]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"(?m)^## \[?v?{re.escape(ver)}\]?(?:\s|$).*$", text)
+          if not m:
+              raise SystemExit(f"CHANGELOG.md is missing a section for v{ver}")
+          rest = text[m.end():]
+          nxt = re.search(r"(?m)^## |\n\[[^\]]+\]:\s*https?://", rest)
+          body = (rest[:nxt.start()] if nxt else rest).strip()
+          ref = re.search(rf"(?m)^\[v?{re.escape(ver)}\]:\s*(\S+)", text)
+          if ref and "/compare/" in ref.group(1):
+              body = f"{body}\n\n**Full Changelog**: {ref.group(1)}"
+          print(body)
+          PY
+          cat release-notes.md
       - uses: softprops/action-gh-release@v3
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: release-notes.md

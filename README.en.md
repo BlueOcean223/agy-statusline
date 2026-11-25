@@ -113,6 +113,7 @@ Every segment includes a custom hover tooltip (unaffected by live redraws) and c
 
 ## Documentation & Development
 
+- Release changelog: [CHANGELOG.md](CHANGELOG.md)
 - Architecture, data sources, local build & release workflow: [docs/development.en.md](docs/development.en.md)
 - Design comparison & data-flow diagram (Chinese): [docs/architecture.html](docs/architecture.html)
 

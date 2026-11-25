@@ -87,12 +87,13 @@ cargo test --locked
 ## CI 与发版流程
 
 - **`.github/workflows/ci.yml`**：推送到 `main` 或提 PR 时执行格式检查、JS 语法检查、JSON 清单检查，并在 macOS、Windows、Linux 三平台运行 `cargo clippy --locked --all-targets -- -D warnings` 与 `cargo test --locked`。
-- **`.github/workflows/release.yml`**：推送 `v*` 标签后自动校验版本号一致（标签、`Cargo.toml`、`plugin.json` 三处必须相同），构建 macOS 通用二进制（`aarch64` + `x86_64`）与 Windows x64 二进制，打包并生成 `SHA256SUMS` 发布到 GitHub Releases。
+- **`.github/workflows/release.yml`**：推送 `v*` 标签后自动校验版本号一致（标签、`Cargo.toml`、`plugin.json` 三处必须相同，且 `CHANGELOG.md` 包含对应版本变更），构建 macOS 通用二进制（`aarch64` + `x86_64`）与 Windows x64 二进制，打包生成 `SHA256SUMS`，并自动提取 `CHANGELOG.md` 对应章节作为 GitHub Release 正文。
 
 发布新版本：
 
 ```bash
-# 1. 将 Cargo.toml、Cargo.lock 与 plugin.json 的 version 改为目标版本（如 0.4.0）并提交
-# 2. 打标签并推送，触发 Release 工作流
+# 1. 在 CHANGELOG.md 中补充目标版本（如 v0.4.0）的变更记录
+# 2. 将 Cargo.toml、Cargo.lock 与 plugin.json 的 version 改为目标版本并提交
+# 3. 打标签并推送，触发 Release 工作流
 git tag v0.4.0 && git push origin v0.4.0
 ```
