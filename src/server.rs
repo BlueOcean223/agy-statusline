@@ -108,6 +108,10 @@ fn active_online_prices(cfg_enabled: bool) -> Option<OnlinePrices> {
     LIVE.get().and_then(|sh| sh.0.lock().ok().and_then(|s| s.online_prices.clone()))
 }
 
+fn requires_ui_token(method: &str, path: &str) -> bool {
+    method != "GET" || path == "/api/checkpoint"
+}
+
 fn handle_client(stream: TcpStream, ui_token: String) {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
@@ -159,8 +163,8 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         return;
     }
 
-    // Validate sidecar UI token on non-GET requests (same contract as sidecar_sdk)
-    if method != "GET" && !ui_token.is_empty() {
+    // Validate sidecar UI token on non-GET requests and sensitive GET endpoints (e.g. checkpoint summary).
+    if requires_ui_token(method, path) && !ui_token.is_empty() {
         let provided = headers.get("x-sidecar-token").or_else(|| query.get("token")).map(String::as_str).unwrap_or("");
         if provided != ui_token {
             send_response(stream, 401, "application/json", br#"{"error":"unauthorized"}"#);
@@ -234,29 +238,33 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             } else {
                 Vec::new()
             };
-            let out = match USAGE.lock() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(store) => {
-                        let ad = store.app_data.clone();
-                        let cd = store.cli_data.clone();
-                        let pd = store.plugin_data.clone();
-                        usage::build_usage_view(
-                            &store.history,
-                            &store.samples,
-                            span,
-                            &ad,
-                            &cd,
-                            &pd,
-                            &mut store.cli,
-                            &live_calls,
-                            &rules,
-                            now_ms(),
-                            &price_src,
-                        )
-                    }
-                    None => json!({ "days": [], "error": "usage history initializing" }),
-                },
-                Err(_) => json!({ "days": [], "error": "usage store unavailable" }),
+            // Snapshot history, samples, and CLI cache briefly under USAGE lock, then run all disk/SQLite reads lock-free.
+            let snap = USAGE.lock().ok().and_then(|g| {
+                let store = g.as_ref()?;
+                Some((
+                    store.history.clone(),
+                    store.samples.clone(),
+                    store.cli_snap.clone(),
+                    store.app_data.clone(),
+                    store.cli_data.clone(),
+                    store.plugin_data.clone(),
+                ))
+            });
+            let out = match snap {
+                Some((history, samples, mut cli_snap, ad, cd, pd)) => usage::build_usage_view(
+                    &history,
+                    &samples,
+                    span,
+                    &ad,
+                    &cd,
+                    &pd,
+                    &mut cli_snap,
+                    &live_calls,
+                    &rules,
+                    now_ms(),
+                    &price_src,
+                ),
+                None => json!({ "days": [], "error": "usage history initializing" }),
             };
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
@@ -273,28 +281,29 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             let rules = effective_model_rules(&cfg.models, online.as_ref());
             let live_calls =
                 ENGINE.lock().ok().and_then(|g| g.as_ref().map(|e| e.live_call_records())).unwrap_or_default();
-            let out = match USAGE.lock() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(store) => {
-                        let ad = store.app_data.clone();
-                        let cd = store.cli_data.clone();
-                        let pd = store.plugin_data.clone();
-                        usage::build_day_calls_view(
-                            &ad,
-                            &cd,
-                            &pd,
-                            &mut store.cli,
-                            date,
-                            &live_calls,
-                            &rules,
-                            now_ms(),
-                            cfg.costly_call_usd,
-                            limit,
-                        )
-                    }
-                    None => json!({ "date": date, "calls": [], "error": "usage store initializing" }),
-                },
-                Err(_) => json!({ "date": date, "calls": [], "error": "usage store unavailable" }),
+            let snap = USAGE.lock().ok().and_then(|g| {
+                let store = g.as_ref()?;
+                Some((
+                    store.cli_snap.clone(),
+                    store.app_data.clone(),
+                    store.cli_data.clone(),
+                    store.plugin_data.clone(),
+                ))
+            });
+            let out = match snap {
+                Some((mut cli_snap, ad, cd, pd)) => usage::build_day_calls_view(
+                    &ad,
+                    &cd,
+                    &pd,
+                    &mut cli_snap,
+                    date,
+                    &live_calls,
+                    &rules,
+                    now_ms(),
+                    cfg.costly_call_usd,
+                    limit,
+                ),
+                None => json!({ "date": date, "calls": [], "error": "usage store initializing" }),
             };
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }
@@ -397,10 +406,10 @@ fn handle_client(stream: TcpStream, ui_token: String) {
         ("POST", "/api/config") => {
             let patch: ConfigPatch = serde_json::from_slice(&body).unwrap_or_default();
             let toggle_sync = patch.online_data_sync;
-            let toggle_zh = patch.ui_zh;
+            let prev_ui_zh = load_config(&plugin_data).ui_zh;
             let cfg = apply_config_patch(&plugin_data, patch);
             if let Some(shared) = LIVE.get() {
-                if toggle_zh.is_some()
+                if cfg.ui_zh != prev_ui_zh
                     && let Ok(mut s) = shared.0.lock()
                 {
                     s.ui_zh_paused = false;
@@ -475,4 +484,17 @@ pub fn run_server(explicit_port: Option<u16>) -> std::io::Result<()> {
         thread::spawn(move || handle_client(stream, tok));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn requires_ui_token_for_mutations_and_checkpoint_endpoint() {
+        assert!(requires_ui_token("POST", "/api/config"));
+        assert!(requires_ui_token("GET", "/api/checkpoint"));
+        assert!(!requires_ui_token("GET", "/api/panel"));
+        assert!(!requires_ui_token("GET", "/api/usage"));
+    }
 }

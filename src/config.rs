@@ -617,21 +617,21 @@ pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = path.with_file_name(format!("{fname}.tmp.{}.{seq}", std::process::id()));
     fs::write(&tmp, content)?;
-    for attempt in 0..3 {
+    let mut last_err = None;
+    for attempt in 0..5 {
         match fs::rename(&tmp, path) {
             Ok(()) => return Ok(()),
-            Err(_) if attempt < 2 => thread::sleep(Duration::from_millis(50)),
             Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                // Windows fallback when rename is transiently blocked by antivirus/indexers.
-                if cfg!(target_os = "windows") {
-                    return fs::write(path, content);
+                last_err = Some(e);
+                if attempt < 4 {
+                    thread::sleep(Duration::from_millis(40 * (attempt + 1)));
                 }
-                return Err(e);
             }
         }
     }
-    Ok(())
+    let _ = fs::remove_file(&tmp);
+    // Never fall back to truncating `path` directly: preserve the existing intact file on failure.
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("atomic rename failed")))
 }
 
 /// Outcome of reading a persisted file with retry + corruption preservation (review A1).

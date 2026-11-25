@@ -13,7 +13,7 @@
 //! Hooks only tell the engine *when* to look (UDP datagram, see `hook.rs`), so a turn's numbers
 //! show up right after the call ends instead of on the next poll.
 
-use crate::cli_usage::CliScanner;
+use crate::cli_usage::{CliScanner, CliSnapshot, apply_cli_delta};
 use crate::config::{
     Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir,
     load_config, write_atomic,
@@ -390,7 +390,7 @@ pub struct UsageStore {
     pub history: UsageHistory,
     pub samples: QuotaSamples,
     pub samples_writable: bool,
-    pub cli: CliScanner,
+    pub cli_snap: CliSnapshot,
     pub app_data: PathBuf,
     pub cli_data: PathBuf,
     pub plugin_data: PathBuf,
@@ -412,7 +412,7 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
             history,
             samples,
             samples_writable,
-            cli: CliScanner::default(),
+            cli_snap: CliSnapshot::default(),
             app_data: app_data.clone(),
             cli_data: cli_data.clone(),
             plugin_data: plugin_data.clone(),
@@ -448,25 +448,33 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
             }
         });
     }
-    // Background agy CLI scanner (runs immediately, then every 30s without blocking live::run).
+    // Background agy CLI scanner: runs all SQLite reads outside USAGE lock, then merges briefly.
     std::thread::spawn(move || {
+        let mut scanner = CliScanner::default();
         loop {
-            let changed = if let Ok(mut guard) = USAGE.lock()
-                && let Some(store) = guard.as_mut()
+            let meta = USAGE.lock().ok().and_then(|g| {
+                g.as_ref().map(|s| (s.cli_data.clone(), s.plugin_data.clone(), s.history.cli_bf.clone()))
+            });
+            if let Some((cd, pd, cli_bf)) = meta
+                && let Some(delta) = scanner.scan_delta(&cd, &pd, cli_bf.as_ref(), now_ms())
             {
-                let cd = store.cli_data.clone();
-                let pd = store.plugin_data.clone();
-                let ch = store.cli.scan(&cd, &pd, &mut store.history, now_ms());
-                if ch {
-                    save_history(&store.plugin_data, &store.history);
-                    store.last_saved = Instant::now();
+                let snap = delta.snapshot.clone();
+                let changed = if let Ok(mut guard) = USAGE.lock()
+                    && let Some(store) = guard.as_mut()
+                {
+                    store.cli_snap = snap;
+                    let ch = apply_cli_delta(&mut store.history, delta);
+                    if ch {
+                        save_history(&store.plugin_data, &store.history);
+                        store.last_saved = Instant::now();
+                    }
+                    ch
+                } else {
+                    false
+                };
+                if changed {
+                    wake(&shared);
                 }
-                ch
-            } else {
-                false
-            };
-            if changed {
-                wake(&shared);
             }
             std::thread::sleep(Duration::from_secs(30));
         }
@@ -1056,66 +1064,73 @@ impl Engine {
                 live_tok += c.input + c.cache + c.cache_write + c.output;
             }
         }
-        let persisted = USAGE.lock().ok().and_then(|mut g| {
-            let store = g.as_mut()?;
-            let today = today_str();
-            let now = now_ms();
+        // Snapshot today's persisted aggregates + CLI snapshot briefly under USAGE lock, then price lock-free.
+        let today = today_str();
+        let now = now_ms();
+        let snap = USAGE.lock().ok().and_then(|g| {
+            let store = g.as_ref()?;
+            let day = store.history.days.get(&today)?;
+            Some((
+                day.raw.clone(),
+                day.cli_raw.clone(),
+                store.cli_snap.clone(),
+                store.cli_data.clone(),
+                store.plugin_data.clone(),
+            ))
+        });
+        let persisted = snap.map(|(desk_raw, cli_raw, mut cli_snap, cd, pd)| {
             let (mut desk_usd, mut desk_tok) = (0.0, 0u64);
             let (mut cli_usd, mut cli_tok) = (0.0, 0u64);
-            if let Some(day) = store.history.days.get(&today) {
-                for (model, agg) in &day.raw {
-                    let (_, u) = crate::usage::price_tokens(
-                        rules,
-                        model,
-                        agg.input,
-                        agg.cache_read,
-                        agg.cache_write,
-                        agg.output,
-                        now,
-                        now,
-                    );
-                    desk_usd += u;
-                    desk_tok += agg.total_tokens();
-                }
-                if !day.cli_raw.is_empty() {
-                    // On price-transition days, price CLI calls at their exact timestamps.
-                    if crate::config::any_price_cut_in(rules, midnight, midnight + 86_400_000) {
-                        let cd = store.cli_data.clone();
-                        let pd = store.plugin_data.clone();
-                        for c in store.cli.calls_for_day(&cd, &pd, &today) {
-                            let key = format!("{} {}", c.model_raw, c.model_display);
-                            let (_, u) = crate::usage::price_tokens(
-                                rules,
-                                &key,
-                                c.input,
-                                c.cache_read,
-                                c.cache_write,
-                                c.output,
-                                c.at_ms,
-                                now,
-                            );
-                            cli_usd += u;
-                            cli_tok += c.input + c.cache_read + c.cache_write + c.output;
-                        }
-                    } else {
-                        for (model, agg) in &day.cli_raw {
-                            let (_, u) = crate::usage::price_tokens(
-                                rules,
-                                model,
-                                agg.input,
-                                agg.cache_read,
-                                agg.cache_write,
-                                agg.output,
-                                now,
-                                now,
-                            );
-                            cli_usd += u;
-                            cli_tok += agg.total_tokens();
-                        }
+            for (model, agg) in &desk_raw {
+                let (_, u) = crate::usage::price_tokens(
+                    rules,
+                    model,
+                    agg.input,
+                    agg.cache_read,
+                    agg.cache_write,
+                    agg.output,
+                    now,
+                    now,
+                );
+                desk_usd += u;
+                desk_tok += agg.total_tokens();
+            }
+            if !cli_raw.is_empty() {
+                // On price-transition days, price CLI calls at their exact timestamps outside USAGE lock.
+                if crate::config::any_price_cut_in(rules, midnight, midnight + 86_400_000) {
+                    for c in cli_snap.calls_for_day(&cd, &pd, &today) {
+                        let key = format!("{} {}", c.model_raw, c.model_display);
+                        let (_, u) = crate::usage::price_tokens(
+                            rules,
+                            &key,
+                            c.input,
+                            c.cache_read,
+                            c.cache_write,
+                            c.output,
+                            c.at_ms,
+                            now,
+                        );
+                        cli_usd += u;
+                        cli_tok += c.input + c.cache_read + c.cache_write + c.output;
+                    }
+                } else {
+                    for (model, agg) in &cli_raw {
+                        let (_, u) = crate::usage::price_tokens(
+                            rules,
+                            model,
+                            agg.input,
+                            agg.cache_read,
+                            agg.cache_write,
+                            agg.output,
+                            now,
+                            now,
+                        );
+                        cli_usd += u;
+                        cli_tok += agg.total_tokens();
                     }
                 }
             }
-            Some((desk_usd, desk_tok, cli_usd, cli_tok))
+            (desk_usd, desk_tok, cli_usd, cli_tok)
         });
         match persisted {
             Some((p_desk_cost, p_desk_tok, cli_cost, cli_tok)) => {

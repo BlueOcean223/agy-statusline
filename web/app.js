@@ -45,6 +45,7 @@
   let ckptOpenConvId = null;
   let ckptData = null;
   let ckptLoading = false;
+  let ckptReqSeq = 0;
 
   // Live status cache (for temporary English toggle button state)
   let liveStatus = null;
@@ -111,6 +112,12 @@
 
   convSelect.addEventListener('change', () => {
     selectedConvId = convSelect.value;
+    if (ckptOpenConvId && ckptOpenConvId !== selectedConvId) {
+      ckptReqSeq++;
+      ckptOpenConvId = null;
+      ckptData = null;
+      ckptLoading = false;
+    }
     lastJson = '';
     poll();
   });
@@ -119,6 +126,10 @@
   const postJson = (path, body) => {
     const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
     return f(path, { method: 'POST', body: JSON.stringify(body || {}) });
+  };
+  const secureGet = (path) => {
+    const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
+    return f(path, { method: 'GET', cache: 'no-store' });
   };
   function esc(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -214,23 +225,31 @@
 
   async function toggleCheckpointViewer(convId) {
     if (ckptOpenConvId === convId) {
+      ckptReqSeq++;
       ckptOpenConvId = null;
       ckptData = null;
+      ckptLoading = false;
       if (last) renderOverview(last);
       return;
     }
+    const seq = ++ckptReqSeq;
     ckptOpenConvId = convId;
     ckptData = null;
     ckptLoading = true;
     if (last) renderOverview(last);
     try {
-      const res = await fetch(`/api/checkpoint?conversationId=${encodeURIComponent(convId)}`, { cache: 'no-store' });
-      ckptData = res.ok ? await res.json() : { err: 'HTTP ' + res.status };
+      const res = await secureGet(`/api/checkpoint?conversationId=${encodeURIComponent(convId)}`);
+      const next = res.ok ? await res.json() : { err: 'HTTP ' + res.status };
+      if (seq !== ckptReqSeq || ckptOpenConvId !== convId) return;
+      ckptData = next;
     } catch (e) {
+      if (seq !== ckptReqSeq || ckptOpenConvId !== convId) return;
       ckptData = { err: e.message };
     } finally {
-      ckptLoading = false;
-      if (last && activeTab === 'overview') renderOverview(last);
+      if (seq === ckptReqSeq && ckptOpenConvId === convId) {
+        ckptLoading = false;
+        if (last && activeTab === 'overview') renderOverview(last);
+      }
     }
   }
 
@@ -786,7 +805,10 @@
     const barItems = isWeekly ? weekBuckets(days) : days;
     const maxUsd = Math.max(0.01, ...barItems.map((d) => Number(d.usd) || 0));
     const peakDate = barItems.reduce((best, d) => ((d.usd || 0) > (best?.usd || 0) ? d : best), null)?.date;
-    const avgVal = isWeekly ? (totals.avgUsd || 0) * 7 : (totals.avgUsd || 0);
+    const activeWeeks = isWeekly ? barItems.filter((w) => (Number(w.usd) || 0) > 0) : [];
+    const avgVal = isWeekly
+      ? (activeWeeks.length ? activeWeeks.reduce((s, w) => s + (Number(w.usd) || 0), 0) / activeWeeks.length : 0)
+      : (totals.avgUsd || 0);
     const avgPct = avgVal > 0 ? Math.min(100, (avgVal / maxUsd) * 100) : 0;
 
     const acct = u.account;

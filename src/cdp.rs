@@ -43,7 +43,7 @@ fn i18n_source(dict: Option<&str>, rules: Option<&str>, opts: &str) -> String {
 }
 
 fn disable_i18n_expr() -> &'static str {
-    "if (window.__agyI18n) { try { window.__agyI18n.update({}, []); } catch (e) {} window.__agyI18n.disable(); }"
+    "if (window.__agyI18n) { try { if (window.__agyI18n.restore) window.__agyI18n.restore(); else if (window.__agyI18n.setPaused) window.__agyI18n.setPaused(true, true); else window.__agyI18n.update({}, []); } catch (e) {} window.__agyI18n.disable(); }"
 }
 
 fn pause_i18n_expr(paused: bool, quiet: bool) -> String {

@@ -354,6 +354,11 @@ function agyI18n(DICT, RULES, OPTS) {
         const o = origText.get(n);
         if (o && n.nodeValue === o[1]) n.nodeValue = o[0];
       } else {
+        if (n.hasAttribute(ORIG)) {
+          n.removeAttribute(ORIG);
+          n.removeAttribute('title');
+          origOwner.delete(n);
+        }
         const m = origAttr.get(n);
         if (m) for (const a of Object.keys(m)) if (n.getAttribute(a) === m[a][1]) n.setAttribute(a, m[a][0]);
       }
@@ -399,6 +404,7 @@ function agyI18n(DICT, RULES, OPTS) {
     version: VERSION,
     optsKey: OPTS_KEY,
     update(d, r) { load(d, r); missSeen.clear(); missNew = []; if (document.body && !paused) walk(document.body); },
+    restore: restoreAll,
     setPaused, // 插件面板的“切到英文 / 切回中文”按钮经注入程序调用（v12）
     get paused() { return paused; },
     takeMissing() { const a = missNew; missNew = []; return a; }, // 注入程序每 30 秒取一次（v11）
