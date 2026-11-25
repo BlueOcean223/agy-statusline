@@ -10,10 +10,10 @@
 
 | 组件 | 路径 | 职责 |
 |---|---|---|
-| **Sidecar 入口** | `src/main.rs`、`src/server.rs` | 由 `sidecars/statusline/sidecar.json` 拉起并托管：运行 live 引擎、CDP 注入器、本地 HTTP 面板服务、调试重启守卫与更新中心 |
-| **实时引擎** | `src/live.rs`、`src/ls.rs`、`src/git.rs`、`src/transcript.rs` | 增量拉取 `language_server` 只读接口、读取 transcript/annotations、定期采集工作区 Git 状态 |
-| **用量与补算** | `src/usage.rs` | 持久化 90 天每日用量（`usage-history.json`）与 8 天每周额度采样（`quota-samples.json`）、只读 SQLite 补算 `conversations/*.db`、单日调用明细与每周额度容量/耗尽预估 |
-| **CDP 渲染注入** | `src/cdp.rs`、`web/bar.js` | 每 3 秒扫描 `DevToolsActivePort`，向主窗口注入纯渲染脚本 `bar.js` 与 `i18n/translator.js`；关闭中文时即时还原英文 |
+| **Sidecar 入口** | `src/main.rs`、`src/server.rs`、`src/panel.rs` | 由 `sidecars/statusline/sidecar.json` 拉起并托管：运行 live 引擎、CDP 注入器、本地 HTTP 面板服务（写接口与 `GET /api/checkpoint` 均受 UI 令牌保护）、调试重启守卫与更新中心 |
+| **实时引擎** | `src/live.rs`、`src/ls.rs`、`src/git.rs`、`src/transcript.rs` | 增量拉取 `language_server` 只读接口、读取 transcript/annotations 与按需提取 `transcript_full.jsonl` 压缩摘要、定期采集工作区 Git 状态 |
+| **用量、额度与归因** | `src/usage.rs`、`src/quota.rs`、`src/cli_usage.rs`、`src/miss.rs` | 持久化 400 天每日用量（`usage-history.json`）、8 天每周额度采样（`quota-samples.json`）与 CLI 日期索引（`cli-index.json`）；只读 SQLite 补算桌面与 `agy CLI` 对话库、单日调用/按对话明细、6 类缓存未命中归因分析，以及跨周期分段与提早重置（`↺`）的每周额度状态机 |
+| **CDP 渲染注入** | `src/cdp.rs`、`web/bar.js` | 每 3 秒扫描 `DevToolsActivePort`，向主窗口与 Swarm iframe 注入纯渲染脚本 `bar.js` 与 `i18n/translator.js`（v12）；同步全局临时英文快捷键、关闭中文时即时还原英文，并自动重载卡死在 `"plugin unavailable"` 的侧边栏面板 |
 | **跨平台重启守卫** | `src/relaunch.rs` | macOS（`nohup` 脱离）与 Windows（两段式 PowerShell 脱离 Job Object）调试重启，触发前核验主进程命令行防误重启 |
 | **更新与数据同步** | `src/updater.rs` | 自动识别环境变量与系统代理；支持 GitHub Releases `SHA256SUMS` 校验自更新（含备份回滚与开发目录保护），以及按 commit 同步 `agy-zh-pack` 词典与价格表 |
 | **生命周期 Hook** | `src/hook.rs`、`hooks.json` | 响应会话/工具事件，向 sidecar 发送本地 UDP 通知（≤10ms）触发即时刷新 |
@@ -32,14 +32,14 @@
 - **`GetUserStatus`**：当前登录账号（页面与落盘仅保留打码邮箱和 FNV-1a 哈希键）及订阅档次。
 
 **本地文件与 Git**：
-- `brain/<id>/.system_generated/logs/transcript.jsonl`：按字节偏移增量读取步骤创建时间、工具摘要与历史子代理提示。
+- `brain/<id>/.system_generated/logs/transcript.jsonl` 与 `transcript_full.jsonl`：前者按字节偏移增量读取步骤创建时间、工具摘要与历史子代理提示；后者仅在用户点击压缩摘要时按需读取（经 UI 令牌鉴权，不持久化）。
 - `annotations/<id>.pbtxt`：读取对话标题与最近查看时间。
-- `conversations/*.db`：首次运行后台只读打开（`SQLITE_OPEN_READ_ONLY`），轻量解析 `steps` 与 `gen_metadata` 的 protobuf 行补算历史天数，并在查看历史单日调用明细时按需查询。
+- `conversations/*.db` 与 `~/.gemini/antigravity-cli/conversations/*.db`（及 `conversation_summaries.db`）：后台只读打开（`SQLITE_OPEN_READ_ONLY`），轻量解析 protobuf 行补算历史天数与 `agy CLI` 用量，并在查看历史单日明细时按需查询。
 - Git 状态：对当前屏幕对话的工作区执行 `git status --porcelain=v2 --branch` 与 `git diff HEAD --numstat`，带 `GIT_OPTIONAL_LOCKS=0`，每个工作区最多 5 秒执行一次。
 
-**数据目录**（`~/.gemini/antigravity/plugin_data/agy-statusline/`，Windows 为 `%USERPROFILE%\.gemini\antigravity\plugin_data\agy-statusline\`）：
-- `config.toml`：全部插件配置、外观与模型单价规则
-- `usage-history.json` / `quota-samples.json`：90 天每日用量汇总与 8 天每周额度采样
+**数据目录**（`~/.gemini/antigravity/plugin_data/agy-statusline/`，Windows 为 `%USERPROFILE%\.gemini\antigravity\plugin_data\agy-statusline\`；所有落盘文件使用原子写入，解析失败时自动备份为 `*.bad-YYYYMMDDHHMM.*`）：
+- `config.toml`：全部插件配置、外观、高价告警阈值与模型单价规则
+- `usage-history.json` / `quota-samples.json` / `cli-index.json`：400 天每日用量汇总（含周期历史与重置事件）、8 天每周额度采样与 CLI 会话库日期索引
 - `relaunch-state.json` / `relaunch.log`：防误重启状态与重启脚本日志
 - `release-cache.json` / `update-state.json` / `backup/`：版本检查缓存、更新状态与回滚备份
 - `remote/`：在线同步的 `zh-CN.json`、`zh-CN.rules.json`、`prices.json` 与同步状态
@@ -92,7 +92,7 @@ cargo test --locked
 发布新版本：
 
 ```bash
-# 1. 将 Cargo.toml 与 plugin.json 的 version 改为目标版本（如 0.3.0）并提交
+# 1. 将 Cargo.toml、Cargo.lock 与 plugin.json 的 version 改为目标版本（如 0.4.0）并提交
 # 2. 打标签并推送，触发 Release 工作流
-git tag v0.3.0 && git push origin v0.3.0
+git tag v0.4.0 && git push origin v0.4.0
 ```
