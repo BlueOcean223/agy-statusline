@@ -18,6 +18,23 @@
   let data = null;
   let paneIds = [];
   let timer = 0;
+  const costlySeen = new Map();
+
+  const fmtIdle = (ms) => {
+    const n = Math.max(0, Number(ms) || 0);
+    if (n < 60e3) return Math.round(n / 1000) + ' 秒';
+    if (n < 3600e3) return Math.round(n / 60e3) + ' 分钟';
+    return (n / 3600e3).toFixed(1) + ' 小时';
+  };
+  const missExplain = (m) => {
+    if (!m) return '';
+    if (m.cause === 'user') return '你隔了 ' + fmtIdle(m.idleMs) + ' 才发下一条消息';
+    if (m.cause === 'turn') return '一轮中间停了 ' + fmtIdle(m.idleMs) + '（长命令、等你批准、等子代理）';
+    if (m.cause === 'wait') return '隔了 ' + fmtIdle(m.idleMs) + ' 才发下一次请求（agy CLI）';
+    if (m.cause === 'compact') return '上下文刚被压缩或截短';
+    if (m.cause === 'model') return '换了模型（上一大调用：' + (m.fromModel || '其他模型') + '）';
+    return '间隔仅 ' + fmtIdle(m.idleMs) + ' 也未命中（服务端缓存未接上或前缀变化）';
+  };
 
   // ---------------------------------------------------------------- palettes (8 themes × light/dark)
   const PAL_VARS = [
@@ -301,7 +318,7 @@
     const tipText = '上下文窗口：' + Number(a.ctxUsed).toLocaleString() +
       (a.ctxMax ? ' / ' + Number(a.ctxMax).toLocaleString() + ' token（' + pct(f) + '）' : ' token') +
       barLine +
-      (a.compactions ? '\n已自动压缩上下文 ' + a.compactions + ' 次' : '\n尚未发生上下文压缩');
+      (a.compactions ? '\n已自动压缩上下文 ' + a.compactions + ' 次（可在右侧 Statusline 面板查看压缩摘要）' : '\n尚未发生上下文压缩');
     return seg(key, ctxIcon(f, look), parts, tipText);
   };
 
@@ -334,9 +351,32 @@
     return s;
   };
 
-  const costSeg = (v, today, showConv, look, priceSource) => {
+  const costlyBadge = (usd, key, look) => {
+    const b = el('span', 'costly');
+    if (look.icons !== 'off') b.append(el('span', 'ex', '!'));
+    b.append(fmtUsd(usd));
+    if (key) {
+      if (!costlySeen.has(key)) {
+        costlySeen.set(key, Date.now());
+        if (costlySeen.size > 200) costlySeen.delete(costlySeen.keys().next().value);
+      }
+      if (Date.now() - costlySeen.get(key) < 6000) b.classList.add('flash');
+    }
+    return b;
+  };
+
+  const costSeg = (v, today, todayCli, showConv, look, priceSource) => {
     const convText = showConv ? fmtUsd(v.costConv) + (v.multiDay ? ' conv' : '') : null;
-    const parts = [convText];
+    const lastTotal = v.costLast
+      ? (Number(v.costLast.in) || 0) + (Number(v.costLast.cache) || 0) + (Number(v.costLast.cw) || 0) + (Number(v.costLast.out) || 0)
+      : 0;
+    let convNode = convText;
+    if (showConv && v.lastCallCostly && lastTotal > 0) {
+      const wrap = el('span', 'cost-wrap');
+      wrap.append(el('span', 'tx', convText), costlyBadge(lastTotal, v.lastCallKey, look));
+      convNode = wrap;
+    }
+    const parts = [convNode];
     if (today != null) parts.push(dim(fmtUsd(today) + ' today'));
     const scope = v.isSub
       ? '此子代理累计'
@@ -348,12 +388,24 @@
       tipText += '（其中今日 ' + fmtUsdFine(v.costConvToday) + '）';
     }
     if (today != null) {
-      tipText += '\n今日全部对话：' + fmtUsdFine(today);
+      tipText += '\n今日全部对话：' + fmtUsdFine(today) + (todayCli > 0 ? '（含 agy CLI ' + fmtUsdFine(todayCli) + '）' : '');
     }
     if (v.costLast) {
-      tipText += '\n最近一次调用：输入 ' + fmtUsdFine(v.costLast.in) + ' · 缓存读 ' + fmtUsdFine(v.costLast.cache) +
+      tipText += '\n最近一次调用：' + fmtUsdFine(lastTotal) + '（输入 ' + fmtUsdFine(v.costLast.in) + ' · 缓存读 ' + fmtUsdFine(v.costLast.cache) +
         (v.costLast.cw > 0 ? ' · 缓存写 ' + fmtUsdFine(v.costLast.cw) : '') +
-        ' · 输出 ' + fmtUsdFine(v.costLast.out);
+        ' · 输出 ' + fmtUsdFine(v.costLast.out) + '）';
+    }
+    if (v.lastCallCostly && lastTotal > 0) {
+      const m = v.lastCallMiss;
+      if (m) {
+        tipText += '\n\n⚠ 高价提醒：最近一次调用缓存未命中（约 ' + Number(m.tok || 0).toLocaleString() +
+          ' token 未走缓存，走缓存可省约 ' + fmtUsdFine(m.usd) + '）\n原因：' + missExplain(m);
+      } else {
+        tipText += '\n\n⚠ 高价提醒：缓存已命中，本次费用较高主要来自长上下文或大量输出';
+      }
+    } else if (v.lastCallMiss) {
+      const m = v.lastCallMiss;
+      tipText += '\n最近一次缓存未命中：多花约 ' + fmtUsdFine(m.usd) + '（' + missExplain(m) + '）';
     }
     if (v.priceName) tipText += '\n匹配价目：' + v.priceName;
     if (priceSource) tipText += '\n价格来源：' + (priceSource.startsWith('online') ? '在线价格表 ' + priceSource : '内置价格表');
@@ -512,7 +564,7 @@
       git,
       on('context') ? ctxSeg(a, look) : null,
       on('cache') ? cacheSeg(a, look) : null,
-      on('cost') || showToday ? costSeg(v, showToday ? data.today : null, on('cost'), look, data.priceSource) : null,
+      on('cost') || showToday ? costSeg(v, showToday ? data.today : null, data.todayCli || 0, on('cost'), look, data.priceSource) : null,
       !previewCompact && on('running') ? runSeg(!a.running) : null,
     ];
     const l2 = [...callSegs(a, sg, look), ...quotaSegs((v.quota || []).filter(quotaOn(sg)), look)];
@@ -599,6 +651,11 @@ ${PAL_CSS}
 .${BAR} .real.odd{opacity:1;font-weight:600;color:var(--k-warn)}
 .${BAR} .comp{display:inline-flex;align-items:center;color:var(--k-warn);font-weight:600;font-size:11px;padding:0 .38em;border-radius:4px;line-height:1.45;background:color-mix(in srgb,var(--k-warn) 16%,transparent)}
 .${BAR} .comp .cyc{margin-right:.12em;font-weight:700}
+.${BAR} .cost-wrap{display:inline-flex;align-items:center}
+.${BAR} .costly{display:inline-flex;align-items:center;color:var(--k-crit);font-weight:700;font-size:11px;padding:0 .38em;border-radius:4px;line-height:1.45;background:color-mix(in srgb,var(--k-crit) 16%,transparent);margin-left:.34em}
+.${BAR} .costly .ex{margin-right:.08em;font-weight:800}
+.${BAR} .costly.flash{animation:agyCostlyFlash .72s ease-in-out 5}
+@keyframes agyCostlyFlash{0%,100%{opacity:1}50%{opacity:.25}}
 .${BAR} .pace-ok{color:var(--k-run)} .${BAR} .pace-hi{color:var(--k-warn)}
 .${BAR} .tree{color:var(--k-muted);margin-right:.4em;font-weight:400;opacity:.8}
 .${BAR} .cells{display:inline-flex;gap:2px;margin-right:.18em}
@@ -635,7 +692,7 @@ ${PAL_CSS}
 .${BAR}[data-skin="powerline"] .cells i.on,.${BAR}[data-skin="powerline"] .meter.thin i,.${BAR}[data-skin="powerline"] .pulse{background:var(--pl-ink)}
 .${BAR}[data-skin="powerline"] .trk{stroke:color-mix(in srgb,var(--pl-ink) 30%,transparent)}
 .${BAR}[data-skin="powerline"] .arc{stroke:var(--pl-ink)}
-.${BAR}[data-skin="powerline"] .comp{color:inherit;background:color-mix(in srgb,var(--pl-ink) 22%,transparent)}
+.${BAR}[data-skin="powerline"] .comp,.${BAR}[data-skin="powerline"] .costly{color:inherit;background:color-mix(in srgb,var(--pl-ink) 22%,transparent)}
 .${BAR} .k-model{--kc:var(--k-model)} .${BAR} .k-context{--kc:var(--k-context)} .${BAR} .k-cache{--kc:var(--k-cache)}
 .${BAR} .k-timing{--kc:var(--k-timing)} .${BAR} .k-tokens{--kc:var(--k-tokens)} .${BAR} .k-quota{--kc:var(--k-quota)}
 .${BAR} .k-git{--kc:var(--k-git)} .${BAR} .k-agent{--kc:var(--k-agent)} .${BAR} .k-cost{--kc:var(--k-cost)} .${BAR} .k-warn{--kc:var(--k-warn)}
