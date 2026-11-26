@@ -35,6 +35,31 @@ const POLL_EVERY: Duration = Duration::from_millis(1000);
 const PANEL_CHECK_SECS: u64 = 30;
 const PANEL_MAX_TRIES: u32 = 6;
 const FRAME_RETRY_COOLDOWN: Duration = Duration::from_secs(60);
+/// `Runtime.enable` (needed for `Runtime.addBinding`) makes V8 retain every `console.*` argument
+/// and thrown exception for the life of the session; releasing them periodically bounds that.
+const DISCARD_CONSOLE_EVERY: Duration = Duration::from_secs(60);
+/// Bounds the WebSocket handshake and writes so a stalled target cannot hang its thread forever.
+const WS_IO_TIMEOUT: Duration = Duration::from_secs(10);
+/// High-volume events delivered because of `Runtime.enable` that we never act on.
+const IGNORED_EVENTS: [&str; 2] = ["\"method\":\"Runtime.consoleAPICalled\"", "\"method\":\"Runtime.exceptionThrown\""];
+
+/// Cheaply recognizes ignored CDP events without JSON-parsing them. Chromium serializes `method`
+/// first in event messages, so only the head is scanned; anything else falls through to parsing.
+fn is_ignored_event(text: &str) -> bool {
+    let head = &text.as_bytes()[..text.len().min(64)];
+    IGNORED_EVENTS.iter().any(|m| head.windows(m.len()).any(|w| w == m.as_bytes()))
+}
+
+/// Opens a CDP WebSocket with read/write timeouts already applied to the handshake.
+fn connect_ws(ws_url: &str, read_timeout: Duration) -> Result<WebSocket<TcpStream>, String> {
+    let host = ws_url.strip_prefix("ws://").and_then(|r| r.split('/').next()).ok_or("bad websocket url")?;
+    let stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
+    stream.set_read_timeout(Some(WS_IO_TIMEOUT)).map_err(|e| e.to_string())?;
+    stream.set_write_timeout(Some(WS_IO_TIMEOUT)).map_err(|e| e.to_string())?;
+    let (ws, _) = tungstenite::client(ws_url, stream).map_err(|e| e.to_string())?;
+    ws.get_ref().set_read_timeout(Some(read_timeout)).map_err(|e| e.to_string())?;
+    Ok(ws)
+}
 
 fn i18n_source(dict: Option<&str>, rules: Option<&str>, opts: &str) -> String {
     let d = dict.unwrap_or(I18N_DICT);
@@ -277,6 +302,9 @@ pub fn run(shared: SharedRef) {
                         }
                     }
                     panel_checks.retain(|id, _| seen_panels.contains(id));
+                    if let Ok(mut m) = frame_fail_at.lock() {
+                        m.retain(|_, at| at.elapsed() < FRAME_RETRY_COOLDOWN);
+                    }
 
                     let n = connected.lock().map(|c| c.len()).unwrap_or(0);
                     (true, format!("port {port}, {n} page(s) attached"))
@@ -328,10 +356,7 @@ fn handle_ask_binding(origin_id: &str, payload: &str, shared: &SharedRef) {
 }
 
 fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(), String> {
-    let host = ws_url.strip_prefix("ws://").and_then(|r| r.split('/').next()).ok_or("bad websocket url")?;
-    let stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
-    let (ws, _) = tungstenite::client(ws_url, stream).map_err(|e| e.to_string())?;
-    ws.get_ref().set_read_timeout(Some(Duration::from_millis(200))).map_err(|e| e.to_string())?;
+    let ws = connect_ws(ws_url, Duration::from_millis(200))?;
     let mut page = Page { ws, seq: 0 };
 
     page.send("Page.enable", json!({}))?;
@@ -353,7 +378,12 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
     let mut zh_script: Option<String> = None;
     let mut zh_old_script: Option<String> = None;
     let mut polled_at = Instant::now() - POLL_EVERY;
+    let mut discarded_at = Instant::now();
     loop {
+        if discarded_at.elapsed() >= DISCARD_CONSOLE_EVERY {
+            discarded_at = Instant::now();
+            page.send("Runtime.discardConsoleEntries", json!({}))?;
+        }
         if poll_id.is_none() && polled_at.elapsed() >= POLL_EVERY {
             polled_at = Instant::now();
             page.send(
@@ -364,6 +394,8 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
         }
 
         match page.ws.read() {
+            // Falls through (no `continue`) so a console flood cannot starve the work below.
+            Ok(Message::Text(t)) if is_ignored_event(t.as_str()) => {}
             Ok(Message::Text(t)) => {
                 let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
                 if v["method"].as_str() == Some("Runtime.bindingCalled")
@@ -470,10 +502,7 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
 
 /// Injects translator v12 with Swarm-specific exclude/allow/rules into `plugin://swarm--` iframes.
 fn run_swarm_frame(id: &str, ws_url: &str, shared: &SharedRef) -> Result<(), String> {
-    let host = ws_url.strip_prefix("ws://").and_then(|r| r.split('/').next()).ok_or("bad websocket url")?;
-    let stream = TcpStream::connect(host).map_err(|e| e.to_string())?;
-    let (ws, _) = tungstenite::client(ws_url, stream).map_err(|e| e.to_string())?;
-    ws.get_ref().set_read_timeout(Some(Duration::from_millis(300))).map_err(|e| e.to_string())?;
+    let ws = connect_ws(ws_url, Duration::from_millis(300))?;
     let mut page = Page { ws, seq: 0 };
 
     let _ = page.send("Page.enable", json!({}));
@@ -489,9 +518,16 @@ fn run_swarm_frame(id: &str, ws_url: &str, shared: &SharedRef) -> Result<(), Str
     let mut zh_add_id: Option<u64> = None;
     let mut zh_script: Option<String> = None;
     let mut zh_old_script: Option<String> = None;
+    let mut discarded_at = Instant::now();
 
     loop {
+        if discarded_at.elapsed() >= DISCARD_CONSOLE_EVERY {
+            discarded_at = Instant::now();
+            page.send("Runtime.discardConsoleEntries", json!({}))?;
+        }
         match page.ws.read() {
+            // Falls through (no `continue`) so a console flood cannot starve the work below.
+            Ok(Message::Text(t)) if is_ignored_event(t.as_str()) => {}
             Ok(Message::Text(t)) => {
                 let Ok(v) = serde_json::from_str::<Value>(t.as_str()) else { continue };
                 if v["method"].as_str() == Some("Runtime.bindingCalled")
@@ -575,6 +611,15 @@ mod tests {
         assert_eq!(panel_iframe_port("plugin://agy-statusline--statusline-54321/index.html"), Some(54321));
         assert_eq!(panel_iframe_port("plugin://swarm--core-19847/"), None);
         assert_eq!(panel_iframe_port("plugin://agy-zh-pack--core-19847/"), None);
+    }
+
+    #[test]
+    fn recognizes_ignored_runtime_events() {
+        assert!(is_ignored_event(r#"{"method":"Runtime.consoleAPICalled","params":{"type":"log","args":[]}}"#));
+        assert!(is_ignored_event(r#"{"method":"Runtime.exceptionThrown","params":{"timestamp":1}}"#));
+        assert!(!is_ignored_event(r#"{"method":"Runtime.bindingCalled","params":{"name":"__agyZhAsk"}}"#));
+        assert!(!is_ignored_event(r#"{"id":3,"result":{"result":{"value":"Runtime.consoleAPICalled"}}}"#));
+        assert!(!is_ignored_event(""));
     }
 
     #[test]

@@ -489,25 +489,23 @@
   };
 
   // Aligns columns across multiple subagent rows (excluding the trailing flexible status column).
+  // Clears all, then reads all, then writes all, so the host page lays out once per call rather
+  // than once per cell.
   const alignCols = (bar) => {
-    const rows = bar.querySelectorAll('.ln.sub');
-    if (rows.length < 2) return;
+    if (bar.querySelectorAll('.ln.sub').length < 2) return;
+    const cells = bar.querySelectorAll(':scope .ln.sub .seg[data-col]');
+    cells.forEach((s) => { s.style.minWidth = ''; });
     const widths = new Map();
-    rows.forEach((r) => {
-      r.querySelectorAll('.seg[data-col]').forEach((s) => {
-        s.style.minWidth = '';
-        if (s.classList.contains('sst') || s.classList.contains('ph')) return;
-        const c = s.dataset.col;
-        const w = Math.ceil(s.getBoundingClientRect().width);
-        if (w > (widths.get(c) || 0)) widths.set(c, w);
-      });
+    cells.forEach((s) => {
+      if (s.classList.contains('sst') || s.classList.contains('ph')) return;
+      const c = s.dataset.col;
+      const w = Math.ceil(s.getBoundingClientRect().width);
+      if (w > (widths.get(c) || 0)) widths.set(c, w);
     });
-    rows.forEach((r) => {
-      r.querySelectorAll('.seg[data-col]').forEach((s) => {
-        if (s.classList.contains('sst')) return;
-        const w = widths.get(s.dataset.col);
-        if (w) s.style.minWidth = w + 'px';
-      });
+    cells.forEach((s) => {
+      if (s.classList.contains('sst')) return;
+      const w = widths.get(s.dataset.col);
+      if (w) s.style.minWidth = w + 'px';
     });
   };
 
@@ -609,7 +607,8 @@
   };
 
   // ---------------------------------------------------------------- mount & style
-  const paneId = (box) => {
+  // `inputCount` is the number of chat inputs on the page, computed once per render by the caller.
+  const paneId = (box, inputCount) => {
     const own = box.closest(PANE);
     if (own) return own.getAttribute('data-cascade-id');
     let e = box.parentElement;
@@ -617,7 +616,7 @@
       const d = e.querySelector('[data-testid="subagent-tab-conversation"][data-cascade-id]');
       if (d) return d.getAttribute('data-cascade-id');
     }
-    if (document.querySelectorAll(INPUT).length !== 1) return null;
+    if (inputCount !== 1) return null;
     const m = UUID.exec(location.pathname);
     return m ? m[1] : null;
   };
@@ -710,16 +709,19 @@ ${PAL_CSS}
     elNode.setAttribute('data-icons', look.icons);
   };
 
-  const bars = () => Array.from(document.querySelectorAll(INPUT)).map((box) => {
-    let bar = box.previousElementSibling;
-    if (!bar || !bar.classList.contains(BAR)) {
-      bar = el('div', BAR);
-      bar.setAttribute('data-agy-no-i18n', '');
-      box.parentElement.insertBefore(bar, box);
-      bar._fresh = true;
-    }
-    return { bar, box, id: paneId(box) };
-  });
+  const bars = () => {
+    const boxes = document.querySelectorAll(INPUT);
+    return Array.from(boxes).map((box) => {
+      let bar = box.previousElementSibling;
+      if (!bar || !bar.classList.contains(BAR)) {
+        bar = el('div', BAR);
+        bar.setAttribute('data-agy-no-i18n', '');
+        box.parentElement.insertBefore(bar, box);
+        bar._fresh = true;
+      }
+      return { bar, box, id: paneId(box, boxes.length) };
+    });
+  };
 
   const render = (force) => {
     if (!document.body) return;
