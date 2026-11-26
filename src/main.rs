@@ -1,6 +1,7 @@
 mod cdp;
 mod cli_usage;
 mod config;
+mod convdb;
 mod git;
 mod hook;
 mod http;

@@ -18,6 +18,7 @@ use crate::config::{
     Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir,
     load_config, write_atomic,
 };
+use crate::convdb::{self, DbSig};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::miss::{MissCallInput, MissInfo, miss_scan};
@@ -219,6 +220,8 @@ pub struct Conv {
     loaded_once: bool,
     last_conv_mod: i64,
     transcript: Option<Transcript>,
+    /// Set when `calls` came from the conversation database instead of the language_server.
+    db_sig: Option<DbSig>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -486,7 +489,11 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
 pub struct Engine {
     pub(crate) ls: LsClient,
     pub(crate) app_data: PathBuf,
+    /// Conversations the language_server has loaded, plus those read from their database.
     pub(crate) summaries: HashMap<String, Summary>,
+    /// Ids in the latest `GetAllCascadeTrajectories` reply. Only these may be queried by id:
+    /// querying any other conversation makes the language_server load it for good.
+    ls_loaded: HashSet<String>,
     pub(crate) convs: HashMap<String, Conv>,
     hooks: HashMap<String, HookState>,
     pub(crate) dirty: HashSet<String>,
@@ -515,6 +522,7 @@ impl Engine {
             ls,
             app_data: find_app_data_dir(),
             summaries: HashMap::new(),
+            ls_loaded: HashSet::new(),
             convs: HashMap::new(),
             hooks: HashMap::new(),
             dirty: HashSet::new(),
@@ -552,7 +560,12 @@ impl Engine {
         let j = self.ls.call("GetAllCascadeTrajectories", &json!({}))?;
         let Some(ts) = j["trajectorySummaries"].as_object() else { return Ok(()) };
         let now = now_ms();
+        self.ls_loaded = ts.keys().cloned().collect();
         for (id, s) in ts {
+            // Read from its database earlier; the language_server has it now, so switch over.
+            if self.convs.get(id).is_some_and(|c| c.db_sig.is_some()) {
+                self.dirty.insert(id.clone());
+            }
             let tm = &s["trajectoryMetadata"];
             let spec = &tm["subagentSpec"];
             let next = Summary {
@@ -596,9 +609,17 @@ impl Engine {
         Ok(())
     }
 
+    /// Loads new generator records for `id`: from the language_server if it already has the
+    /// conversation loaded, otherwise from the conversation database (see `convdb`).
     pub(crate) fn refresh_conv(&mut self, id: &str) -> Result<(), String> {
+        if !self.ls_loaded.contains(id) {
+            return self.refresh_conv_db(id);
+        }
         let now = now_ms();
         let conv = self.convs.entry(id.to_string()).or_default();
+        // Database rows match the language_server's records index for index, so continue
+        // incrementally from what was read there.
+        conv.db_sig = None;
         let was_loaded = conv.loaded_once;
         // Re-read the last record: it may have been written before its usage was filled in.
         let offset = conv.calls.len().saturating_sub(1);
@@ -640,9 +661,36 @@ impl Engine {
         Ok(())
     }
 
+    /// Reads a conversation the language_server has not loaded from `conversations/<id>.db`,
+    /// without asking the language_server (which would load it into memory until restart).
+    fn refresh_conv_db(&mut self, id: &str) -> Result<(), String> {
+        let sig = convdb::signature(&self.app_data, id)
+            .ok_or_else(|| format!("{id}: not loaded by the language_server and has no database"))?;
+        if self.convs.get(id).is_some_and(|c| c.loaded_once && c.db_sig == Some(sig)) {
+            return Ok(());
+        }
+        let (mut calls, summary) = convdb::read(&self.app_data, id, sig)?;
+        let conv = self.convs.entry(id.to_string()).or_default();
+        for (new, old) in calls.iter_mut().zip(&conv.calls) {
+            new.at_ms = old.at_ms;
+            new.dated = old.dated;
+            new.live_seen = old.live_seen;
+        }
+        conv.calls = calls;
+        conv.loaded_once = true;
+        conv.loaded_steps = summary.step_count;
+        conv.db_sig = Some(sig);
+        self.summaries.insert(id.to_string(), summary);
+        self.sync_transcript(id, true);
+        Ok(())
+    }
+
     /// Incrementally fetches steps for an active or recently-completed subagent so the bar can
     /// show `waiting`, live elapsed duration, total steps, and a recent-steps timeline tooltip.
     fn refresh_sub_steps(&mut self, id: &str) {
+        if !self.ls_loaded.contains(id) {
+            return;
+        }
         let running = self.is_running(id);
         let cache = self.sub_steps.entry(id.to_string()).or_default();
         if running {
@@ -705,9 +753,7 @@ impl Engine {
 
     /// Probes subagent ids referenced in the transcripts of `seeds` that the language_server has
     /// not loaded yet (e.g. historical subagents of a conversation opened after restart).
-    /// Returns true if any new conversation was loaded.
-    pub(crate) fn load_subagent_hints(&mut self, seeds: &[String]) -> bool {
-        let mut loaded_any = false;
+    pub(crate) fn load_subagent_hints(&mut self, seeds: &[String]) {
         let mut queue: Vec<String> = seeds.to_vec();
         let mut seen: HashSet<String> = queue.iter().cloned().collect();
         for _ in 0..3 {
@@ -726,11 +772,8 @@ impl Engine {
                     if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
                         continue;
                     }
-                    if self.refresh_conv(&sid).is_ok() {
-                        loaded_any = true;
-                        if seen.insert(sid.clone()) {
-                            next_queue.push(sid);
-                        }
+                    if self.refresh_conv(&sid).is_ok() && seen.insert(sid.clone()) {
+                        next_queue.push(sid);
                     }
                 }
             }
@@ -739,7 +782,6 @@ impl Engine {
             }
             queue = next_queue;
         }
-        loaded_any
     }
 
     pub(crate) fn refresh_quota(&mut self) -> Result<(), String> {
@@ -827,16 +869,9 @@ impl Engine {
             })
             .collect();
         todo.sort();
-        let mut loaded_unknown = false;
         for id in todo {
-            let was_in_summaries = self.summaries.contains_key(&id);
-            match self.refresh_conv(&id) {
-                Ok(()) => {
-                    if !was_in_summaries {
-                        loaded_unknown = true;
-                    }
-                }
-                Err(e) => errors.push(e),
+            if let Err(e) = self.refresh_conv(&id) {
+                errors.push(e);
             }
             self.dirty.remove(&id);
         }
@@ -847,6 +882,7 @@ impl Engine {
         }
 
         // Backfill historical subagents for panes on screen so restarts don't omit subagent cost.
+        // They are read from their databases, which also records their summaries (root, role).
         let mut seeds: Vec<String> = Vec::new();
         for p in panes {
             seeds.push(p.clone());
@@ -855,33 +891,7 @@ impl Engine {
                 seeds.push(root);
             }
         }
-        if self.load_subagent_hints(&seeds) {
-            loaded_unknown = true;
-        }
-        if loaded_unknown {
-            match self.refresh_summaries() {
-                Ok(()) => {
-                    self.summaries_at = Some(Instant::now());
-                    let mut extra: Vec<String> = Vec::new();
-                    for p in panes {
-                        let root = self.root_of(p);
-                        for cid in self.tree(&root) {
-                            if !self.convs.contains_key(&cid) {
-                                extra.push(cid);
-                            }
-                        }
-                    }
-                    extra.sort();
-                    extra.dedup();
-                    for cid in extra {
-                        if let Err(e) = self.refresh_conv(&cid) {
-                            errors.push(e);
-                        }
-                    }
-                }
-                Err(e) => errors.push(e),
-            }
-        }
+        self.load_subagent_hints(&seeds);
 
         // Pick up late-flushed transcript.jsonl entries (timestamps/labels) without an LS RPC.
         let sync_ids: Vec<String> = self

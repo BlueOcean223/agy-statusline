@@ -534,7 +534,7 @@ pub fn update_today(
 
 // ---------------------------------------------------------------- lightweight protobuf reader
 
-enum PbVal<'a> {
+pub(crate) enum PbVal<'a> {
     Varint(u64),
     Bytes(&'a [u8]),
 }
@@ -556,7 +556,7 @@ fn read_varint(buf: &[u8], i: &mut usize) -> Option<u64> {
     None
 }
 
-fn pb_get(buf: &[u8], target: u64) -> Option<PbVal<'_>> {
+pub(crate) fn pb_get(buf: &[u8], target: u64) -> Option<PbVal<'_>> {
     let mut i = 0usize;
     while i < buf.len() {
         let key = read_varint(buf, &mut i)?;
@@ -602,28 +602,28 @@ fn pb_get(buf: &[u8], target: u64) -> Option<PbVal<'_>> {
     None
 }
 
-fn pb_bytes(buf: &[u8], field: u64) -> Option<&[u8]> {
+pub(crate) fn pb_bytes(buf: &[u8], field: u64) -> Option<&[u8]> {
     match pb_get(buf, field)? {
         PbVal::Bytes(b) => Some(b),
         _ => None,
     }
 }
 
-fn pb_u64(buf: &[u8], field: u64) -> Option<u64> {
+pub(crate) fn pb_u64(buf: &[u8], field: u64) -> Option<u64> {
     match pb_get(buf, field)? {
         PbVal::Varint(v) => Some(v),
         _ => None,
     }
 }
 
-fn pb_duration_ms(buf: &[u8]) -> Option<f64> {
+pub(crate) fn pb_duration_ms(buf: &[u8]) -> Option<f64> {
     let sec = pb_u64(buf, 1).unwrap_or(0) as f64;
     let nanos = pb_u64(buf, 2).unwrap_or(0) as f64;
     let ms = sec * 1000.0 + nanos / 1_000_000.0;
     (ms > 0.0).then_some(ms)
 }
 
-fn pb_varints(buf: &[u8]) -> Vec<u64> {
+pub(crate) fn pb_varints(buf: &[u8]) -> Vec<u64> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < buf.len() {

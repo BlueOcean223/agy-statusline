@@ -31,33 +31,19 @@ impl Engine {
     }
 
     /// Makes sure `id` and its subagents are loaded, for a panel request between engine ticks.
+    /// Conversations the language_server hasn't loaded are read from their databases.
     fn ensure_loaded(&mut self, id: &str) {
+        if !self.convs.contains_key(id) {
+            let _ = self.refresh_conv(id);
+        }
+        // Reading `id` may have revealed its root (a subagent opened from the list).
         let root = self.root_of(id);
-        let mut ids = self.tree(&root);
-        ids.push(id.to_string());
-        let mut loaded_unknown = false;
-        for cid in ids {
+        for cid in self.tree(&root) {
             if !self.convs.contains_key(&cid) {
-                let was_in_summaries = self.summaries.contains_key(&cid);
-                if self.refresh_conv(&cid).is_ok() && !was_in_summaries {
-                    loaded_unknown = true;
-                }
+                let _ = self.refresh_conv(&cid);
             }
         }
-        if self.load_subagent_hints(&[id.to_string(), root]) {
-            loaded_unknown = true;
-        }
-        if loaded_unknown && self.refresh_summaries().is_ok() {
-            self.summaries_at = Some(std::time::Instant::now());
-            let root = self.root_of(id);
-            for cid in self.tree(&root) {
-                if !self.convs.contains_key(&cid) {
-                    let _ = self.refresh_conv(&cid);
-                } else {
-                    self.sync_transcript(&cid, false);
-                }
-            }
-        }
+        self.load_subagent_hints(&[id.to_string(), root]);
     }
 
     pub fn panel(&mut self, requested: Option<&str>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {

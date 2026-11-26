@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 改进与修复 (Fixed & Improved)
+- **修复 `language_server` 内存持续增长**：此前 sidecar 会向 `language_server` 查询它尚未加载的对话（当天所有对话与子代理、历史子代理补全、面板切换的对话），每次查询都会让其把整段对话载入内存且直到 Antigravity 重启才释放，大量子代理时可涨至数 GB。现在只对 `language_server` 已加载的对话调用接口，其余对话改为只读读取 `conversations/<id>.db`（含用量、上下文、压缩点、子代理归属与工作区），统计结果不变。
 - **macOS 调试模式重启修复与加固**：修复 PID 回绕后 `target_app()` 误将 `Antigravity Helper (Renderer).app` 识别为主应用导致重启无响应的问题（过滤嵌套 Helper 子包及 `--type=` / `--import=` 进程并校验主程序路径）；重启脚本改用 `ps` + `awk` 字面匹配 PID 与参数化 `osascript`，并支持 `osascript quit` → `SIGTERM` → `SIGKILL` 逐级退出。
 - **进程校验状态同步**：CDP 调试端口连接后同步更新 `relaunch-state.json` 中的 `last_flag`，发起重启时清空旧状态，且已连接时不再显示过期的 `进程校验: noflag`。
 - **重启弹窗确认与超时恢复**：将 Settings 页手动重启按钮由内联二次点击改为主题自适应的模态确认弹窗（存在运行中对话时标红提示），并增加 20 秒退出超时自动恢复机制，避免异常时按钮卡死。
