@@ -1170,8 +1170,8 @@
         </div>
         <div class="form-hint" id="live-status" style="margin:8px 0;line-height:1.6">…</div>
         <div class="restart-row">
-          <button id="btn-restart" type="button" class="secondary-btn">以调试模式重启 Antigravity</button>
-          <span id="restart-hint" class="form-hint"></span>
+          <button id="btn-restart" type="button" class="secondary-btn" ${restartPending ? 'disabled' : ''}>${restartPending ? '重启中…' : '以调试模式重启 Antigravity'}</button>
+          <span id="restart-hint" class="form-hint">${restartPending ? '正在退出 Antigravity，稍后自动重新打开…' : ''}</span>
         </div>
       </div>
 
@@ -1353,38 +1353,125 @@
     });
   }
 
-  // ---------------------------------------------------------------- debug relaunch button
-  let restartArmed = 0;
-  async function onRestart() {
+  // ---------------------------------------------------------------- confirm modal & debug relaunch
+  let confirmResolver = null;
+  function openConfirmModal({ title, bodyHtml, okText = '确认', cancelText = '取消', danger = false, focusCancel = true }) {
+    const modal = $('confirm-modal');
+    if (!modal) return Promise.resolve(false);
+    if (confirmResolver) {
+      confirmResolver(false);
+      confirmResolver = null;
+    }
+    $('confirm-modal-title').textContent = title;
+    $('confirm-modal-body').innerHTML = bodyHtml;
+    const cancelBtn = $('confirm-modal-cancel');
+    const okBtn = $('confirm-modal-ok');
+    cancelBtn.textContent = cancelText;
+    okBtn.textContent = okText;
+    okBtn.className = 'secondary-btn ' + (danger ? 'danger-fill' : 'primary');
+    modal.classList.remove('hidden');
+
+    return new Promise((resolve) => {
+      const finish = (accepted) => {
+        if (!confirmResolver) return;
+        confirmResolver = null;
+        modal.classList.add('hidden');
+        cancelBtn.removeEventListener('click', onCancel);
+        okBtn.removeEventListener('click', onOk);
+        modal.removeEventListener('click', onBackdrop);
+        document.removeEventListener('keydown', onKey);
+        resolve(accepted);
+      };
+      const onCancel = () => finish(false);
+      const onOk = () => finish(true);
+      const onBackdrop = (e) => { if (e.target === modal) finish(false); };
+      const onKey = (e) => {
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          finish(false);
+        }
+      };
+      confirmResolver = finish;
+      cancelBtn.addEventListener('click', onCancel);
+      okBtn.addEventListener('click', onOk);
+      modal.addEventListener('click', onBackdrop);
+      document.addEventListener('keydown', onKey);
+      (focusCancel ? cancelBtn : okBtn).focus();
+    });
+  }
+
+  let restartChecking = false;
+  let restartPending = false;
+  let restartTimeout = 0;
+  function resetRestartUi(message = '', isErr = false) {
+    clearTimeout(restartTimeout);
+    restartTimeout = 0;
+    restartPending = false;
     const btn = $('btn-restart');
     const hint = $('restart-hint');
-    if (!restartArmed) {
-      let running = 0;
-      try { running = (await (await fetch('/api/live-status', { cache: 'no-store' })).json()).running || 0; } catch (e) {}
-      btn.textContent = '确认重启';
-      btn.classList.add('danger');
-      hint.textContent = running ? `${running} 个对话正在运行，重启会中断它们` : '会关闭所有 Antigravity 窗口后带调试参数重新打开';
-      restartArmed = setTimeout(() => {
-        restartArmed = 0;
-        btn.textContent = '以调试模式重启 Antigravity';
-        btn.classList.remove('danger');
-        hint.textContent = '';
-      }, 6000);
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '以调试模式重启 Antigravity';
+    }
+    if (hint) {
+      hint.textContent = message;
+      hint.classList.toggle('err', !!isErr);
+    }
+  }
+
+  async function onRestart() {
+    if (restartPending || restartChecking) return;
+    restartChecking = true;
+    const btn = $('btn-restart');
+    if (btn) btn.disabled = true;
+    let running = 0;
+    try {
+      const status = await (await fetch('/api/live-status', { cache: 'no-store' })).json();
+      running = Number(status.running) || 0;
+    } catch (e) {} finally {
+      restartChecking = false;
+      const curBtn = $('btn-restart');
+      if (curBtn && !restartPending) curBtn.disabled = false;
+    }
+
+    const bodyHtml =
+      '<div>将关闭当前所有 Antigravity 窗口，并附带 <code>--remote-debugging-port=0</code> 重新打开。对话记录会保留。</div>' +
+      (running > 0 ? `<div class="modal-warn">当前有 ${running} 个对话正在运行，重启会中断正在进行的任务。</div>` : '');
+
+    const ok = await openConfirmModal({
+      title: '以调试模式重启 Antigravity？',
+      bodyHtml,
+      okText: '确认重启',
+      cancelText: '取消',
+      danger: true,
+      focusCancel: running > 0,
+    });
+    if (!ok) {
+      $('btn-restart')?.focus();
       return;
     }
-    clearTimeout(restartArmed);
-    restartArmed = 0;
-    btn.disabled = true;
+
+    restartPending = true;
+    const curBtn = $('btn-restart');
+    const hint = $('restart-hint');
+    if (curBtn) {
+      curBtn.disabled = true;
+      curBtn.textContent = '重启中…';
+    }
+    if (hint) {
+      hint.classList.remove('err');
+      hint.textContent = '正在退出 Antigravity，稍后自动重新打开…';
+    }
     try {
       const res = await postJson('/api/restart-debug', {});
       const j = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(j.error || 'HTTP ' + res.status);
-      hint.textContent = '正在退出 Antigravity，稍后自动重新打开…';
+      // If Antigravity hasn't exited within 20s, recover the button instead of hanging forever.
+      restartTimeout = setTimeout(() => {
+        resetRestartUi('重启超时：Antigravity 未退出，请检查是否有未保存确认窗或查看 relaunch.log', true);
+      }, 20000);
     } catch (e) {
-      btn.disabled = false;
-      btn.textContent = '以调试模式重启 Antigravity';
-      btn.classList.remove('danger');
-      hint.textContent = '重启失败：' + e.message;
+      resetRestartUi('重启失败：' + e.message, true);
     }
   }
 
@@ -1403,7 +1490,8 @@
       if (!box) return;
       const state = j.debug ? '<span class="ok">调试端口已连接，状态栏和中文界面可用</span>'
         : '<span class="bad">没连上调试端口：状态栏和中文界面需要 Antigravity 以调试模式启动</span>';
-      const flag = j.relaunch?.lastFlag ? ` · 进程校验: ${esc(j.relaunch.lastFlag)}` : '';
+      const rawFlag = j.relaunch?.lastFlag || '';
+      const flag = (rawFlag && (!j.debug || rawFlag === 'flag')) ? ` · 进程校验: ${esc(rawFlag)}` : '';
       const swarm = j.swarmFrames ? ` · Swarm 面板: ${j.swarmFrames}` : '';
       const zhNote = j.zhPaused ? ' · <span class="bad">当前临时英文</span>' : '';
       box.innerHTML = state + zhNote + `<br>CDP: ${esc(j.cdp || '—')}${swarm}${flag}<br>language_server: ${esc(j.ls || '—')}` +

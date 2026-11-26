@@ -120,11 +120,10 @@ pub fn target_app() -> Option<String> {
         if let Ok(out) = Command::new("/bin/ps").args(["-axo", "args="]).output() {
             let text = String::from_utf8_lossy(&out.stdout);
             for line in text.lines() {
-                if let Some(idx) = line.find(".app/Contents/MacOS/Antigravity") {
-                    let candidate = line[..idx + 4].trim();
-                    if Path::new(candidate).exists() {
-                        return Some(candidate.to_string());
-                    }
+                if let Some(candidate) = parse_macos_app_from_ps_line(line)
+                    && Path::new(candidate).join("Contents/MacOS/Antigravity").is_file()
+                {
+                    return Some(candidate.to_string());
                 }
             }
         }
@@ -132,7 +131,7 @@ pub fn target_app() -> Option<String> {
             PathBuf::from("/Applications/Antigravity.app"),
             dirs::home_dir().unwrap_or_default().join("Applications/Antigravity.app"),
         ] {
-            if p.exists() {
+            if p.join("Contents/MacOS/Antigravity").is_file() {
                 return Some(p.to_string_lossy().to_string());
             }
         }
@@ -154,6 +153,41 @@ pub fn target_app() -> Option<String> {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn parse_macos_app_from_ps_line(line: &str) -> Option<&str> {
+    const MARKER: &str = ".app/Contents/MacOS/Antigravity";
+    let trimmed = line.trim();
+    if !trimmed.starts_with('/') || trimmed.contains("--type=") || trimmed.contains("--import=") {
+        return None;
+    }
+    let idx = trimmed.find(MARKER)?;
+    let after = &trimmed[idx + MARKER.len()..];
+    if !after.is_empty() && !after.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let candidate = &trimmed[..idx + 4];
+    // Exclude Helper sub-bundles nested under Contents/Frameworks/*.app.
+    if candidate.contains(".app/Contents/") {
+        return None;
+    }
+    Some(candidate)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn classify_macos_ps(target: &str, ps_output: &str) -> LaunchFlag {
+    let main = format!("{target}/Contents/MacOS/Antigravity");
+    let main_prefix = format!("{main} ");
+    let mains: Vec<&str> = ps_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| (*l == main || l.starts_with(&main_prefix)) && !l.contains("--type=") && !l.contains("--import="))
+        .collect();
+    if mains.is_empty() {
+        return LaunchFlag::NotRunning;
+    }
+    if mains.iter().any(|l| !has_debug_port_flag(l)) { LaunchFlag::NoFlag } else { LaunchFlag::Flag }
+}
+
 /// Inspects running Antigravity main processes to determine whether `--remote-debugging-port` was passed.
 pub fn started_with_flag(target: &str) -> LaunchFlag {
     if target.is_empty() {
@@ -161,23 +195,13 @@ pub fn started_with_flag(target: &str) -> LaunchFlag {
     }
     #[cfg(target_os = "macos")]
     {
-        let main = format!("{target}/Contents/MacOS/Antigravity");
         let Ok(out) = Command::new("/bin/ps").args(["-axo", "args="]).output() else {
             return LaunchFlag::Unknown;
         };
         if !out.status.success() {
             return LaunchFlag::Unknown;
         }
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mains: Vec<&str> = text
-            .lines()
-            .map(str::trim)
-            .filter(|l| (*l == main || l.starts_with(&format!("{main} "))) && !l.contains("--type="))
-            .collect();
-        if mains.is_empty() {
-            return LaunchFlag::NotRunning;
-        }
-        if mains.iter().any(|l| !has_debug_port_flag(l)) { LaunchFlag::NoFlag } else { LaunchFlag::Flag }
+        classify_macos_ps(target, &String::from_utf8_lossy(&out.stdout))
     }
     #[cfg(target_os = "windows")]
     {
@@ -358,6 +382,7 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
     let target = target_app().ok_or_else(|| "未找到 Antigravity 安装路径".to_string())?;
     let (mut st, writable) = load_state(plugin_data);
     st.last_relaunch_at = now_ms();
+    st.last_flag.clear();
     save_state(plugin_data, &st, writable);
     append_log(plugin_data, &format!("relaunching Antigravity with {DEBUG_ARG}: {target}"));
     let log_file = log_path(plugin_data);
@@ -370,17 +395,42 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
             "#!/bin/sh\n\
              unset ELECTRON_RUN_AS_NODE ELECTRON_NO_ATTACH_CONSOLE NODE_OPTIONS NODE_PATH\n\
              L() {{ echo \"$(date '+%Y-%m-%d %H:%M:%S') $*\" >> \"$AGY_LOG\"; }}\n\
-             L \"script start pid=$$ ppid=$PPID\"\n\
+             L \"script start pid=$$ ppid=$PPID target=$AGY_APP\"\n\
              sleep 0.5\n\
-             PAT=\"$AGY_APP/Contents/MacOS/Antigravity\"\n\
-             L \"closing, running=$(pgrep -f \"$PAT\" | wc -l | tr -d ' ')\"\n\
-             osascript -e \"quit app \\\"$AGY_APP\\\"\" >/dev/null 2>&1\n\
-             i=0; while [ $i -lt 40 ] && pgrep -f \"$PAT\" >/dev/null; do sleep 0.25; i=$((i+1)); done\n\
-             if pgrep -f \"$PAT\" >/dev/null; then L \"force kill\"; pkill -f \"$PAT\" >/dev/null 2>&1; fi\n\
-             i=0; while [ $i -lt 24 ] && pgrep -f \"$PAT\" >/dev/null; do sleep 0.25; i=$((i+1)); done\n\
+             export AGY_MAIN=\"$AGY_APP/Contents/MacOS/Antigravity\"\n\
+             find_pids() {{\n\
+               /bin/ps -axo pid=,args= | /usr/bin/awk '\n\
+                 BEGIN {{ pat = ENVIRON[\"AGY_MAIN\"] }}\n\
+                 {{\n\
+                   pid = $1\n\
+                   sub(/^[[:space:]]*[0-9]+[[:space:]]+/, \"\")\n\
+                   if (($0 == pat || index($0, pat \" \") == 1) && index($0, \"--type=\") == 0 && index($0, \"--import=\") == 0) {{\n\
+                     print pid\n\
+                   }}\n\
+                 }}\n\
+               '\n\
+             }}\n\
+             pids=$(find_pids)\n\
+             cnt=$(printf '%s\\n' \"$pids\" | /usr/bin/awk 'NF {{ n++ }} END {{ print n + 0 }}')\n\
+             L \"closing, running=$cnt${{pids:+ pids=$(echo $pids)}}\"\n\
+             osascript -e 'on run argv' -e 'quit app (item 1 of argv)' -e 'end run' \"$AGY_APP\" >/dev/null 2>&1\n\
+             i=0; while [ $i -lt 40 ] && [ -n \"$(find_pids)\" ]; do sleep 0.25; i=$((i+1)); done\n\
+             pids=$(find_pids)\n\
+             if [ -n \"$pids\" ]; then\n\
+               L \"force kill (SIGTERM) pids=$(echo $pids)\"\n\
+               kill -TERM $pids >/dev/null 2>&1\n\
+             fi\n\
+             i=0; while [ $i -lt 24 ] && [ -n \"$(find_pids)\" ]; do sleep 0.25; i=$((i+1)); done\n\
+             pids=$(find_pids)\n\
+             if [ -n \"$pids\" ]; then\n\
+               L \"force kill (SIGKILL) pids=$(echo $pids)\"\n\
+               kill -KILL $pids >/dev/null 2>&1\n\
+               i=0; while [ $i -lt 12 ] && [ -n \"$(find_pids)\" ]; do sleep 0.25; i=$((i+1)); done\n\
+             fi\n\
              sleep 0.5\n\
-             open -a \"$AGY_APP\" --args {DEBUG_ARG}\n\
-             L \"open exit=$?\"\n\
+             OUT=$(open -a \"$AGY_APP\" --args {DEBUG_ARG} 2>&1)\n\
+             RC=$?\n\
+             L \"open exit=$RC${{OUT:+ msg=$OUT}}\"\n\
              rm -f \"$0\"\n"
         );
         let _ = fs::create_dir_all(plugin_data);
@@ -396,7 +446,10 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .process_group(0);
-        cmd.spawn().map_err(|e| format!("spawn restart script: {e}"))?;
+        let status = cmd.status().map_err(|e| format!("spawn restart script: {e}"))?;
+        if !status.success() {
+            return Err(format!("restart launcher exited with {status}"));
+        }
         Ok(target)
     }
     #[cfg(target_os = "windows")]
@@ -478,6 +531,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| format!("pid-{}", std::process::id()));
         let mut last_check: Option<(Instant, LaunchFlag)> = None;
+        let mut synced_ok = false;
 
         loop {
             thread::sleep(Duration::from_secs(5));
@@ -485,6 +539,22 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
                 Ok(s) => (s.cdp_port_ok, s.cdp_port_since),
                 Err(_) => continue,
             };
+            if port_ok == Some(true) {
+                if !synced_ok {
+                    synced_ok = true;
+                    if let Some(target) = target_app() {
+                        let flag = started_with_flag(&target);
+                        last_check = Some((Instant::now(), flag));
+                        let (mut st, writable) = load_state(&plugin_data);
+                        if st.last_flag != flag.as_str() {
+                            st.last_flag = flag.as_str().to_string();
+                            save_state(&plugin_data, &st, writable);
+                        }
+                    }
+                }
+                continue;
+            }
+            synced_ok = false;
             if port_ok != Some(false) || port_since.is_none_or(|t| t.elapsed() < PROMPT_AFTER) {
                 continue;
             }
@@ -585,5 +655,55 @@ mod tests {
             "/Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port 9222"
         ));
         assert!(!has_debug_port_flag("/Applications/Antigravity.app/Contents/MacOS/Antigravity --user-data-dir=/tmp"));
+    }
+
+    #[test]
+    fn macos_ps_parser_skips_helper_sub_bundles_and_finds_main_app() {
+        assert_eq!(
+            parse_macos_app_from_ps_line(
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app/Contents/MacOS/Antigravity Helper (Renderer) --type=renderer --remote-debugging-port=0"
+            ),
+            None
+        );
+        assert_eq!(
+            parse_macos_app_from_ps_line(
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper --import=file:///tmp/main.mjs"
+            ),
+            None
+        );
+        // Even a nested helper without --type= or --import= must be rejected.
+        assert_eq!(
+            parse_macos_app_from_ps_line(
+                "/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper"
+            ),
+            None
+        );
+        assert_eq!(parse_macos_app_from_ps_line("grep /Applications/Antigravity.app/Contents/MacOS/Antigravity"), None);
+        assert_eq!(
+            parse_macos_app_from_ps_line(
+                "/Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port=0"
+            ),
+            Some("/Applications/Antigravity.app")
+        );
+        assert_eq!(
+            parse_macos_app_from_ps_line("/Users/me/Apps/Antigravity Beta.app/Contents/MacOS/Antigravity"),
+            Some("/Users/me/Apps/Antigravity Beta.app")
+        );
+    }
+
+    #[test]
+    fn macos_flag_classifier_handles_wrapped_pid_helper_first() {
+        let ps_with_flag = "\
+/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app/Contents/MacOS/Antigravity Helper (Renderer) --type=renderer
+/Applications/Antigravity.app/Contents/MacOS/Antigravity --remote-debugging-port=0
+/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper.app/Contents/MacOS/Antigravity Helper --import=file:///tmp/main.mjs
+";
+        assert_eq!(classify_macos_ps("/Applications/Antigravity.app", ps_with_flag), LaunchFlag::Flag);
+
+        let ps_without_flag = "\
+/Applications/Antigravity.app/Contents/Frameworks/Antigravity Helper (Renderer).app/Contents/MacOS/Antigravity Helper (Renderer) --type=renderer --remote-debugging-port=0
+/Applications/Antigravity.app/Contents/MacOS/Antigravity
+";
+        assert_eq!(classify_macos_ps("/Applications/Antigravity.app", ps_without_flag), LaunchFlag::NoFlag);
     }
 }
