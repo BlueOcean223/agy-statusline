@@ -2,6 +2,13 @@
 
 本项目所有重要变更均记录于此。版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)；每次推送 `v*` 标签发版时，GitHub Actions 会自动提取本文件中对应版本的变更内容作为 GitHub Release 说明。
 
+## [Unreleased]
+
+### 改进与修复 (Fixed & Improved)
+- **macOS 调试模式重启修复与加固**：修复 PID 回绕后 `target_app()` 误将 `Antigravity Helper (Renderer).app` 识别为主应用导致重启无响应的问题（过滤嵌套 Helper 子包及 `--type=` / `--import=` 进程并校验主程序路径）；重启脚本改用 `ps` + `awk` 字面匹配 PID 与参数化 `osascript`，并支持 `osascript quit` → `SIGTERM` → `SIGKILL` 逐级退出。
+- **进程校验状态同步**：CDP 调试端口连接后同步更新 `relaunch-state.json` 中的 `last_flag`，发起重启时清空旧状态，且已连接时不再显示过期的 `进程校验: noflag`。
+- **重启弹窗确认与超时恢复**：将 Settings 页手动重启按钮由内联二次点击改为主题自适应的模态确认弹窗（存在运行中对话时标红提示），并增加 20 秒退出超时自动恢复机制，避免异常时按钮卡死。
+
 ## [v0.4.0] - 2026-11-25
 
 ### 新增 (Added)
@@ -45,6 +52,7 @@
 - 统一由实时引擎驱动右侧辅助面板，移除旧版 transcript 桥接代码。
 - 修复 Antigravity 重启后查找未加载对话、按模型列表匹配首页额度组、跟随系统明暗主题、`language_server` 断开后自动退出以及面板轮询同步等问题。
 
+[Unreleased]: https://github.com/BlueOcean223/agy-statusline/compare/v0.4.0...HEAD
 [v0.4.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.3.0...v0.4.0
 [v0.3.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/BlueOcean223/agy-statusline/releases/tag/v0.2.0
