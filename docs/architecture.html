@@ -70,10 +70,9 @@
   <div class="flow">Antigravity ──拉起──▶ sidecar（agy-statusline sidecar，常驻）
                          │
    hooks.json            │  ① live 引擎：每 1s 一轮
-   PreInvocation ─┐      │     GetAllCascadeTrajectories   状态、步数、父子关系（运行中 2s / 空闲 10s）
-   PostInvocation ├─UDP─▶│     GetCascadeTrajectoryGeneratorMetadata  每次模型调用（增量，按 offset）
-   PostToolUse    │      │     RetrieveUserQuotaSummary    5h / 每周额度（3 分钟，Stop 后立刻）
-   Stop          ─┘      │
+   PreInvocation ─┐      │     GetAllCascadeTrajectories   状态、步数、父子关系（运行中 2s / 空闲 10s，Hook 后最快 1.5s）
+   PostInvocation ├─UDP─▶│     GetCascadeTrajectoryGeneratorMetadata  每次模型调用（增量，按 offset；仅限 LS 已加载的对话）
+   Stop          ─┘      │     RetrieveUserQuotaSummary    5h / 每周额度（3 分钟，Stop 后最快 30s）
    (≤10ms, 不等回应)      │  ② CDP 画师：读 DevToolsActivePort，连主窗口
                          │     注入 web/bar.js（addScriptToEvaluateOnNewDocument + 立即执行一次）
                          │     每秒读 __agyBar.panes()：“我这里显示的是对话 X，手上有没有数据”

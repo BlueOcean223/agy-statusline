@@ -3,24 +3,27 @@
 use crate::config::{Config, OnlinePrices, effective_model_rules};
 use crate::live::{Call, Engine, call_cost, now_ms};
 use crate::miss::MissSummary;
-use crate::transcript::{annotated_ids, read_annotation};
+use crate::transcript::read_annotation;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
 const SERIES_LEN: usize = 40;
 const RECENT_LEN: usize = 15;
+const TURNS_LEN: usize = 300;
 
 impl Engine {
     /// Top-level conversations, most recently viewed or modified first. Includes conversations the
     /// language_server hasn't loaded yet (found through their annotation files).
     fn top_level_recent(&self) -> Vec<String> {
-        let mut ids: HashSet<String> = annotated_ids(&self.app_data).into_iter().collect();
+        // Annotation titles/view times come from the engine's cache (refreshed every 10s off-lock);
+        // this runs on every 1.5s panel poll.
+        let mut ids: HashSet<String> = self.annotations.keys().cloned().collect();
         ids.extend(self.summaries.iter().filter(|(_, s)| s.root.is_none()).map(|(id, _)| id.clone()));
         let mut scored: Vec<(i64, String)> = ids
             .into_iter()
             .filter(|id| self.summaries.get(id).is_none_or(|s| s.root.is_none()))
             .map(|id| {
-                let viewed = read_annotation(&self.app_data, &id).map(|a| a.viewed_ms).unwrap_or(0);
+                let viewed = self.annotations.get(&id).map(|(_, a)| a.viewed_ms).unwrap_or(0);
                 let modified = self.summaries.get(&id).map(|s| s.modified_ms).unwrap_or(0);
                 let disk = self.disk.get(&id).copied().unwrap_or(0);
                 (viewed.max(modified).max(disk), id)
@@ -47,10 +50,11 @@ impl Engine {
     }
 
     pub fn panel(&mut self, requested: Option<&str>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
+        let recent_ids = self.top_level_recent();
         let id = match requested.filter(|s| !s.is_empty()) {
             Some(id) => id.to_string(),
-            None => match self.top_level_recent().into_iter().next() {
-                Some(id) => id,
+            None => match recent_ids.first() {
+                Some(id) => id.clone(),
                 None => return json!({ "id": null }),
             },
         };
@@ -173,9 +177,13 @@ impl Engine {
         };
         let sub_cost: f64 = subagents.iter().filter_map(|v| v["cost"].as_f64()).sum();
 
+        // Only the most recent turns are sent: this is rebuilt and re-rendered on every 1.5s poll,
+        // and agent-team conversations can have thousands of calls.
+        let turns_total = own.len();
         let turns: Vec<Value> = own
             .iter()
             .enumerate()
+            .skip(turns_total.saturating_sub(TURNS_LEN))
             .map(|(idx, c)| {
                 let c_usd = call_cost(&rules, c).total();
                 let costly = cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd;
@@ -199,7 +207,7 @@ impl Engine {
 
         let mut listed: HashSet<String> = HashSet::new();
         let recent: Vec<Value> = std::iter::once(id.clone())
-            .chain(self.top_level_recent())
+            .chain(recent_ids)
             .filter(|cid| listed.insert(cid.clone()))
             .take(RECENT_LEN + 1)
             .map(|cid| json!({ "id": cid, "title": self.title(&cid) }))
@@ -248,11 +256,16 @@ impl Engine {
             "subagents": subagents,
             "subCost": sub_cost,
             "turns": turns,
+            "turnsTotal": turns_total,
         })
     }
 
     fn title(&self, id: &str) -> String {
-        let t = read_annotation(&self.app_data, id).map(|a| a.title).unwrap_or_default();
+        let t = match self.annotations.get(id) {
+            Some((_, a)) => a.title.clone(),
+            // Created since the last annotation scan.
+            None => read_annotation(&self.app_data, id).map(|a| a.title).unwrap_or_default(),
+        };
         if !t.is_empty() {
             return t;
         }

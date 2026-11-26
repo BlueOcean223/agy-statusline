@@ -312,16 +312,6 @@ pub fn load_samples(plugin_data: &Path) -> (QuotaSamples, bool) {
     }
 }
 
-pub fn save_samples(plugin_data: &Path, s: &QuotaSamples, writable: bool) {
-    if !writable {
-        return;
-    }
-    let path = plugin_data.join("quota-samples.json");
-    if let Ok(text) = serde_json::to_string(s) {
-        let _ = write_atomic(&path, &text);
-    }
-}
-
 /// Runs one-time sample replay (migrating pre-segmented quota history) and seeds `cycles`
 /// from earlier recorded early-reset events if `cycles` is empty.
 pub fn maybe_replay_samples(h: &mut UsageHistory, samples: &QuotaSamples) -> bool {

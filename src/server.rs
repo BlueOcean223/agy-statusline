@@ -230,14 +230,15 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                 Some(_) => "online".to_string(),
                 None => "bundled".to_string(),
             };
-            let live_calls = if let Ok(guard) = ENGINE.lock()
+            let (live_calls, writes) = if let Ok(guard) = ENGINE.lock()
                 && let Some(eng) = guard.as_ref()
             {
-                eng.sync_usage_store();
-                eng.live_call_records()
+                let writes = eng.sync_usage_store();
+                (eng.live_call_records(), writes)
             } else {
-                Vec::new()
+                (Vec::new(), Default::default())
             };
+            writes.write();
             // Snapshot history, samples, and CLI cache briefly under USAGE lock, then run all disk/SQLite reads lock-free.
             let snap = USAGE.lock().ok().and_then(|g| {
                 let store = g.as_ref()?;

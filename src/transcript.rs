@@ -297,13 +297,31 @@ pub fn scan_brain(app_data: &Path) -> HashMap<String, i64> {
     out
 }
 
-/// Top-level conversations that have an annotation file (subagents don't get one).
-pub fn annotated_ids(app_data: &Path) -> Vec<String> {
-    let Ok(rd) = fs::read_dir(app_data.join("annotations")) else { return Vec::new() };
-    rd.flatten()
-        .filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".pbtxt").map(str::to_string))
-        .filter(|n| is_uuid(n))
-        .collect()
+/// Titles and last-view times of all top-level conversations, re-reading only annotation files
+/// whose mtime changed since `prev`.
+pub fn scan_annotations(
+    app_data: &Path,
+    mut prev: HashMap<String, (i64, Annotation)>,
+) -> HashMap<String, (i64, Annotation)> {
+    let mut out = HashMap::new();
+    let Ok(rd) = fs::read_dir(app_data.join("annotations")) else { return out };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(id) = name.strip_suffix(".pbtxt").filter(|n| is_uuid(n)) else { continue };
+        let mtime = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let ann = match prev.remove(id) {
+            Some((m, a)) if m == mtime => a,
+            _ => read_annotation(app_data, id).unwrap_or_default(),
+        };
+        out.insert(id.to_string(), (mtime, ann));
+    }
+    out
 }
 
 #[derive(Clone, Debug, Default)]
