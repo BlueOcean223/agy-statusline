@@ -6,40 +6,70 @@
 //! call records keeps today's spend, daily history, weekly `cap ≈`, and call breakdowns accurate.
 
 use crate::config::{ReadFile, read_json_keep, write_atomic};
+use crate::convdb::{DbSig, signature};
 use crate::usage::{
-    CallRecord, HISTORY_KEEP_DAYS, ModelAgg, UsageHistory, day_start_ms, is_uuid_db, local_day_str, read_conv_db,
-    today_str,
+    CallRecord, DbCache, HISTORY_KEEP_DAYS, ModelAgg, UsageHistory, day_start_ms, is_uuid_db, local_day_str,
+    read_conv_db, today_str,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::UNIX_EPOCH;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 const CLI_BF_V: u32 = 3;
 const CLI_CALLS_KEEP_MS: i64 = 32 * 86_400_000;
-const CLI_OLD_MAX: usize = 100;
+/// Call records kept for CLI DBs older than `CLI_CALLS_KEEP_MS` that a day lookup had to open
+/// (e.g. past weekly cycles); least recently used DBs are evicted beyond this.
+const CLI_OLD_MAX_RECORDS: usize = 50_000;
 
-/// Returns the latest modification timestamp (ms) across `<db>` and `<db>-wal`.
-/// In SQLite WAL mode, recent writes only bump `-wal`'s mtime until a checkpoint runs.
-pub fn db_mtime_ms(path: &Path) -> i64 {
-    let mut best = file_mtime_ms(path);
-    let mut wal = path.as_os_str().to_os_string();
-    wal.push("-wal");
-    best = best.max(file_mtime_ms(Path::new(&wal)));
-    best
+/// One CLI DB's calls with each call's local day computed once at read time, so day lookups
+/// and aggregation never format a date per call.
+pub(crate) struct CliDbCalls {
+    calls: Vec<CallRecord>,
+    /// Sorted, unique local days (`YYYY-MM-DD`) that have calls.
+    days: Vec<String>,
+    /// Per call: index into `days`.
+    day_of: Vec<u32>,
+    /// Per day: indices into `calls`, in row order.
+    by_day: Vec<Vec<u32>>,
 }
 
-fn file_mtime_ms(path: &Path) -> i64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+impl CliDbCalls {
+    fn new(calls: Vec<CallRecord>) -> Self {
+        let keys: Vec<String> = calls.iter().map(|c| local_day_str(c.at_ms)).collect();
+        let mut days = keys.clone();
+        days.sort();
+        days.dedup();
+        let mut by_day = vec![Vec::new(); days.len()];
+        let mut day_of = Vec::with_capacity(calls.len());
+        for (i, k) in keys.iter().enumerate() {
+            let d = days.binary_search(k).unwrap_or_default();
+            day_of.push(d as u32);
+            by_day[d].push(i as u32);
+        }
+        Self { calls, days, day_of, by_day }
+    }
+
+    /// Calls on `date`, in row order.
+    fn on_day<'a>(&'a self, date: &str) -> impl Iterator<Item = &'a CallRecord> + 'a {
+        let idx = self.days.binary_search_by(|d| d.as_str().cmp(date)).ok();
+        idx.into_iter().flat_map(move |d| self.by_day[d].iter().map(move |&i| &self.calls[i as usize]))
+    }
+}
+
+#[derive(Clone)]
+struct CachedCliDb {
+    sig: DbSig,
+    db: Arc<CliDbCalls>,
+}
+
+type OldCliCache = DbCache<CliDbCalls, CLI_OLD_MAX_RECORDS>;
+
+fn lock_old(old: &Mutex<OldCliCache>) -> MutexGuard<'_, OldCliCache> {
+    old.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -73,12 +103,13 @@ pub struct CliScanDelta {
 }
 
 /// Lock-free read snapshot of cached CLI DBs and `cli-index.json` for HTTP handlers.
+/// Cloning is O(1): the recent-DB map and index are shared `Arc`s, and the cache of older DBs
+/// opened by day lookups is shared with the scanner and every other snapshot.
 #[derive(Clone, Default)]
 pub struct CliSnapshot {
-    cache: HashMap<String, (i64, Arc<Vec<CallRecord>>)>,
-    old_cache: HashMap<String, (i64, Arc<Vec<CallRecord>>)>,
-    old_order: VecDeque<String>,
-    index: CliIndex,
+    cache: Arc<HashMap<String, CachedCliDb>>,
+    old: Arc<Mutex<OldCliCache>>,
+    index: Arc<CliIndex>,
     index_loaded: bool,
 }
 
@@ -91,74 +122,63 @@ impl CliSnapshot {
         if let ReadFile::Ok(idx) = read_json_keep::<CliIndex>(&plugin_data.join("cli-index.json"))
             && idx.v == 1
         {
-            self.index = idx;
+            self.index = Arc::new(idx);
         }
     }
 
-    fn load_old_db(&mut self, conv_dir: &Path, fname: &str) -> Option<Arc<Vec<CallRecord>>> {
+    fn load_old_db(&self, cli_dir: &Path, fname: &str) -> Option<Arc<CliDbCalls>> {
         let cid = is_uuid_db(fname)?;
-        let path = conv_dir.join(fname);
-        let mt = db_mtime_ms(&path);
-        if mt <= 0 {
+        let sig = signature(cli_dir, cid)?;
+        if sig.mtime_ms <= 0 {
             return None;
         }
-        let fresh = self.old_cache.get(fname).is_some_and(|(old_mt, _)| *old_mt == mt);
-        if !fresh {
-            let calls = Arc::new(read_conv_db(&path, cid, "cli").ok()?);
-            self.old_cache.insert(fname.to_string(), (mt, calls));
-            self.old_order.retain(|k| k != fname);
-            self.old_order.push_back(fname.to_string());
-            while self.old_order.len() > CLI_OLD_MAX {
-                if let Some(evict) = self.old_order.pop_front() {
-                    self.old_cache.remove(&evict);
-                }
-            }
+        let path = cli_dir.join("conversations").join(fname);
+        let hit = lock_old(&self.old).get(&path, sig);
+        if hit.is_some() {
+            return hit;
         }
-        self.old_cache.get(fname).map(|(_, v)| Arc::clone(v))
+        let db = Arc::new(CliDbCalls::new(read_conv_db(&path, cid, "cli").ok()?));
+        let records = db.calls.len();
+        lock_old(&self.old).insert(path, sig, Arc::clone(&db), records);
+        Some(db)
     }
 
     /// Returns all deduplicated CLI calls occurring on `date` (`YYYY-MM-DD`).
     pub fn calls_for_day(&mut self, cli_dir: &Path, plugin_data: &Path, date: &str) -> Vec<CallRecord> {
         self.ensure_index_readonly(plugin_data);
-        let conv_dir = cli_dir.join("conversations");
-        let mut out = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut dbs: Vec<Arc<CliDbCalls>> = self.cache.values().map(|e| Arc::clone(&e.db)).collect();
 
-        for (_, calls) in self.cache.values() {
-            for c in calls.iter() {
-                if local_day_str(c.at_ms) == date && seen.insert(c.dedup_key.clone()) {
+        // Consult `cli-index.json` for older DBs (>32 days) that touched `date`.
+        for (fname, ent) in &self.index.files {
+            if !self.cache.contains_key(fname)
+                && ent.d.iter().any(|d| d == date)
+                && let Some(db) = self.load_old_db(cli_dir, fname)
+            {
+                dbs.push(db);
+            }
+        }
+
+        let mut out = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        for db in &dbs {
+            for c in db.on_day(date) {
+                if seen.insert(c.dedup_key.as_str()) {
                     out.push(c.clone());
                 }
             }
         }
-
-        // Consult `cli-index.json` for older DBs (>32 days) that touched `date`.
-        let extra_files: Vec<String> = self
-            .index
-            .files
-            .iter()
-            .filter(|(fname, ent)| !self.cache.contains_key(*fname) && ent.d.iter().any(|d| d == date))
-            .map(|(fname, _)| fname.clone())
-            .collect();
-        for fname in extra_files {
-            if let Some(calls) = self.load_old_db(&conv_dir, &fname) {
-                for c in calls.iter() {
-                    if local_day_str(c.at_ms) == date && seen.insert(c.dedup_key.clone()) {
-                        out.push(c.clone());
-                    }
-                }
-            }
-        }
-
         out
     }
 }
 
 #[derive(Default)]
 pub struct CliScanner {
-    /// Recent (<= 32 days modified) CLI DBs cached in memory: filename -> (mtime_ms, calls).
-    cache: HashMap<String, (i64, Arc<Vec<CallRecord>>)>,
-    index: CliIndex,
+    /// Recent CLI DBs (modified within `CLI_CALLS_KEEP_MS`) cached in memory: filename -> calls.
+    /// Copy-on-write: snapshots share it until a scan changes it.
+    cache: Arc<HashMap<String, CachedCliDb>>,
+    /// Older DBs opened by snapshot day lookups, shared with every snapshot.
+    old: Arc<Mutex<OldCliCache>>,
+    index: Arc<CliIndex>,
     index_loaded: bool,
     index_writable: bool,
 }
@@ -172,15 +192,15 @@ impl CliScanner {
         let path = plugin_data.join("cli-index.json");
         match read_json_keep::<CliIndex>(&path) {
             ReadFile::Ok(idx) if idx.v == 1 => {
-                self.index = idx;
+                self.index = Arc::new(idx);
                 self.index_writable = true;
             }
             ReadFile::Ok(_) | ReadFile::Missing | ReadFile::Corrupt { kept: true } => {
-                self.index = CliIndex { v: 1, files: HashMap::new() };
+                self.index = Arc::new(CliIndex { v: 1, files: HashMap::new() });
                 self.index_writable = true;
             }
             ReadFile::Unreadable | ReadFile::Corrupt { kept: false } => {
-                self.index = CliIndex { v: 1, files: HashMap::new() };
+                self.index = Arc::new(CliIndex { v: 1, files: HashMap::new() });
                 self.index_writable = false;
             }
         }
@@ -191,17 +211,16 @@ impl CliScanner {
             return;
         }
         let path = plugin_data.join("cli-index.json");
-        if let Ok(text) = serde_json::to_string(&self.index) {
+        if let Ok(text) = serde_json::to_string(&*self.index) {
             let _ = write_atomic(&path, &text);
         }
     }
 
     pub fn snapshot(&self) -> CliSnapshot {
         CliSnapshot {
-            cache: self.cache.clone(),
-            old_cache: HashMap::new(),
-            old_order: VecDeque::new(),
-            index: self.index.clone(),
+            cache: Arc::clone(&self.cache),
+            old: Arc::clone(&self.old),
+            index: Arc::clone(&self.index),
             index_loaded: self.index_loaded,
         }
     }
@@ -230,14 +249,18 @@ impl CliScanner {
             }
         }
         let present: HashSet<&str> = names.iter().map(String::as_str).collect();
-        self.cache.retain(|k, _| present.contains(k.as_str()));
+        // Mutate the shared maps only when something changes, so snapshots keep sharing them.
+        if self.cache.keys().any(|k| !present.contains(k.as_str())) {
+            Arc::make_mut(&mut self.cache).retain(|k, _| present.contains(k.as_str()));
+        }
         let mut index_dirty = false;
-        self.index.files.retain(|k, _| {
-            let keep = present.contains(k.as_str());
-            if !keep {
-                index_dirty = true;
-            }
-            keep
+        if self.index.files.keys().any(|k| !present.contains(k.as_str())) {
+            Arc::make_mut(&mut self.index).files.retain(|k, _| present.contains(k.as_str()));
+            index_dirty = true;
+        }
+        lock_old(&self.old).retain(|p| {
+            p.parent() != Some(conv_dir.as_path())
+                || p.file_name().and_then(|n| n.to_str()).is_some_and(|n| present.contains(n))
         });
 
         let full = cli_bf.is_none_or(|b| b.version < CLI_BF_V);
@@ -256,21 +279,25 @@ impl CliScanner {
         let mut partial_errors = false;
         for fname in &names {
             let Some(cid) = is_uuid_db(fname) else { continue };
-            let path = conv_dir.join(fname);
-            let mt = db_mtime_ms(&path);
+            // A DB whose metadata cannot be read cannot be opened either.
+            let Some(sig) = signature(cli_dir, cid) else { continue };
+            let mt = sig.mtime_ms;
             if mt <= 0 || mt < scan_cut {
                 continue;
             }
-            if self.cache.get(fname).is_some_and(|(old_mt, _)| *old_mt == mt) {
+            if self.cache.get(fname).is_some_and(|e| e.sig == sig) {
                 continue;
             }
-            match read_conv_db(&path, cid, "cli") {
+            // Full re-read on change: rows are updated in place after insertion (usage arrives when
+            // streaming ends, step timestamps can land after the generator row), so reading only
+            // new `idx` rows would need its own invalidation rules. A 9 MB DB reads in ~20 ms.
+            match read_conv_db(&conv_dir.join(fname), cid, "cli") {
                 Ok(calls) => {
-                    let mut days: Vec<String> =
-                        calls.iter().map(|c| local_day_str(c.at_ms)).collect::<HashSet<_>>().into_iter().collect();
-                    days.sort();
-                    self.index.files.insert(fname.clone(), CliIndexEntry { m: mt, d: days });
-                    self.cache.insert(fname.clone(), (mt, Arc::new(calls)));
+                    let db = Arc::new(CliDbCalls::new(calls));
+                    Arc::make_mut(&mut self.index)
+                        .files
+                        .insert(fname.clone(), CliIndexEntry { m: mt, d: db.days.clone() });
+                    Arc::make_mut(&mut self.cache).insert(fname.clone(), CachedCliDb { sig, db });
                     index_dirty = true;
                 }
                 Err(_) => {
@@ -289,32 +316,49 @@ impl CliScanner {
 
         // Aggregate all readable/cached DBs from `from_ms` through today.
         let mut raw_agg: BTreeMap<String, (HashMap<String, ModelAgg>, HashSet<String>)> = BTreeMap::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        for (mt, calls) in self.cache.values() {
-            if *mt < from_ms {
+        let mut seen: HashSet<&str> = HashSet::new();
+        for e in self.cache.values() {
+            if e.sig.mtime_ms < from_ms {
                 continue;
             }
-            for c in calls.iter() {
+            let db = &e.db;
+            for (c, &d) in db.calls.iter().zip(&db.day_of) {
                 if c.at_ms < from_ms {
                     continue;
                 }
-                if !seen.insert(c.dedup_key.clone()) {
+                if !seen.insert(c.dedup_key.as_str()) {
                     continue;
                 }
-                let day = local_day_str(c.at_ms);
+                let day = &db.days[d as usize];
                 let model_key = if !c.model_raw.is_empty() {
-                    c.model_raw.clone()
+                    c.model_raw.as_str()
                 } else if !c.model_display.is_empty() {
-                    c.model_display.clone()
+                    c.model_display.as_str()
                 } else {
-                    "unknown".to_string()
+                    "unknown"
                 };
-                let (raw, convs) = raw_agg.entry(day).or_default();
-                raw.entry(model_key).or_default().add(c.input, c.cache_read, c.cache_write, c.output);
-                convs.insert(c.conv_id.clone());
+                if !raw_agg.contains_key(day) {
+                    raw_agg.insert(day.clone(), Default::default());
+                }
+                let Some((raw, convs)) = raw_agg.get_mut(day) else { continue };
+                if !raw.contains_key(model_key) {
+                    raw.insert(model_key.to_string(), ModelAgg::default());
+                }
+                if let Some(agg) = raw.get_mut(model_key) {
+                    agg.add(c.input, c.cache_read, c.cache_write, c.output);
+                }
+                if !convs.contains(&c.conv_id) {
+                    convs.insert(c.conv_id.clone());
+                }
             }
         }
         let agg = raw_agg.into_iter().map(|(d, (raw, convs))| (d, (raw, convs.len()))).collect();
+
+        // DBs not modified within `CLI_CALLS_KEEP_MS` leave memory once aggregated (the first full
+        // scan reads up to 400 days); day lookups reopen them via `cli-index.json` when needed.
+        if self.cache.values().any(|e| e.sig.mtime_ms < keep_from) {
+            Arc::make_mut(&mut self.cache).retain(|_, e| e.sig.mtime_ms >= keep_from);
+        }
 
         Some(CliScanDelta { from_ms, today, now_ms, full, partial_errors, agg, snapshot: self.snapshot() })
     }
@@ -500,6 +544,91 @@ mod tests {
         let today_rec = h.days.get(&today_str()).expect("healthy DB should populate today");
         assert_eq!(today_rec.cli_raw["gemini-4-neon"].calls, 1);
         assert_eq!(today_rec.cli_convs, 1);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    fn write_cli_db(path: &Path, at_ms: i64, req: &str) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
+        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
+        conn.execute("INSERT INTO steps VALUES (1, ?1)", [&fb(1, &fv(1, (at_ms / 1000) as u64))]).unwrap();
+        let usage = [fv(2, 1000), fv(3, 200), fb(11, req.as_bytes())].concat();
+        let cm = [fb(4, &usage), fb(19, b"gemini-4-neon")].concat();
+        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&[fb(1, &cm), fb(2, &varint(1))].concat()]).unwrap();
+    }
+
+    fn call_at(at_ms: i64, key: &str) -> CallRecord {
+        CallRecord {
+            conv_id: "c".into(),
+            at_ms,
+            step: None,
+            model_raw: String::new(),
+            model_display: String::new(),
+            input: 1,
+            cache_read: 0,
+            cache_write: 0,
+            output: 0,
+            ttft_ms: None,
+            stream_ms: None,
+            dedup_key: key.into(),
+            source: "cli",
+        }
+    }
+
+    #[test]
+    fn cli_db_calls_buckets_calls_by_local_day_in_row_order() {
+        let d1 = day_start_ms("2026-11-20").unwrap() + 3_600_000;
+        let d2 = day_start_ms("2026-11-21").unwrap() + 3_600_000;
+        let db = CliDbCalls::new(vec![call_at(d2, "a"), call_at(d1, "b"), call_at(d2 + 60_000, "c")]);
+        assert_eq!(db.days, vec!["2026-11-20".to_string(), "2026-11-21".to_string()]);
+        let keys = |date| db.on_day(date).map(|c| c.dedup_key.clone()).collect::<Vec<_>>();
+        assert_eq!(keys("2026-11-21"), vec!["a", "c"]);
+        assert_eq!(keys("2026-11-20"), vec!["b"]);
+        assert!(keys("2026-11-22").is_empty());
+        assert_eq!(db.day_of, vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn scan_keeps_only_recent_dbs_in_memory_and_snapshots_share_state() {
+        let root = std::env::temp_dir().join(format!("agy-cli-trim-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cli_dir = root.join("cli");
+        let conv_dir = cli_dir.join("conversations");
+        let pd = root.join("pd");
+        fs::create_dir_all(&conv_dir).unwrap();
+        fs::create_dir_all(&pd).unwrap();
+
+        let now_ms = crate::live::now_ms();
+        let old_at = now_ms - 40 * 86_400_000;
+        let old_fname = "00000000-0000-4000-8000-000000000031.db";
+        let new_fname = "00000000-0000-4000-8000-000000000032.db";
+        write_cli_db(&conv_dir.join(old_fname), old_at, "req-old");
+        write_cli_db(&conv_dir.join(new_fname), now_ms, "req-new");
+        let old_mtime = std::time::UNIX_EPOCH + std::time::Duration::from_millis(old_at as u64);
+        fs::File::options().write(true).open(conv_dir.join(old_fname)).unwrap().set_modified(old_mtime).unwrap();
+
+        // The first (full) scan aggregates the 40-day-old DB, then drops it from memory.
+        let mut scanner = CliScanner::default();
+        let delta = scanner.scan_delta(&cli_dir, &pd, None, now_ms).unwrap();
+        let old_day = local_day_str(old_at);
+        assert_eq!(delta.agg[&old_day].0["gemini-4-neon"].calls, 1);
+        assert!(!scanner.cache.contains_key(old_fname));
+        assert!(scanner.cache.contains_key(new_fname));
+        assert!(scanner.index.files[old_fname].d.contains(&old_day));
+
+        // Day lookups still find it through `cli-index.json`, and keep it in the shared old-DB cache.
+        let mut snap = delta.snapshot.clone();
+        let calls = snap.calls_for_day(&cli_dir, &pd, &old_day);
+        assert_eq!(calls.iter().map(|c| c.dedup_key.as_str()).collect::<Vec<_>>(), vec!["req-old"]);
+        assert!(lock_old(&scanner.old).contains(&conv_dir.join(old_fname)));
+        assert_eq!(snap.calls_for_day(&cli_dir, &pd, &today_str()).len(), 1);
+
+        // A scan with no DB changes hands out the same shared maps (cheap snapshot clones).
+        let bf = CliBackfillMeta { version: CLI_BF_V, at_ms: now_ms };
+        let again = scanner.scan_delta(&cli_dir, &pd, Some(&bf), now_ms).unwrap();
+        assert!(Arc::ptr_eq(&delta.snapshot.cache, &again.snapshot.cache));
+        assert!(Arc::ptr_eq(&delta.snapshot.index, &again.snapshot.index));
+        assert!(Arc::ptr_eq(&snap.old, &again.snapshot.old));
         let _ = fs::remove_dir_all(&root);
     }
 

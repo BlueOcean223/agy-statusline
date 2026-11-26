@@ -7,8 +7,9 @@
 //! - `quota-samples.json`: up to 8 days of periodic weekly quota snapshots for forecasting & replay.
 //! - `cli-index.json`: day index of `~/.gemini/antigravity-cli/conversations/*.db` files.
 
-use crate::cli_usage::{CliBackfillMeta, CliSnapshot, db_mtime_ms, read_cli_titles};
+use crate::cli_usage::{CliBackfillMeta, CliSnapshot, read_cli_titles};
 use crate::config::{ModelRule, ReadFile, any_price_cut_in, read_json_keep, write_atomic};
+use crate::convdb::{DbSig, signature};
 use crate::miss::{MissCallInput, MissInfo, MissSummary, miss_scan};
 pub use crate::quota::{
     CycleRecord, DayQuotaRec, QuotaBucketSample, QuotaSamplePoint, QuotaSamples, ResetEvent, note_cycle_end,
@@ -21,7 +22,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 
 pub const HISTORY_KEEP_DAYS: usize = 400;
 const SAMPLES_KEEP_MS: i64 = 8 * 86_400_000;
@@ -373,6 +375,15 @@ pub fn maybe_replay_samples(h: &mut UsageHistory, samples: &QuotaSamples) -> boo
     dirty
 }
 
+/// Drops quota samples older than `cut` for every account (not only the active one), then drops
+/// accounts left without samples, so `quota-samples.json` stays bounded after account switches.
+fn trim_samples(samples: &mut QuotaSamples, cut: i64) {
+    samples.by_acct.retain(|_, list| {
+        list.retain(|p| p.at_ms >= cut);
+        !list.is_empty()
+    });
+}
+
 fn prev_quota_of(h: &UsageHistory, today: &str, acct_key: &str, bucket_id: &str) -> Option<DayQuotaRec> {
     h.days
         .range(..today.to_string())
@@ -513,8 +524,7 @@ pub fn update_today(
                         reset_ms: b.reset_ms,
                     });
                 }
-                let cut = quota_at_ms - SAMPLES_KEEP_MS;
-                list.retain(|p| p.at_ms >= cut);
+                trim_samples(samples, quota_at_ms - SAMPLES_KEEP_MS);
                 samp_dirty = true;
             }
         }
@@ -840,9 +850,145 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
     true
 }
 
+/// Parsed conversation DBs keyed by path, reused while the DB's [`DbSig`] (mtime + length of
+/// `.db` and `.db-wal`) is unchanged. Any write to the DB or its WAL changes the signature, so a
+/// hit holds what `read_conv_db` would return now.
+///
+/// Memory bound: each DB weighs its call-record count + 1, and the least recently used DBs are
+/// evicted once the total would exceed `MAX`; a single DB heavier than `MAX` is never cached.
+pub(crate) struct DbCache<T, const MAX: usize> {
+    entries: HashMap<PathBuf, DbCacheEntry<T>>,
+    weight: usize,
+    tick: u64,
+}
+
+struct DbCacheEntry<T> {
+    sig: DbSig,
+    val: Arc<T>,
+    weight: usize,
+    used: u64,
+}
+
+impl<T, const MAX: usize> Default for DbCache<T, MAX> {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), weight: 0, tick: 0 }
+    }
+}
+
+impl<T, const MAX: usize> DbCache<T, MAX> {
+    /// Returns the cached value for `path` if it was read at signature `sig`.
+    pub(crate) fn get(&mut self, path: &Path, sig: DbSig) -> Option<Arc<T>> {
+        self.tick += 1;
+        let e = self.entries.get_mut(path).filter(|e| e.sig == sig)?;
+        e.used = self.tick;
+        Some(Arc::clone(&e.val))
+    }
+
+    /// Stores `val` (holding `records` call records) read at `sig`, evicting least recently used DBs.
+    pub(crate) fn insert(&mut self, path: PathBuf, sig: DbSig, val: Arc<T>, records: usize) {
+        self.remove(&path);
+        let weight = records.saturating_add(1);
+        if weight > MAX {
+            return;
+        }
+        while self.weight + weight > MAX {
+            let Some(lru) = self.entries.iter().min_by_key(|(_, e)| e.used).map(|(p, _)| p.clone()) else { break };
+            self.remove(&lru);
+        }
+        self.tick += 1;
+        self.weight += weight;
+        self.entries.insert(path, DbCacheEntry { sig, val, weight, used: self.tick });
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if let Some(e) = self.entries.remove(path) {
+            self.weight -= e.weight;
+        }
+    }
+
+    /// Keeps only DBs whose path satisfies `keep` (used to forget deleted conversations).
+    pub(crate) fn retain(&mut self, mut keep: impl FnMut(&Path) -> bool) {
+        let weight = &mut self.weight;
+        self.entries.retain(|p, e| {
+            let k = keep(p);
+            if !k {
+                *weight -= e.weight;
+            }
+            k
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn weight(&self) -> usize {
+        self.weight
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        self.entries.contains_key(path)
+    }
+}
+
+/// Desktop call records kept across `/api/usage` requests. A record is ~300 bytes with its
+/// strings, so the bound is roughly 30 MB; one Mac with 161 MB of DBs held ~1.2k records.
+const DESKTOP_CACHE_MAX_RECORDS: usize = 100_000;
+
+struct DesktopDbCalls {
+    calls: Vec<CallRecord>,
+    min_at: i64,
+    max_at: i64,
+}
+
+type DesktopDbCache = DbCache<DesktopDbCalls, DESKTOP_CACHE_MAX_RECORDS>;
+
+static DESKTOP_DB_CACHE: LazyLock<Mutex<DesktopDbCache>> = LazyLock::new(Mutex::default);
+
+fn desktop_cache() -> MutexGuard<'static, DesktopDbCache> {
+    DESKTOP_DB_CACHE.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// One `<app_data>/conversations/<uuid>.db`, listed once per request.
+struct DesktopDb {
+    path: PathBuf,
+    cid: String,
+    sig: Option<DbSig>,
+}
+
+/// Lists desktop conversation DBs in `read_dir` order with their signatures, and forgets cached
+/// DBs from the same directory that no longer exist.
+fn list_desktop_dbs(app_data: &Path) -> Vec<DesktopDb> {
+    let conv_dir = app_data.join("conversations");
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(&conv_dir) {
+        for entry in rd.flatten() {
+            let fname = entry.file_name().to_string_lossy().to_string();
+            let Some(cid) = is_uuid_db(&fname) else { continue };
+            out.push(DesktopDb { path: entry.path(), cid: cid.to_string(), sig: signature(app_data, cid) });
+        }
+    }
+    let present: HashSet<&Path> = out.iter().map(|d| d.path.as_path()).collect();
+    desktop_cache().retain(|p| p.parent() != Some(conv_dir.as_path()) || present.contains(p));
+    out
+}
+
+/// Returns the DB's calls from the process-wide cache, reading the DB only when its signature changed.
+fn desktop_db_calls(db: &DesktopDb, sig: DbSig) -> Option<Arc<DesktopDbCalls>> {
+    let hit = desktop_cache().get(&db.path, sig);
+    if hit.is_some() {
+        return hit;
+    }
+    let calls = read_conv_db(&db.path, &db.cid, "desktop").ok()?;
+    let min_at = calls.iter().map(|c| c.at_ms).min().unwrap_or(i64::MAX);
+    let max_at = calls.iter().map(|c| c.at_ms).max().unwrap_or(i64::MIN);
+    let records = calls.len();
+    let val = Arc::new(DesktopDbCalls { calls, min_at, max_at });
+    desktop_cache().insert(db.path.clone(), sig, Arc::clone(&val), records);
+    Some(val)
+}
+
 /// Collects deduplicated desktop calls falling inside `[from_ms, to_ms)` from live memory + SQLite DBs.
 fn collect_desktop_calls_in_range(
-    app_data: &Path,
+    dbs: &[DesktopDb],
     from_ms: i64,
     to_ms: i64,
     live_calls: &[CallRecord],
@@ -861,24 +1007,24 @@ fn collect_desktop_calls_in_range(
         }
     }
 
-    if let Ok(rd) = fs::read_dir(app_data.join("conversations")) {
-        for entry in rd.flatten() {
-            let fname = entry.file_name().to_string_lossy().to_string();
-            let Some(cid) = is_uuid_db(&fname) else { continue };
-            let mtime = db_mtime_ms(&entry.path());
-            if from_ms > 0 && mtime > 0 && mtime < from_ms - 60_000 {
+    for db in dbs {
+        // A DB whose metadata cannot be read cannot be opened either.
+        let Some(sig) = db.sig else { continue };
+        let mtime = sig.mtime_ms;
+        if from_ms > 0 && mtime > 0 && mtime < from_ms - 60_000 {
+            continue;
+        }
+        let Some(recs) = desktop_db_calls(db, sig) else { continue };
+        if recs.max_at < from_ms || recs.min_at >= to_ms {
+            continue;
+        }
+        for r in &recs.calls {
+            if r.at_ms < from_ms || r.at_ms >= to_ms {
                 continue;
             }
-            if let Ok(recs) = read_conv_db(&entry.path(), cid, "desktop") {
-                for r in recs {
-                    if r.at_ms < from_ms || r.at_ms >= to_ms {
-                        continue;
-                    }
-                    let soft_key = format!("{}:{}:{}:{}", r.conv_id, r.at_ms / 1000, r.input, r.output);
-                    if seen.insert(r.dedup_key.clone()) && seen.insert(soft_key) {
-                        merged.push(r);
-                    }
-                }
+            let soft_key = format!("{}:{}:{}:{}", r.conv_id, r.at_ms / 1000, r.input, r.output);
+            if seen.insert(r.dedup_key.clone()) && seen.insert(soft_key) {
+                merged.push(r.clone());
             }
         }
     }
@@ -887,10 +1033,12 @@ fn collect_desktop_calls_in_range(
 }
 
 /// Per-request cache of deduplicated desktop + CLI calls per calendar day, preventing
-/// redundant SQLite scans across quota groups, past cycles, transition days, and miss checks.
+/// redundant work across quota groups, past cycles, transition days, and miss checks.
+/// The desktop DB listing is taken once per request; parsed DBs come from `DESKTOP_DB_CACHE`.
 #[derive(Default)]
 struct DayCallCache {
     days: HashMap<String, Vec<CallRecord>>,
+    desktop_dbs: Option<Vec<DesktopDb>>,
 }
 
 impl DayCallCache {
@@ -904,7 +1052,8 @@ impl DayCallCache {
         live_calls: &[CallRecord],
     ) -> &'a [CallRecord] {
         if !self.days.contains_key(date) {
-            let calls = collect_all_day_calls(app_data, cli_dir, plugin_data, cli, date, live_calls);
+            let dbs = self.desktop_dbs.get_or_insert_with(|| list_desktop_dbs(app_data));
+            let calls = collect_all_day_calls(dbs, cli_dir, plugin_data, cli, date, live_calls);
             self.days.insert(date.to_string(), calls);
         }
         self.days.get(date).map(Vec::as_slice).unwrap_or(&[])
@@ -913,7 +1062,7 @@ impl DayCallCache {
 
 /// Collects all desktop + CLI calls for a single calendar day (`YYYY-MM-DD`).
 fn collect_all_day_calls(
-    app_data: &Path,
+    desktop_dbs: &[DesktopDb],
     cli_dir: &Path,
     plugin_data: &Path,
     cli: &mut CliSnapshot,
@@ -924,10 +1073,11 @@ fn collect_all_day_calls(
         return Vec::new();
     };
     // Add 26h buffer then filter by exact local_day_str to stay DST-safe.
-    let mut out: Vec<CallRecord> = collect_desktop_calls_in_range(app_data, start, start + 26 * 3_600_000, live_calls)
-        .into_iter()
-        .filter(|c| local_day_str(c.at_ms) == date)
-        .collect();
+    let mut out: Vec<CallRecord> =
+        collect_desktop_calls_in_range(desktop_dbs, start, start + 26 * 3_600_000, live_calls)
+            .into_iter()
+            .filter(|c| local_day_str(c.at_ms) == date)
+            .collect();
     out.extend(cli.calls_for_day(cli_dir, plugin_data, date));
     out
 }
@@ -2040,6 +2190,113 @@ mod tests {
         assert_eq!(out["missSummary"]["count"], 1, "cross-midnight first call must be counted as cache miss");
         assert!(out["calls"][0]["miss"].is_object());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn db_cache_evicts_least_recently_used_by_record_weight() {
+        let sig = |mtime_ms| DbSig { mtime_ms, len: 1 };
+        let (a, b, c, big) =
+            (PathBuf::from("/x/a.db"), PathBuf::from("/x/b.db"), PathBuf::from("/y/c.db"), PathBuf::from("/x/big.db"));
+        let mut cache: DbCache<u32, 10> = DbCache::default();
+        cache.insert(a.clone(), sig(1), Arc::new(1), 4);
+        cache.insert(b.clone(), sig(1), Arc::new(2), 3);
+        assert_eq!(cache.weight(), 9);
+        assert_eq!(cache.get(&a, sig(1)).as_deref(), Some(&1));
+        assert!(cache.get(&a, sig(2)).is_none(), "a changed signature must miss");
+
+        // `b` is least recently used, so it goes when `c` needs room.
+        cache.insert(c.clone(), sig(1), Arc::new(3), 2);
+        assert!(cache.contains(&a) && cache.contains(&c) && !cache.contains(&b));
+        assert_eq!(cache.weight(), 8);
+
+        // Re-inserting replaces the old entry's weight; an oversized DB is not cached.
+        cache.insert(a.clone(), sig(2), Arc::new(4), 0);
+        assert_eq!(cache.weight(), 4);
+        cache.insert(big.clone(), sig(1), Arc::new(5), 10);
+        assert!(!cache.contains(&big));
+
+        cache.retain(|p| p.parent() != Some(Path::new("/x")));
+        assert!(!cache.contains(&a) && cache.contains(&c));
+        assert_eq!(cache.weight(), 3);
+    }
+
+    #[test]
+    fn desktop_db_cache_reuses_calls_until_signature_changes() {
+        fn varint(mut n: u64) -> Vec<u8> {
+            let mut b = Vec::new();
+            loop {
+                let mut c = (n & 0x7f) as u8;
+                n >>= 7;
+                if n != 0 {
+                    c |= 0x80;
+                }
+                b.push(c);
+                if n == 0 {
+                    break;
+                }
+            }
+            b
+        }
+        fn fv(f: u64, n: u64) -> Vec<u8> {
+            [varint(f << 3), varint(n)].concat()
+        }
+        fn fb(f: u64, data: &[u8]) -> Vec<u8> {
+            [varint((f << 3) | 2), varint(data.len() as u64), data.to_vec()].concat()
+        }
+
+        let root = std::env::temp_dir().join(format!("agy-desk-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("conversations")).unwrap();
+        let cid = "00000000-0000-4000-8000-0000000000cc";
+        let db_path = root.join("conversations").join(format!("{cid}.db"));
+        let today = today_str();
+        let at_s = (crate::live::now_ms() / 1000) as u64;
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
+        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
+        conn.execute("INSERT INTO steps VALUES (1, ?1)", [&fb(1, &fv(1, at_s))]).unwrap();
+        let cm = [fb(4, &[fv(2, 1000), fv(3, 20), fb(11, b"req-cache")].concat()), fb(19, b"gemini-4-neon")].concat();
+        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&[fb(1, &cm), fb(2, &varint(1))].concat()]).unwrap();
+        drop(conn);
+
+        let day_calls = || {
+            let mut cli = CliSnapshot::default();
+            let mut cache = DayCallCache::default();
+            cache.get_or_load(&root, &root, &root, &mut cli, &today, &[]).to_vec()
+        };
+        assert_eq!(day_calls().len(), 1);
+        assert!(desktop_cache().contains(&db_path));
+
+        // Same mtime and length: the cached calls are served without opening the (now garbage) file.
+        let meta = fs::metadata(&db_path).unwrap();
+        fs::write(&db_path, vec![0u8; meta.len() as usize]).unwrap();
+        fs::File::options().write(true).open(&db_path).unwrap().set_modified(meta.modified().unwrap()).unwrap();
+        let calls = day_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].dedup_key, "req-cache");
+
+        // A length change invalidates the entry; the garbage file then yields no calls.
+        fs::write(&db_path, vec![0u8; meta.len() as usize + 1]).unwrap();
+        assert!(day_calls().is_empty());
+
+        // Deleted DBs are dropped from the cache on the next listing.
+        fs::remove_file(&db_path).unwrap();
+        assert!(day_calls().is_empty());
+        assert!(!desktop_cache().contains(&db_path));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn trim_samples_applies_age_limit_to_every_account() {
+        let pt = |at_ms| QuotaSamplePoint { at_ms, bucket_id: "gemini-weekly".into(), used: 0.1, reset_ms: 0 };
+        let mut s = QuotaSamples { v: 1, by_acct: HashMap::new() };
+        s.by_acct.insert("cur".into(), vec![pt(10), pt(100)]);
+        s.by_acct.insert("other".into(), vec![pt(20), pt(200)]);
+        s.by_acct.insert("gone".into(), vec![pt(30)]);
+        trim_samples(&mut s, 50);
+        assert_eq!(s.by_acct["cur"].iter().map(|p| p.at_ms).collect::<Vec<_>>(), vec![100]);
+        assert_eq!(s.by_acct["other"].iter().map(|p| p.at_ms).collect::<Vec<_>>(), vec![200]);
+        assert!(!s.by_acct.contains_key("gone"), "accounts with only expired samples are dropped");
     }
 
     #[test]
