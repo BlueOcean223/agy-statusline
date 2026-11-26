@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### 改进与修复 (Fixed & Improved)
+- **Windows 重启询问弹窗升级为原生 `TaskDialogIndirect`**：替换原先通过 `powershell.exe` 调起的 `WScript.Shell.Popup`（无高分屏 DPI 感知且为旧版经典控件样式）；在 MSVC 构建中嵌入 ComCtl32 v6 与 Per-Monitor DPI v2 应用清单（附运行时 SxS 激活上下文与 `MessageBoxW` 回退），按钮改为与 macOS 一致的「立即重启 / 稍后」，并支持系统深色标题栏与主标题/正文/脚注层级。
+
 ## [v0.5.0] - 2026-11-26
 
 ### 新增 (Added)

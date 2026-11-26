@@ -15,6 +15,7 @@ mod server;
 mod transcript;
 mod updater;
 mod usage;
+mod win_dialog;
 
 use clap::{Parser, Subcommand};
 use config::{find_app_data_dir, find_plugin_data_dir};

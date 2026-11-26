@@ -481,7 +481,7 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(target_os = "macos")]
 const ASK_MESSAGE: &str = "这次 Antigravity 启动时未带调试端口参数（--remote-debugging-port=0），AGY Statusline 的状态栏和中文界面暂时无法注入。\n\n要现在重启 Antigravity 吗？对话记录会保留，正在运行的任务会被中断。\n\n（在侧边栏 Settings 中可修改该行为。）";
 
 fn ask_user_confirm() -> bool {
@@ -498,20 +498,7 @@ fn ask_user_confirm() -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let ps = "$r = (New-Object -ComObject WScript.Shell).Popup($env:AGY_PROMPT_MSG, 0, 'AGY Statusline', 1 + 32 + 4096); if ($r -eq 1) { exit 10 } else { exit 0 }";
-        let Ok(status) = Command::new(powershell_exe())
-            .args(["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-Command", ps])
-            .env_clear()
-            .envs(clean_env())
-            .env("AGY_PROMPT_MSG", ASK_MESSAGE)
-            .creation_flags(CREATE_NO_WINDOW)
-            .status()
-        else {
-            return false;
-        };
-        status.code() == Some(10)
+        crate::win_dialog::ask_relaunch_confirm()
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
