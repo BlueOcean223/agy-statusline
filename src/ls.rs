@@ -53,7 +53,7 @@ impl LsClient {
         None
     }
 
-    fn new(addr: &str, csrf: &str, from_env: bool) -> Self {
+    pub(crate) fn new(addr: &str, csrf: &str, from_env: bool) -> Self {
         Self { addr: addr.to_string(), csrf: csrf.to_string(), from_env, down_since: Arc::default() }
     }
 

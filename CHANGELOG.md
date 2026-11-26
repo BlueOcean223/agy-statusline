@@ -5,6 +5,7 @@
 ## [Unreleased]
 
 ### 改进与修复 (Fixed & Improved)
+- **子代理改为调用 Antigravity 原生侧边栏标签页打开**：移除原先点击「打开」时调用 `toggleConversation` 切换主窗口到旧版全屏子代理路由的行为（该行为会劫持当前主对话并迁移 sidecar 标签页，在切回侧边栏会话时还易误触宿主的隐形归档按钮）；现在对当前窗格已加载的直属子代理改用 `toggleAuxPane({ tabType: 'subagentView', ... })` 在右侧辅助栏打开原生子代理标签页，对跨会话预览、嵌套或历史仅落盘子代理则降级为面板内「详情」查看（附「← 返回主对话」按钮），并修复切换会话/子代理时顶部下拉框「当前窗格」标题错位问题。
 - **Windows 重启询问弹窗升级为原生 `TaskDialogIndirect`**：替换原先通过 `powershell.exe` 调起的 `WScript.Shell.Popup`（无高分屏 DPI 感知且为旧版经典控件样式）；在 MSVC 构建中嵌入 ComCtl32 v6 与 Per-Monitor DPI v2 应用清单（附运行时 SxS 激活上下文与 `MessageBoxW` 回退），按钮改为与 macOS 一致的「立即重启 / 稍后」，并支持系统深色标题栏与主标题/正文/脚注层级。
 
 ## [v0.5.0] - 2026-11-26

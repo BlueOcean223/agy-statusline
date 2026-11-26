@@ -162,6 +162,8 @@ impl Engine {
                         .unwrap_or_default();
                     json!({
                         "id": sid,
+                        "parent": s.parent,
+                        "inLs": self.ls_loaded.contains(&sid),
                         "type": s.sub_type,
                         "role": s.sub_role,
                         "model": calls.last().map(|c| c.display.clone()),

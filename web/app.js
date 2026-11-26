@@ -518,10 +518,27 @@
       : '';
 
     const subs = p.subagents || [];
+    const canOpenSubagentTab = (s) => Boolean(
+      window.sidecar?.ui?.toggleAuxPane &&
+      hostConvId &&
+      p.id === hostConvId &&
+      s.inLs !== false &&
+      (!s.parent || s.parent === hostConvId)
+    );
+    const subOpenTip = (s, nativeOk) => {
+      if (nativeOk) return '在侧边栏以 Antigravity 原生子代理标签页打开';
+      if (hostConvId && p.id !== hostConvId) return '仅当前对话窗格支持以原生标签页打开；点击在面板内查看该子代理统计';
+      if (s.inLs === false) return '该历史子代理未加载到当前会话列表，无法打开原生标签页；点击在面板内查看统计';
+      if (s.parent && s.parent !== hostConvId) return '嵌套子代理暂不支持原生标签页直达；点击在面板内查看统计';
+      return '在面板内查看该子代理统计';
+    };
     const subagentsSection = subs.length ? `
       <div class="sec-title"><span>子代理 (${subs.length})</span><span class="sec-meta">${fmtUsd(p.subCost)}</span></div>
       <div class="surface">
-        ${subs.map((s) => `
+        ${subs.map((s) => {
+          const nativeOk = canOpenSubagentTab(s);
+          const tabTitle = s.role || s.type || '';
+          return `
           <div class="item">
             <div class="item-info">
               <div class="item-title">
@@ -530,8 +547,15 @@
               </div>
               <div class="item-sub" style="font-family:var(--mono)">${esc(s.model || '—')} · ${fmtTok(s.tokens)} tok · ${fmtUsd(s.cost)}</div>
             </div>
-            <button type="button" class="pill-btn sm btn-open-conv" data-conv="${esc(s.id)}">打开</button>
-          </div>`).join('')}
+            <button type="button" class="pill-btn sm btn-open-conv" data-conv="${esc(s.id)}" data-open-mode="${nativeOk ? 'aux' : 'panel'}" data-title="${esc(tabTitle)}" title="${esc(subOpenTip(s, nativeOk))}">${nativeOk ? '打开' : '详情'}</button>
+          </div>`;
+        }).join('')}
+      </div>` : '';
+
+    const subBackBar = p.isSub && p.root ? `
+      <div class="usage-top" style="margin-bottom:8px">
+        <button type="button" class="pill-btn sm" id="btn-back-parent" data-root="${esc(p.root)}">← 返回主对话</button>
+        <span class="tonal-tag">子代理详情</span>
       </div>` : '';
 
     const warmTxt = cache.warmLeftSec
@@ -540,6 +564,7 @@
     const ctxLeftInfo = ctx.turnsLeft ? `剩 ${fmtTok(ctx.left)} · ~${ctx.turnsLeft} 轮` : `剩 ${fmtTok(ctx.left)}`;
 
     panelOverview.innerHTML = `
+      ${subBackBar}
       <!-- Dual Ring Hero Cards -->
       <div class="ring-grid">
         <div class="ring-card">
@@ -636,11 +661,29 @@
     $('btn-view-ckpt')?.addEventListener('click', () => toggleCheckpointViewer(p.id));
     $('btn-close-ckpt')?.addEventListener('click', () => toggleCheckpointViewer(p.id));
     $('btn-ov-go-usage')?.addEventListener('click', () => switchTab('usage'));
+    $('btn-back-parent')?.addEventListener('click', () => {
+      const root = $('btn-back-parent')?.dataset.root;
+      if (!root) return;
+      selectedConvId = root;
+      lastJson = '';
+      poll();
+    });
     for (const btn of panelOverview.querySelectorAll('.btn-open-conv')) {
       btn.addEventListener('click', () => {
         const cid = btn.dataset.conv;
-        if (window.sidecar?.ui?.toggleConversation) window.sidecar.ui.toggleConversation(cid);
-        else { selectedConvId = cid; lastJson = ''; poll(); }
+        if (!cid) return;
+        if (btn.dataset.openMode === 'aux' && window.sidecar?.ui?.toggleAuxPane) {
+          const title = btn.dataset.title || '';
+          window.sidecar.ui.toggleAuxPane({
+            tabType: 'subagentView',
+            conversationId: cid,
+            ...(title ? { title } : {}),
+          });
+        } else {
+          selectedConvId = cid;
+          lastJson = '';
+          poll();
+        }
       });
     }
   }
@@ -2085,8 +2128,9 @@
       last = p;
 
       const recents = p.recent || [];
-      const autoLabel = (hostConvId ? '当前窗格 · ' : '自动 · ') + (recents[0]?.title || '');
-      convSelect.innerHTML = `<option value="${esc(hostConvId)}">${esc(autoLabel)}</option>` +
+      const hostEntry = hostConvId ? recents.find((c) => c.id === hostConvId) : recents[0];
+      const autoLabel = (hostConvId ? '当前窗格 · ' : '自动 · ') + (hostEntry?.title || recents[0]?.title || '');
+      convSelect.innerHTML = `<option value="${esc(hostConvId)}" ${selectedConvId === hostConvId ? 'selected' : ''}>${esc(autoLabel)}</option>` +
         recents.filter((c) => c.id !== hostConvId).map((c) =>
           `<option value="${esc(c.id)}" ${c.id === selectedConvId ? 'selected' : ''}>${esc(c.title)}</option>`).join('');
 

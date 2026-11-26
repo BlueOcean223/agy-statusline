@@ -222,6 +222,7 @@ pub struct Summary {
     pub step_count: u64,
     pub created_ms: i64,
     pub modified_ms: i64,
+    pub parent: Option<String>,
     pub root: Option<String>,
     pub sub_type: Option<String>,
     pub sub_role: Option<String>,
@@ -284,7 +285,7 @@ impl ConvReq {
 pub(crate) enum ConvData {
     Ls(Value),
     /// `None` when the database is unchanged since `have`.
-    Db(Option<(DbSig, Vec<Call>, Summary)>),
+    Db(Option<(DbSig, Vec<Call>, Box<Summary>)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -310,7 +311,7 @@ pub(crate) fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Resul
             if *have == Some(sig) {
                 return Ok(ConvData::Db(None));
             }
-            convdb::read(app_data, id, sig).map(|(calls, summary)| ConvData::Db(Some((sig, calls, summary))))
+            convdb::read(app_data, id, sig).map(|(calls, summary)| ConvData::Db(Some((sig, calls, Box::new(summary)))))
         }
     }
 }
@@ -661,7 +662,7 @@ pub struct Engine {
     pub(crate) summaries: HashMap<String, Summary>,
     /// Ids in the latest `GetAllCascadeTrajectories` reply. Only these may be queried by id:
     /// querying any other conversation makes the language_server load it for good.
-    ls_loaded: HashSet<String>,
+    pub(crate) ls_loaded: HashSet<String>,
     pub(crate) convs: HashMap<String, Conv>,
     hooks: HashMap<String, HookState>,
     pub(crate) dirty: HashSet<String>,
@@ -760,6 +761,7 @@ impl Engine {
                 step_count: num(&s["stepCount"]),
                 created_ms: s["createdTime"].as_str().and_then(parse_ts).unwrap_or(0),
                 modified_ms: s["lastModifiedTime"].as_str().and_then(parse_ts).unwrap_or(0),
+                parent: tm["parentConversationId"].as_str().filter(|p| *p != id).map(str::to_string),
                 root: tm["rootConversationId"].as_str().filter(|r| *r != id).map(str::to_string),
                 sub_type: spec["typeName"].as_str().map(str::to_string),
                 sub_role: spec["role"].as_str().map(str::to_string),
@@ -896,7 +898,7 @@ impl Engine {
                 conv.db_sig = Some(sig);
                 conv.changed_at = Some(now);
                 conv.rev += 1;
-                self.summaries.insert(id.clone(), summary);
+                self.summaries.insert(id.clone(), *summary);
                 Applied::Changed
             }
             _ => Applied::Stale,
@@ -1930,5 +1932,48 @@ mod tests {
         let p = parse_sub_step(&st).unwrap();
         assert_eq!(p.status, "WAITING");
         assert!(p.text.contains("cargo test"));
+    }
+
+    #[test]
+    fn apply_summaries_tracks_parent_root_and_ls_loaded() {
+        let mut eng = Engine::new(LsClient::new("127.0.0.1:0", "tok", false));
+        eng.apply_summaries(&json!({
+            "trajectorySummaries": {
+                "root-1": {
+                    "status": "CASCADE_RUN_STATUS_IDLE",
+                    "stepCount": 4,
+                    "trajectoryMetadata": {
+                        "rootConversationId": "root-1"
+                    }
+                },
+                "child-1": {
+                    "status": "CASCADE_RUN_STATUS_IDLE",
+                    "stepCount": 2,
+                    "trajectoryMetadata": {
+                        "parentConversationId": "root-1",
+                        "rootConversationId": "root-1",
+                        "subagentSpec": { "typeName": "browser", "role": "Blog Previewer" }
+                    }
+                },
+                "grand-1": {
+                    "status": "CASCADE_RUN_STATUS_RUNNING",
+                    "stepCount": 1,
+                    "trajectoryMetadata": {
+                        "parentConversationId": "child-1",
+                        "rootConversationId": "root-1",
+                        "subagentSpec": { "typeName": "research", "role": "Deep Reader" }
+                    }
+                }
+            }
+        }));
+        assert_eq!(eng.summaries["root-1"].parent, None);
+        assert_eq!(eng.summaries["root-1"].root, None);
+        assert_eq!(eng.summaries["child-1"].parent.as_deref(), Some("root-1"));
+        assert_eq!(eng.summaries["child-1"].root.as_deref(), Some("root-1"));
+        assert_eq!(eng.summaries["grand-1"].parent.as_deref(), Some("child-1"));
+        assert_eq!(eng.summaries["grand-1"].root.as_deref(), Some("root-1"));
+        assert!(eng.ls_loaded.contains("child-1"));
+        assert!(eng.ls_loaded.contains("grand-1"));
+        assert!(!eng.ls_loaded.contains("historical-only"));
     }
 }
