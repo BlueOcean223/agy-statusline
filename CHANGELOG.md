@@ -4,6 +4,8 @@
 
 ## [Unreleased]
 
+## [v0.5.0] - 2026-11-26
+
 ### 新增 (Added)
 - **侧边栏面板原生柔面 UI 重构**：全面重设计右侧辅助面板（`AUX_PANE`）的 5 个标签页，采用基于宿主 CSS 变量的无边框柔面色阶体系（自动适配 Antigravity 明暗主题）；顶部状态栏预览支持一键折叠/展开（切入外观页时自动展开），导航升级为胶囊式标签栏。
 - **概览页独立速度卡片与额度预计消耗**：上下文窗口与 Prompt 缓存改用双圆环主卡；费用区新增 Token 构成占比色条；将「速度与延迟」拆分为独立卡片并加入 TPS 渐变趋势折线图；Antigravity 额度卡片内嵌每周额度预计消耗/耗尽时间与容量估算（`cap ≈`）。
@@ -77,7 +79,8 @@
 - 统一由实时引擎驱动右侧辅助面板，移除旧版 transcript 桥接代码。
 - 修复 Antigravity 重启后查找未加载对话、按模型列表匹配首页额度组、跟随系统明暗主题、`language_server` 断开后自动退出以及面板轮询同步等问题。
 
-[Unreleased]: https://github.com/BlueOcean223/agy-statusline/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/BlueOcean223/agy-statusline/compare/v0.5.0...HEAD
+[v0.5.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.4.0...v0.5.0
 [v0.4.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.3.0...v0.4.0
 [v0.3.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.2.0...v0.3.0
 [v0.2.0]: https://github.com/BlueOcean223/agy-statusline/releases/tag/v0.2.0
