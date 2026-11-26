@@ -7,42 +7,50 @@
   <script src="/preload.js"></script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@400;500;600&family=Google+Sans+Code:wght@400;500;600&display=swap">
+  <link rel="stylesheet" media="print" onload="this.media='all'" href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:wght@400;500;600;700&family=Google+Sans+Code:wght@400;500;600;700&display=swap">
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="header">
-    <div class="header-top">
-      <div class="conv-title-wrap">
-        <select id="conv-select" class="conv-select" title="切换查看的对话（默认自动跟随当前窗格对话）">
-          <option value="">Loading…</option>
-        </select>
+    <div class="header-inner">
+      <div class="header-top">
+        <div class="conv-title-wrap">
+          <select id="conv-select" class="conv-select" title="切换查看的对话（默认自动跟随当前窗格对话）">
+            <option value="">加载中…</option>
+          </select>
+        </div>
+        <div class="header-right">
+          <button type="button" id="btn-toggle-strip" class="ghost-pill" title="展开或收起顶部状态栏预览">预览 ▾</button>
+          <span id="live-pill" class="live-pill">
+            <span class="live-dot"></span>
+            <span id="live-label">Idle</span>
+          </span>
+        </div>
       </div>
-      <span id="live-pill" class="live-pill">
-        <span class="live-dot"></span>
-        <span id="live-label">Idle</span>
-      </span>
+
+      <!-- Preview of the in-page bar for the selected conversation, drawn by bar.js with the current settings -->
+      <div id="strip-box" class="tonal-preview">
+        <div id="status-strip" class="status-strip" aria-label="Statusline summary"></div>
+      </div>
+
+      <nav class="tabs" role="tablist">
+        <button type="button" class="tab active" data-tab="overview">概览</button>
+        <button type="button" class="tab" data-tab="turns">调用 <span id="turns-count" class="tab-count"></span></button>
+        <button type="button" class="tab" data-tab="usage">用量</button>
+        <button type="button" class="tab" data-tab="theme">外观</button>
+        <button type="button" class="tab" data-tab="settings">设置 <span id="update-dot" class="tab-dot hidden" title="有新版本可用"></span></button>
+      </nav>
     </div>
-
-    <!-- Preview of the in-page bar for the selected conversation, drawn by bar.js with the current settings -->
-    <div class="strip-cap">状态栏预览</div>
-    <div id="status-strip" class="status-strip" aria-label="Statusline summary"></div>
-
-    <nav class="tabs" role="tablist">
-      <button type="button" class="tab active" data-tab="overview">Overview</button>
-      <button type="button" class="tab" data-tab="turns">Turns <span id="turns-count" class="tab-count"></span></button>
-      <button type="button" class="tab" data-tab="usage">Usage</button>
-      <button type="button" class="tab" data-tab="theme">Theme</button>
-      <button type="button" class="tab" data-tab="settings">Settings <span id="update-dot" class="tab-dot hidden" title="有新版本可用"></span></button>
-    </nav>
   </header>
 
   <main class="main">
-    <section id="panel-overview" class="tab-panel"></section>
-    <section id="panel-turns" class="tab-panel hidden"></section>
-    <section id="panel-usage" class="tab-panel hidden"></section>
-    <section id="panel-theme" class="tab-panel hidden"></section>
-    <section id="panel-settings" class="tab-panel hidden"></section>
+    <div class="main-inner">
+      <section id="panel-overview" class="tab-panel"></section>
+      <section id="panel-turns" class="tab-panel hidden"></section>
+      <section id="panel-usage" class="tab-panel hidden"></section>
+      <section id="panel-theme" class="tab-panel hidden"></section>
+      <section id="panel-settings" class="tab-panel hidden"></section>
+    </div>
   </main>
 
   <div id="confirm-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="confirm-modal-title">
@@ -50,8 +58,8 @@
       <div id="confirm-modal-title" class="modal-title"></div>
       <div id="confirm-modal-body" class="modal-body"></div>
       <div class="modal-actions">
-        <button id="confirm-modal-cancel" type="button" class="secondary-btn">取消</button>
-        <button id="confirm-modal-ok" type="button" class="secondary-btn danger-fill">确认</button>
+        <button id="confirm-modal-cancel" type="button" class="pill-btn">取消</button>
+        <button id="confirm-modal-ok" type="button" class="pill-btn err">确认</button>
       </div>
     </div>
   </div>
