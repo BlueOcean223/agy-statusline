@@ -34,6 +34,7 @@
   let usageDayData = null;
   let usageHoverCard = null;
   let usageDayRefreshTimer = 0;
+  let usageDayReqSeq = 0;
   let dayView = 'calls'; // 'calls' | 'conv'
   let daySrc = 'all'; // 'all' | 'desktop' | 'cli'
   let dayModel = '';
@@ -462,7 +463,12 @@
       panelTurns.innerHTML = '<div style="padding:24px 0;color:var(--fg-muted);font-size:12px">暂无模型调用记录</div>';
       return;
     }
-    panelTurns.innerHTML = turns.slice().reverse().map((t) => {
+    // The sidecar caps `turns` to the most recent calls; `turnsTotal` counts the whole conversation.
+    const total = p.turnsTotal ?? turns.length;
+    const capNote = total > turns.length
+      ? `<div class="form-hint" style="padding:6px 0">仅显示最近 ${turns.length} 条 / 共 ${total} 条</div>`
+      : '';
+    panelTurns.innerHTML = capNote + turns.slice().reverse().map((t) => {
       const m = t.miss;
       const missTag = m
         ? ` <span class="miss-chip" title="${esc(missNote(m))}">miss +${fmtUsd(m.usd)} · ${esc(MISS_CAUSE[m.cause]?.[0] || m.cause)}</span>`
@@ -541,6 +547,10 @@
     }
     usageDayDate = date;
     clearInterval(usageDayRefreshTimer);
+    usageDayRefreshTimer = 0;
+    // Drops responses superseded by a newer open/refresh/close so only the latest one renders and
+    // only one refresh interval can exist.
+    const seq = ++usageDayReqSeq;
     if (!silent) {
       panelUsage.innerHTML = `<div style="padding:20px 0;color:var(--fg-muted);font-size:12px">加载 ${esc(date)} 调用明细…</div>`;
     }
@@ -548,6 +558,7 @@
       const res = await fetch(`/api/usage/day?date=${encodeURIComponent(date)}&limit=${dayLimit}`, { cache: 'no-store' });
       if (!res.ok) throw new Error('HTTP ' + res.status);
       const next = await res.json();
+      if (seq !== usageDayReqSeq) return;
       const changed = JSON.stringify(next) !== JSON.stringify(usageDayData);
       usageDayData = next;
       if (activeTab === 'usage' && usageDayDate === date && (!silent || changed)) {
@@ -559,11 +570,13 @@
       }
       const todayKey = usageData?.today?.date;
       if (date === todayKey) {
+        clearInterval(usageDayRefreshTimer);
         usageDayRefreshTimer = setInterval(() => {
-          if (activeTab === 'usage' && usageDayDate === date) openUsageDay(date, true);
+          if (!document.hidden && activeTab === 'usage' && usageDayDate === date) openUsageDay(date, true);
         }, 30000);
       }
     } catch (e) {
+      if (seq !== usageDayReqSeq) return;
       panelUsage.innerHTML = `<div class="usage-bar"><button class="pill-btn" id="btn-usage-back">← 返回用量</button></div><div class="form-hint err">读取明细失败：${esc(e.message)}</div>`;
       $('btn-usage-back')?.addEventListener('click', closeUsageDay);
     }
@@ -572,7 +585,9 @@
   function closeUsageDay() {
     usageDayDate = null;
     usageDayData = null;
+    usageDayReqSeq++;
     clearInterval(usageDayRefreshTimer);
+    usageDayRefreshTimer = 0;
     renderUsage();
   }
 
@@ -1503,7 +1518,8 @@
 
   // ---------------------------------------------------------------- main poll loop
   function renderPanels(p, force = false) {
-    turnsCountEl.textContent = p.turns?.length ? String(p.turns.length) : '';
+    const turnsTotal = p.turnsTotal ?? p.turns?.length ?? 0;
+    turnsCountEl.textContent = turnsTotal ? String(turnsTotal) : '';
     if (activeTab === 'overview') renderOverview(p);
     else if (activeTab === 'turns') renderTurns(p);
     else if (activeTab === 'usage') { if (!usageData) loadUsage(); else if (force) renderUsage(); }
@@ -1516,13 +1532,16 @@
     panelOverview.innerHTML = `<div style="padding:24px 0;color:var(--fg-muted);font-size:12px">${esc(msg)}</div>`;
   }
 
-  async function poll() {
+  async function pollOnce() {
     try {
+      const convId = selectedConvId;
       const qs = new URLSearchParams();
-      if (selectedConvId) qs.set('conversationId', selectedConvId);
+      if (convId) qs.set('conversationId', convId);
       const res = await fetch(`/api/panel?${qs}`, { cache: 'no-store' });
       if (!res.ok) return;
       const text = await res.text();
+      // The selection changed mid-request; the queued follow-up poll fetches the new one.
+      if (convId !== selectedConvId) return;
       if (text === lastJson) return;
       lastJson = text;
       const p = JSON.parse(text);
@@ -1545,9 +1564,35 @@
     }
   }
 
+  // Self-scheduling poll loop: one /api/panel request at a time, the next one 1.5s after the
+  // previous finished, and none while the panel document is hidden.
+  let pollRun = null;
+  let pollQueued = null;
+  let pollTimer = 0;
+  function poll() {
+    if (pollRun) {
+      // Callers wanting fresh data (conversation switch, config save) get one more poll after the
+      // in-flight one instead of a parallel request that could land out of order.
+      pollQueued ??= pollRun.then(() => { pollQueued = null; return poll(); });
+      return pollQueued;
+    }
+    clearTimeout(pollTimer);
+    pollTimer = 0;
+    pollRun = pollOnce().finally(() => {
+      pollRun = null;
+      pollTimer = setTimeout(() => {
+        pollTimer = 0;
+        if (!document.hidden) poll();
+      }, 1500);
+    });
+    return pollRun;
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) poll();
+  });
+
   poll();
   refreshUpdateStatus();
-  setInterval(poll, 1500);
   setInterval(refreshUpdateStatus, 60000);
-  setInterval(() => { if (activeTab === 'usage' && !usageDayDate) loadUsage(true); }, 30000);
+  setInterval(() => { if (!document.hidden && activeTab === 'usage' && !usageDayDate) loadUsage(true); }, 30000);
 })();
