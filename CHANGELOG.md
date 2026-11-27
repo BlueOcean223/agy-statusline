@@ -10,6 +10,8 @@
 - **修复 CLI 调试命令（`status` / `live`）在 Antigravity 2.35+ 上找不到 `language_server`**：新版 `language_server`（`--standalone --subclient_type hub`）改从 stdin 读取令牌，命令行不再带 `--csrf_token`，导致不经 sidecar 环境变量的发现逻辑总是失败。现在依次尝试：旧版 `--csrf_token` 参数；新版写入的 `~/.gemini/antigravity/daemon/hub_<port>.json` 发现文件（仅当其中 pid 为正在运行的 `language_server` 时采用）；最后读取正在运行的 agy-statusline sidecar 进程环境中的 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`。只连接回环地址，探测仅调用 `GetAllCascadeTrajectories`，不会让 `language_server` 加载新对话；sidecar 内的连接方式不变。
 - **按响应 ID 识别同一次调用，修复单日明细中实时调用与对话库副本重复计入**：`language_server` 返回的调用记录里没有 `requestId`，此前读取它的去重键始终为空，实时调用只能靠「对话 + 秒 + 输入/输出 token」匹配库中副本，尚未写入 transcript 的调用时间不准时会被算两次。现在实时记录取 `usage.responseId`、对话库取 usage 字段 11（本机 131/131 次调用核对一致），两者相同即为同一次调用；都带响应 ID 且不同时不再按秒级键误合并。桌面端、`agy CLI` 与实时路径共用同一套去重规则和同一个对话库解码器。
 - **修复调价当天同一次调用被计两次，各处金额统一按同一套计价规则**：每日聚合此前只按模型 raw 名称分键并匹配规则，而单次调用按「raw + display」匹配，两者落到不同规则时（例如 display 为 `Gemini 4 Hydrogen (Orchestrator)`），调价当天的余量扣减对不上，同一次调用会算两次。现在每日聚合的键改存为 `raw|display`（见 ADR 0001），状态栏、侧边面板、用量页、每周额度周期与缓存未命中分析都通过同一个计价模块匹配规则和计价；调价当天统一按「仍在磁盘上的调用按各自时间计价，其余按当天中午计价」处理，此前每周额度周期在调价当天整日按中午计价。不含 `|` 的旧键视为 display 为空，计价与旧版一致，不做迁移；升级当天同一模型可能暂时分成新旧两行，总量不变。
+- **修复 Windows 开机后不久启动 sidecar 时崩溃**：Windows 上 `Instant` 从开机时刻起计且不能早于开机，此前主循环与 CDP 轮询用 `Instant::now() - 60s` / `- POLL_EVERY` 表示「立即到期」，开机后一分钟内启动 sidecar（例如登录后自动启动）会直接 panic。现在改为 `Option<Instant>`，`None` 表示尚未执行、首轮立即执行，行为不变。
+- **修复午夜进入夏令时的时区把全部历史对话算作「今天」**：在 00:00 进入夏令时的地区（如 `America/Santiago`、`America/Asuncion`、`Asia/Beirut`、`Africa/Cairo`），切换当天本地 00:00 不存在，此前「今天起点」退回为 0，所有历史对话都会被当作今天加载并计入今日花费；按日期求当天起点的 `day_start_ms` 在这一天返回空值，部分每日统计会跳过或改用兜底值。现在两者统一取当天第一个存在的本地时刻（例如 01:00）；整天被跳过的日期（如萨摩亚 2011-12-30）取下一天的起点。
 
 ## [v0.5.1] - 2026-11-26
 
