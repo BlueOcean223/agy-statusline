@@ -9,7 +9,6 @@ mod http;
 mod live;
 mod ls;
 mod miss;
-mod panel;
 mod pricing;
 mod prompt_dialog;
 mod quota;

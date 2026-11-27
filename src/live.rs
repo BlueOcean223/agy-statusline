@@ -41,6 +41,7 @@ const SUB_DONE_SHOW_MS: i64 = 10_000;
 const MAX_SUBS: usize = 4;
 const SUB_STEPS_KEEP: usize = 30;
 
+mod panel;
 mod tick;
 
 pub fn now_ms() -> i64 {
@@ -114,7 +115,7 @@ impl From<Call> for LiveCall {
 }
 
 impl LiveCall {
-    pub(crate) fn from_json(g: &Value, conv_id: &str, seen_at: i64, live_seen: bool) -> Self {
+    fn from_json(g: &Value, conv_id: &str, seen_at: i64, live_seen: bool) -> Self {
         let cm = &g["chatModel"];
         let usage = &cm["usage"];
         let ctx = &cm["chatStartMetadata"]["contextWindowMetadata"];
@@ -246,7 +247,7 @@ pub(crate) enum Applied {
 }
 
 /// Network/disk half of `refresh_conv`; runs without the ENGINE lock.
-pub(crate) fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Result<ConvData, String> {
+fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Result<ConvData, String> {
     match req {
         ConvReq::Ls { id, offset, .. } => ls
             .call(
@@ -464,7 +465,7 @@ pub(crate) struct Snapshot {
 }
 
 impl UsageStore {
-    pub(crate) fn history_snapshot(&mut self) -> Option<Snapshot> {
+    fn history_snapshot(&mut self) -> Option<Snapshot> {
         self.last_saved = Instant::now();
         self.history_pending = false;
         if !self.history.writable {
@@ -506,7 +507,7 @@ impl PendingWrites {
     }
 }
 
-pub(crate) fn write_snapshot(snap: Option<Snapshot>) {
+fn write_snapshot(snap: Option<Snapshot>) {
     let Some(s) = snap else { return };
     let Ok(mut written) = s.written.lock() else { return };
     if s.generation <= *written {
@@ -609,38 +610,38 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
 // ---------------------------------------------------------------- engine
 
 pub struct Engine {
-    pub(crate) ls: LsClient,
-    pub(crate) app_data: PathBuf,
+    ls: LsClient,
+    app_data: PathBuf,
     /// Conversations the language_server has loaded, plus those read from their database.
-    pub(crate) summaries: HashMap<String, Summary>,
+    summaries: HashMap<String, Summary>,
     /// Ids in the latest `GetAllCascadeTrajectories` reply. Only these may be queried by id:
     /// querying any other conversation makes the language_server load it for good.
-    pub(crate) ls_loaded: HashSet<String>,
-    pub(crate) convs: HashMap<String, Conv>,
+    ls_loaded: HashSet<String>,
+    convs: HashMap<String, Conv>,
     hooks: HashMap<String, HookState>,
-    pub(crate) dirty: HashSet<String>,
+    dirty: HashSet<String>,
     /// When a subagent was first seen idle after being active (for the short "done" row).
-    pub(crate) sub_done: HashMap<String, i64>,
-    pub(crate) sub_steps: HashMap<String, SubStepCache>,
-    pub(crate) quota: Value,
-    pub(crate) quota_at: Option<Instant>,
-    pub(crate) quota_at_ms: i64,
-    pub(crate) account: Option<AccountInfo>,
+    sub_done: HashMap<String, i64>,
+    sub_steps: HashMap<String, SubStepCache>,
+    quota: Value,
+    quota_at: Option<Instant>,
+    quota_at_ms: i64,
+    account: Option<AccountInfo>,
     user_status_at: Option<Instant>,
-    pub(crate) summaries_at: Option<Instant>,
+    summaries_at: Option<Instant>,
     /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
-    pub(crate) disk: HashMap<String, i64>,
+    disk: HashMap<String, i64>,
     disk_at: Option<Instant>,
     /// Candidate subagent ids from transcripts already probed via `refresh_conv`.
     probed_hints: HashSet<String>,
     /// Workspace path → (when read, git status).
     git: HashMap<String, (Instant, Option<GitInfo>)>,
-    pub last_error: Option<String>,
+    last_error: Option<String>,
     /// A hook fired since the last summaries/quota refresh (refreshed sooner, but rate-limited).
     summaries_poke: bool,
     quota_poke: bool,
     /// Conversation id → (annotation file mtime, title and last view), refreshed every 10s.
-    pub(crate) annotations: HashMap<String, (i64, Annotation)>,
+    annotations: HashMap<String, (i64, Annotation)>,
     annotations_at: Option<Instant>,
     /// Conversations whose last read failed (no database yet), retried after a backoff.
     failed: HashMap<String, Instant>,
@@ -683,7 +684,7 @@ impl Engine {
         }
     }
 
-    pub fn on_hook(&mut self, event: &str, conv: &str) {
+    fn on_hook(&mut self, event: &str, conv: &str) {
         self.hooks.insert(conv.to_string(), HookState { event: event.to_string(), at_ms: now_ms() });
         self.dirty.insert(conv.to_string());
         // Agent teams fire hooks many times a second; `plan_status` rate-limits these refreshes.
@@ -693,12 +694,12 @@ impl Engine {
         self.summaries_poke = true;
     }
 
-    pub(crate) fn any_active(&self) -> bool {
+    fn any_active(&self) -> bool {
         self.summaries.values().any(Summary::active)
             || self.hooks.values().any(|h| h.event != "Stop" && now_ms() - h.at_ms < 120_000)
     }
 
-    pub(crate) fn apply_summaries(&mut self, j: &Value) {
+    fn apply_summaries(&mut self, j: &Value) {
         let Some(ts) = j["trajectorySummaries"].as_object() else { return };
         let now = now_ms();
         self.ls_loaded = ts.keys().cloned().collect();
@@ -752,7 +753,7 @@ impl Engine {
 
     /// What to read for `id`: the language_server if it already has the conversation loaded,
     /// otherwise the conversation database (see `convdb`).
-    pub(crate) fn conv_req(&self, id: &str) -> ConvReq {
+    fn conv_req(&self, id: &str) -> ConvReq {
         let conv = self.convs.get(id);
         if self.ls_loaded.contains(id) {
             let len = conv.map_or(0, |c| c.calls.len());
@@ -764,7 +765,7 @@ impl Engine {
     }
 
     /// Loads new generator records for `id` synchronously (panel requests and the CLI).
-    pub(crate) fn refresh_conv(&mut self, id: &str) -> Result<(), String> {
+    fn refresh_conv(&mut self, id: &str) -> Result<(), String> {
         let req = self.conv_req(id);
         let data = fetch_conv(&self.ls, &self.app_data, &req)?;
         if self.apply_conv(&req, data) == Applied::Changed {
@@ -774,7 +775,7 @@ impl Engine {
     }
 
     /// Merges records fetched for `req`. The caller re-dates changed conversations.
-    pub(crate) fn apply_conv(&mut self, req: &ConvReq, data: ConvData) -> Applied {
+    fn apply_conv(&mut self, req: &ConvReq, data: ConvData) -> Applied {
         let now = Instant::now();
         match (req, data) {
             (ConvReq::Ls { id, offset, len }, ConvData::Ls(j)) => {
@@ -860,7 +861,7 @@ impl Engine {
 
     /// Merges a `GetCascadeTrajectorySteps` page (from step `from`) for a visible subagent, so
     /// the bar can show `waiting`, live elapsed duration, total steps, and a recent-steps timeline.
-    pub(crate) fn apply_sub_steps(&mut self, id: &str, from: usize, running: bool, j: &Value) {
+    fn apply_sub_steps(&mut self, id: &str, from: usize, running: bool, j: &Value) {
         let cache = self.sub_steps.entry(id.to_string()).or_default();
         if !running {
             cache.final_fetched = true;
@@ -892,7 +893,7 @@ impl Engine {
     /// Dates calls and labels turns from transcript.jsonl (read incrementally).
     /// Undated calls fall back to neighbouring calls or the conversation's modified time rather
     /// than `now`, so loading a historical conversation never pollutes today's cost.
-    pub(crate) fn sync_transcript(&mut self, id: &str, force: bool) {
+    fn sync_transcript(&mut self, id: &str, force: bool) {
         let app_data = self.app_data.clone();
         let summary_mod = self.summaries.get(id).map(|s| s.modified_ms).unwrap_or(0);
         let disk_mod = self.disk.get(id).copied().unwrap_or(0);
@@ -910,7 +911,7 @@ impl Engine {
 
     /// Probes subagent ids referenced in the transcripts of `seeds` that the language_server has
     /// not loaded yet (e.g. historical subagents of a conversation opened after restart).
-    pub(crate) fn load_subagent_hints(&mut self, seeds: &[String]) {
+    fn load_subagent_hints(&mut self, seeds: &[String]) {
         let mut queue: Vec<String> = seeds.to_vec();
         let mut seen: HashSet<String> = queue.iter().cloned().collect();
         for _ in 0..3 {
@@ -941,14 +942,14 @@ impl Engine {
         }
     }
 
-    pub(crate) fn apply_quota(&mut self, j: Value) {
+    fn apply_quota(&mut self, j: Value) {
         self.quota = j.get("response").cloned().unwrap_or(j);
         self.quota_at_ms = now_ms();
         self.quota_at = Some(Instant::now());
         self.quota_poke = false;
     }
 
-    pub(crate) fn apply_user_status(&mut self, j: Option<&Value>) {
+    fn apply_user_status(&mut self, j: Option<&Value>) {
         if let Some(acct) = j.and_then(account_from_user_status) {
             self.account = Some(acct);
         }
@@ -1030,7 +1031,7 @@ impl Engine {
             .collect()
     }
 
-    pub fn root_of(&self, id: &str) -> String {
+    fn root_of(&self, id: &str) -> String {
         let mut cur = id.to_string();
         for _ in 0..8 {
             match self.summaries.get(&cur).and_then(|s| s.root.clone()) {
@@ -1041,7 +1042,7 @@ impl Engine {
         cur
     }
 
-    pub(crate) fn is_running(&self, id: &str) -> bool {
+    fn is_running(&self, id: &str) -> bool {
         if self.summaries.get(id).is_some_and(Summary::active) {
             return true;
         }
@@ -1049,7 +1050,7 @@ impl Engine {
         self.hooks.get(id).is_some_and(|h| h.event != "Stop" && now_ms() - h.at_ms < 15_000)
     }
 
-    pub(crate) fn tree(&self, root: &str) -> Vec<String> {
+    fn tree(&self, root: &str) -> Vec<String> {
         let mut ids = vec![root.to_string()];
         for (id, s) in &self.summaries {
             if id != root && s.root.as_deref() == Some(root) {
@@ -1059,11 +1060,11 @@ impl Engine {
         ids
     }
 
-    pub(crate) fn last_call(&self, id: &str) -> Option<&LiveCall> {
+    fn last_call(&self, id: &str) -> Option<&LiveCall> {
         self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage())
     }
 
-    pub(crate) fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
+    fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
         let groups = self.quota["groups"].as_array().cloned().unwrap_or_default();
         if groups.is_empty() {
             return Vec::new();
@@ -1089,7 +1090,7 @@ impl Engine {
 
     /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
     /// returning `(total_usd, total_tokens, cli_usd)`.
-    pub(crate) fn today_totals(&self, pricer: &Pricer) -> (f64, u64, f64) {
+    fn today_totals(&self, pricer: &Pricer) -> (f64, u64, f64) {
         let midnight = local_midnight_ms();
         let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
@@ -1148,7 +1149,7 @@ impl Engine {
     }
 
     /// Runs 6-cause cache-miss analysis over a conversation's usage calls.
-    pub(crate) fn conv_misses(&self, id: &str, pricer: &Pricer) -> Vec<Option<MissInfo>> {
+    fn conv_misses(&self, id: &str, pricer: &Pricer) -> Vec<Option<MissInfo>> {
         let Some(conv) = self.convs.get(id) else {
             return Vec::new();
         };
@@ -1195,7 +1196,7 @@ impl Engine {
         })
     }
 
-    pub(crate) fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer) -> AgentLine {
+    fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer) -> AgentLine {
         let calls = self.convs.get(id).map(|c| c.calls.as_slice()).unwrap_or(&[]);
         let last = self.last_call(id);
         let ctx_max = if cfg.context_limit_override > 0 {
@@ -1303,7 +1304,7 @@ impl Engine {
         }
     }
 
-    pub(crate) fn view(&self, id: &str, cfg: &Config, pricer: &Pricer) -> View {
+    fn view(&self, id: &str, cfg: &Config, pricer: &Pricer) -> View {
         let root = self.root_of(id);
         let is_sub = root != id;
         let main = self.agent_line(id, cfg, pricer);
@@ -1381,7 +1382,7 @@ impl Engine {
     }
 }
 
-pub(crate) fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
+fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
     for c in calls.iter_mut() {
         let infos: Vec<_> = c.steps.iter().filter_map(|s| steps.get(s)).collect();
         if let Some(at) = infos.iter().map(|i| i.at_ms).filter(|&t| t > 0).min() {
@@ -1474,7 +1475,7 @@ pub struct QuotaView {
     pub elapsed: Option<f64>,
 }
 
-pub(crate) fn quota_views(group: &Value) -> Vec<QuotaView> {
+fn quota_views(group: &Value) -> Vec<QuotaView> {
     let mut out: Vec<QuotaView> = group["buckets"]
         .as_array()
         .map(|bs| {
@@ -1506,11 +1507,11 @@ pub(crate) fn quota_views(group: &Value) -> Vec<QuotaView> {
 }
 
 /// "Gemini 4 Neon (XHigh)" → "Gemini 4 Neon"; matches the quota group's model list.
-pub(crate) fn model_family(display: &str) -> String {
+fn model_family(display: &str) -> String {
     display.split(" (").next().unwrap_or(display).trim().to_string()
 }
 
-pub(crate) fn local_midnight_ms() -> i64 {
+fn local_midnight_ms() -> i64 {
     Local::now()
         .date_naive()
         .and_hms_opt(0, 0, 0)

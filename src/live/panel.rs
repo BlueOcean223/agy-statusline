@@ -1,7 +1,7 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
+use super::{Engine, LiveCall, now_ms};
 use crate::config::{Config, OnlinePrices};
-use crate::live::{Engine, LiveCall, now_ms};
 use crate::miss::MissSummary;
 use crate::pricing::Pricer;
 use crate::transcript::read_annotation;
