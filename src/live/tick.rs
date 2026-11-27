@@ -18,6 +18,9 @@ const QUOTA_AFTER_STOP_GAP: Duration = Duration::from_secs(30);
 const OFFSCREEN_GAP: Duration = Duration::from_secs(5);
 /// Database reads per tick, so a restart or opening a large agent tree doesn't stall one tick.
 const DB_LOADS_PER_TICK: usize = 24;
+/// Rounds of [`Engine::plan_load`] per side-panel request; each round can reveal subagents one
+/// level deeper (named in transcripts read by the previous round). The engine loop finds the rest.
+pub(super) const LOAD_ROUNDS: usize = 4;
 const FAIL_BACKOFF: Duration = Duration::from_secs(60);
 /// Transcript lines for new records are usually flushed within seconds; stop retrying after this.
 const RESYNC_WINDOW: Duration = Duration::from_secs(600);
@@ -70,15 +73,16 @@ pub(super) struct ConvPlan {
     convs: Vec<ConvReq>,
     subs: Vec<SubReq>,
     git: Vec<String>,
-    /// Kept for `apply_convs`: what the bar/panel shows and what today's cost needs.
-    keep: HashSet<String>,
+    /// Kept for `apply_convs`: what the bar/panel shows and what today's cost needs. `None` for a
+    /// side-panel load, which only adds conversations: it neither evicts nor reports errors.
+    keep: Option<HashSet<String>>,
 }
 
 pub(super) struct ConvFetched {
     convs: Vec<(ConvReq, Result<ConvData, String>)>,
     subs: Vec<(SubReq, Option<Value>)>,
     git: Vec<(String, Option<GitInfo>)>,
-    keep: HashSet<String>,
+    keep: Option<HashSet<String>>,
 }
 
 impl ConvPlan {
@@ -125,6 +129,15 @@ impl Engine {
             if !more {
                 break;
             }
+        }
+    }
+
+    /// Loads what the side panel needs for `id` without releasing `self` (the CLI; the sidecar
+    /// releases the ENGINE lock between phases, see `live::panel_json`).
+    pub fn load_for_panel(&mut self, id: &str) {
+        for _ in 0..LOAD_ROUNDS {
+            let Some(plan) = self.plan_load(id) else { break };
+            self.apply_convs(plan.fetch());
         }
     }
 
@@ -283,32 +296,7 @@ impl Engine {
         for root in &roots {
             seeds.extend(self.tree(root));
         }
-        let mut hints: Vec<String> = Vec::new();
-        for cid in &seeds {
-            if let Some(t) = self.convs.get(cid).and_then(|c| c.transcript.as_ref()) {
-                hints.extend(t.subagent_hints.iter().filter(|sid| *sid != cid).cloned());
-            }
-        }
-        hints.sort();
-        hints.dedup();
-        for sid in hints {
-            if db_budget == 0 {
-                break;
-            }
-            if self.convs.contains_key(&sid) || queued.contains(&sid) || self.probed_hints.contains(&sid) {
-                continue;
-            }
-            self.probed_hints.insert(sid.clone());
-            if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
-                continue;
-            }
-            let req = self.conv_req(&sid);
-            if matches!(req, ConvReq::Db { .. }) {
-                db_budget -= 1;
-            }
-            queued.insert(sid);
-            convs.push(req);
-        }
+        self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
 
         // Steps for the subagents the bar shows. The first page starts near the end: only the
         // last SUB_STEPS_KEEP steps are kept, and early pages can carry large tool outputs.
@@ -347,7 +335,81 @@ impl Engine {
 
         let mut keep = want;
         keep.extend(visible);
-        ConvPlan { ls: self.ls.clone(), app_data: self.app_data.clone(), convs, subs, git, keep }
+        ConvPlan { ls: self.ls.clone(), app_data: self.app_data.clone(), convs, subs, git, keep: Some(keep) }
+    }
+
+    /// Plans reading what the side panel needs for `id` and does not have yet: the conversation,
+    /// its root's subagent tree, and subagents named in their transcripts. `None` when nothing is
+    /// missing; keeping loaded conversations current is left to the engine loop.
+    pub(super) fn plan_load(&mut self, id: &str) -> Option<ConvPlan> {
+        let root = self.root_of(id);
+        let mut seeds = vec![id.to_string()];
+        seeds.extend(self.tree(&root).into_iter().filter(|cid| cid != id));
+        let mut db_budget = DB_LOADS_PER_TICK;
+        let mut convs: Vec<ConvReq> = Vec::new();
+        let mut queued: HashSet<String> = HashSet::new();
+        for cid in &seeds {
+            let backoff = self.failed.get(cid).is_some_and(|t| t.elapsed() < FAIL_BACKOFF);
+            if self.convs.contains_key(cid) || backoff {
+                continue;
+            }
+            let req = self.conv_req(cid);
+            if matches!(req, ConvReq::Db { .. }) {
+                if db_budget == 0 {
+                    continue;
+                }
+                db_budget -= 1;
+            }
+            queued.insert(cid.clone());
+            convs.push(req);
+        }
+        self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
+        let ls = self.ls.clone();
+        (!convs.is_empty()).then(|| ConvPlan {
+            ls,
+            app_data: self.app_data.clone(),
+            convs,
+            subs: Vec::new(),
+            git: Vec::new(),
+            keep: None,
+        })
+    }
+
+    /// Queues historical subagents named in the transcripts of `seeds`, each probed once (see
+    /// `probed_hints`), within the remaining database budget.
+    fn plan_hints(
+        &mut self,
+        seeds: &[String],
+        queued: &mut HashSet<String>,
+        db_budget: &mut usize,
+        convs: &mut Vec<ConvReq>,
+    ) {
+        let mut hints: Vec<String> = Vec::new();
+        for cid in seeds {
+            if let Some(t) = self.convs.get(cid).and_then(|c| c.transcript.as_ref()) {
+                hints.extend(t.subagent_hints.iter().filter(|sid| *sid != cid).cloned());
+            }
+        }
+        hints.sort();
+        hints.dedup();
+        for sid in hints {
+            if *db_budget == 0 {
+                break;
+            }
+            if self.convs.contains_key(&sid) || queued.contains(&sid) || self.probed_hints.contains(&sid) {
+                continue;
+            }
+            self.probed_hints.insert(sid.clone());
+            if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
+                continue;
+            }
+            let req = self.conv_req(&sid);
+            if matches!(req, ConvReq::Db { .. }) {
+                *db_budget -= 1;
+            }
+            queued.insert(sid);
+            convs.push(req);
+        }
     }
 
     pub(super) fn apply_convs(&mut self, f: ConvFetched) {
@@ -370,7 +432,9 @@ impl Engine {
                         self.failed.insert(id.clone(), now);
                     }
                     self.dirty.remove(&id);
-                    self.tick_errors.push(e);
+                    if f.keep.is_some() {
+                        self.tick_errors.push(e);
+                    }
                 }
             }
         }
@@ -382,6 +446,7 @@ impl Engine {
         for (path, info) in f.git {
             self.git.insert(path, (now, info));
         }
+        let Some(keep) = f.keep else { return };
 
         // Pick up late-flushed transcript.jsonl entries (timestamps/labels) without an LS RPC,
         // only for conversations that changed recently: some records never get a label, and
@@ -399,7 +464,7 @@ impl Engine {
         self.last_error = self.tick_errors.first().cloned();
 
         if self.evict_at.is_none_or(|t| t.elapsed() >= EVICT_EVERY) {
-            self.evict(&f.keep, now);
+            self.evict(&keep, now);
             self.evict_at = Some(now);
         }
     }
@@ -457,7 +522,7 @@ mod tests {
     /// Merges fetched conversations, keeping every conversation so eviction stays out of the way.
     fn apply(e: &mut Engine, convs: Vec<(ConvReq, Result<ConvData, String>)>) {
         let keep = e.convs.keys().cloned().chain(convs.iter().map(|(r, _)| r.id().to_string())).collect();
-        e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep });
+        e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep: Some(keep) });
     }
 
     #[test]
@@ -554,5 +619,50 @@ mod tests {
         assert!(e.convs.contains_key(&kept) && e.convs.contains_key(&recent));
         assert!(!e.convs.contains_key(&idle));
         assert!(!e.summaries.contains_key(&idle), "summaries go with their conversation");
+    }
+
+    fn db_conv(root: Option<&str>) -> Result<ConvData, String> {
+        let summary = Summary { root: root.map(str::to_string), step_count: 1, ..Default::default() };
+        Ok(ConvData::Db(Some((DbSig { mtime_ms: 1, len: 1 }, Vec::new(), Box::new(summary)))))
+    }
+
+    fn panel_round(e: &mut Engine, id: &str, data: impl Fn(&str) -> Result<ConvData, String>) -> Vec<String> {
+        let Some(plan) = e.plan_load(id) else { return Vec::new() };
+        let ids: Vec<String> = plan.convs.iter().map(|r| r.id().to_string()).collect();
+        let convs = plan.convs.into_iter().map(|r| (r.clone(), data(r.id()))).collect();
+        e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep: plan.keep });
+        ids
+    }
+
+    #[test]
+    fn panel_load_follows_a_subagent_to_its_root_then_stops() {
+        let mut e = engine();
+        let (sub, root, sibling) = (uuid(1), uuid(2), uuid(3));
+        // The sibling is known from the language_server's summaries but its records are not loaded.
+        e.summaries.insert(sibling.clone(), Summary { root: Some(root.clone()), ..Default::default() });
+        let data = |id: &str| db_conv((id != root).then_some(root.as_str()));
+
+        // Round 1: only the subagent is known; its database names the root.
+        assert_eq!(panel_round(&mut e, &sub, data), vec![sub.clone()]);
+        // Round 2: the root's tree, minus what is loaded.
+        let mut second = panel_round(&mut e, &sub, data);
+        second.sort();
+        assert_eq!(second, vec![root.clone(), sibling.clone()]);
+        assert!(e.plan_load(&sub).is_none(), "everything loaded: nothing to plan");
+    }
+
+    #[test]
+    fn panel_load_neither_evicts_nor_reports_errors_and_backs_off_failures() {
+        let mut e = engine();
+        let (idle, missing) = (uuid(1), uuid(2));
+        // Never fetched and not kept: an engine-loop merge would evict it right away.
+        e.convs.insert(idle.clone(), Conv::default());
+        assert!(e.evict_at.is_none());
+
+        let planned = panel_round(&mut e, &missing, |_| Err("no database".to_string()));
+        assert_eq!(planned, vec![missing.clone()]);
+        assert!(e.convs.contains_key(&idle), "a panel load only adds conversations");
+        assert!(e.last_error.is_none(), "panel load errors do not reach the bar");
+        assert!(e.plan_load(&missing).is_none(), "a failed read waits for FAIL_BACKOFF");
     }
 }

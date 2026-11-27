@@ -198,20 +198,7 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             let conv_id = query.get("conversationId").map(String::as_str).filter(|s| !s.is_empty());
             let cfg = load_config(&plugin_data);
             let online = active_online_prices(cfg.online_data_sync);
-            let out = match ENGINE.lock() {
-                Ok(mut guard) => match guard.as_mut() {
-                    Some(eng) => eng.panel(conv_id, &cfg, online.as_ref()),
-                    None => json!({ "id": null, "error": "language_server not connected" }),
-                },
-                Err(_) => json!({ "id": null, "error": "engine unavailable" }),
-            };
-            // Keeps the engine refreshing this conversation while the panel shows it.
-            if let (Some(shared), Some(id)) = (LIVE.get(), out["id"].as_str())
-                && let Ok(mut s) = shared.0.lock()
-            {
-                s.panel.insert(id.to_string(), std::time::Instant::now());
-            }
-            let mut out = out;
+            let mut out = crate::live::panel_json(LIVE.get(), conv_id, &cfg, online.as_ref());
             out["config"] = serde_json::to_value(&cfg).unwrap_or(Value::Null);
             send_response(stream, 200, "application/json", &serde_json::to_vec(&out).unwrap_or_default());
         }

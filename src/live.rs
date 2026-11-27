@@ -764,16 +764,6 @@ impl Engine {
         }
     }
 
-    /// Loads new generator records for `id` synchronously (panel requests and the CLI).
-    fn refresh_conv(&mut self, id: &str) -> Result<(), String> {
-        let req = self.conv_req(id);
-        let data = fetch_conv(&self.ls, &self.app_data, &req)?;
-        if self.apply_conv(&req, data) == Applied::Changed {
-            self.sync_transcript(id, true);
-        }
-        Ok(())
-    }
-
     /// Merges records fetched for `req`. The caller re-dates changed conversations.
     fn apply_conv(&mut self, req: &ConvReq, data: ConvData) -> Applied {
         let now = Instant::now();
@@ -906,39 +896,6 @@ impl Engine {
             conv.last_conv_mod = conv_mod;
             date_calls(&mut conv.calls, &t.steps, conv_mod);
             conv.rev += 1;
-        }
-    }
-
-    /// Probes subagent ids referenced in the transcripts of `seeds` that the language_server has
-    /// not loaded yet (e.g. historical subagents of a conversation opened after restart).
-    fn load_subagent_hints(&mut self, seeds: &[String]) {
-        let mut queue: Vec<String> = seeds.to_vec();
-        let mut seen: HashSet<String> = queue.iter().cloned().collect();
-        for _ in 0..3 {
-            let mut next_queue = Vec::new();
-            for cid in queue {
-                let hints: Vec<String> = self
-                    .convs
-                    .get(&cid)
-                    .and_then(|c| c.transcript.as_ref())
-                    .map(|t| t.subagent_hints.iter().cloned().collect())
-                    .unwrap_or_default();
-                for sid in hints {
-                    if sid == cid || self.convs.contains_key(&sid) || !self.probed_hints.insert(sid.clone()) {
-                        continue;
-                    }
-                    if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
-                        continue;
-                    }
-                    if self.refresh_conv(&sid).is_ok() && seen.insert(sid.clone()) {
-                        next_queue.push(sid);
-                    }
-                }
-            }
-            if next_queue.is_empty() {
-                break;
-            }
-            queue = next_queue;
         }
     }
 
@@ -1528,6 +1485,41 @@ pub fn port_file(plugin_data: &Path) -> PathBuf {
 
 /// The engine is shared with the side panel's HTTP handlers, which read details from it directly.
 pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
+
+/// The side panel's JSON for `requested` (default: the most recent conversation). What it needs
+/// and is not loaded yet is read with the ENGINE lock released, as in the engine loop, so a panel
+/// request never holds the lock across an RPC or a database read. Concurrent reads of the same
+/// conversation by the engine loop are dropped as stale when merged.
+pub fn panel_json(
+    shared: Option<&SharedRef>,
+    requested: Option<&str>,
+    cfg: &Config,
+    online: Option<&OnlinePrices>,
+) -> Value {
+    let engine = || ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+    let target = match engine().as_ref() {
+        Some(eng) => eng.panel_target(requested),
+        None => return json!({ "id": null, "error": "language_server not connected" }),
+    };
+    let Some(id) = target else { return json!({ "id": null }) };
+    // Keeps the engine loop refreshing this conversation while the panel shows it.
+    if let Some(shared) = shared
+        && let Ok(mut s) = shared.0.lock()
+    {
+        s.panel.insert(id.clone(), Instant::now());
+    }
+    for _ in 0..tick::LOAD_ROUNDS {
+        let Some(plan) = engine().as_mut().and_then(|eng| eng.plan_load(&id)) else { break };
+        let fetched = plan.fetch();
+        if let Some(eng) = engine().as_mut() {
+            eng.apply_convs(fetched);
+        }
+    }
+    match engine().as_ref() {
+        Some(eng) => eng.panel(&id, cfg, online),
+        None => json!({ "id": null, "error": "language_server not connected" }),
+    }
+}
 
 const LS_GONE_AFTER: Duration = Duration::from_secs(20);
 
