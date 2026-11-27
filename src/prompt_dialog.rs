@@ -8,7 +8,8 @@
 //!   - Windows (`windows.rs`): Win32 `WS_EX_LAYERED` + `UpdateLayeredWindow` + GDI+ `32bppPARGB`
 //!     with Per-Monitor DPI v2 scaling and native `MessageBoxW` fallback.
 //! - Spawned via a short-lived `agy-statusline relaunch-prompt` subprocess so macOS AppKit runs
-//!   cleanly on its main thread and the resident sidecar keeps zero GUI libraries loaded.
+//!   cleanly on its main thread. AppKit/CoreGraphics (macOS) and GDI+ (Windows) are loaded at run
+//!   time by that subprocess only, so the resident sidecar and hook runs never load them.
 
 // Only the macOS and Windows painters draw this layout; other platforms never show the dialog.
 #![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
@@ -562,9 +563,14 @@ impl PromptState {
     }
 }
 
+/// What screen readers announce for the dialog: its text and its keys (the controls are drawn,
+/// not native).
+pub const ACCESSIBLE_TEXT: &str = "需要重启 Antigravity：本次未开启调试端口，状态栏和中文界面暂无法加载。\
+重启会保留对话记录，但会中断正在运行的任务。回车：立即重启；Esc：稍后；空格：切换「不再询问」。";
+
 /// Runs the native GUI confirmation dialog directly in the current process (used by the
-/// `agy-statusline relaunch-prompt` helper subcommand).
-pub fn run_prompt_process(theme_override: Option<&str>) -> PromptResult {
+/// `agy-statusline relaunch-prompt` helper subcommand). `None` when no dialog could be shown.
+pub fn run_prompt_process(theme_override: Option<&str>) -> Option<PromptResult> {
     let forced = Theme::parse_override(theme_override);
     #[cfg(target_os = "macos")]
     {
@@ -572,12 +578,12 @@ pub fn run_prompt_process(theme_override: Option<&str>) -> PromptResult {
     }
     #[cfg(target_os = "windows")]
     {
-        windows::show_dialog(forced)
+        Some(windows::show_dialog(forced))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = forced;
-        PromptResult::default()
+        None
     }
 }
 

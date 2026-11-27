@@ -297,8 +297,46 @@ unsafe extern "system" {
     fn GetDeviceCaps(hdc: *mut c_void, index: i32) -> i32;
 }
 
-#[link(name = "gdiplus")]
+// GDI+ is loaded by `Gdiplus::load` when the dialog is shown. Linking it would load gdiplus.dll
+// into every process of this binary: the resident sidecar and each `hook` run too.
+#[link(name = "kernel32")]
 unsafe extern "system" {
+    fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
+}
+
+/// Declares the GDI+ functions this module calls, resolved by [`Gdiplus::load`] and called
+/// through wrappers with the C names, so call sites read as if they were linked.
+macro_rules! gdiplus_fns {
+    ($( fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
+        #[allow(non_snake_case)]
+        struct Gdiplus {
+            $( $name: unsafe extern "system" fn($($ty),*) $(-> $ret)?, )*
+        }
+
+        impl Gdiplus {
+            unsafe fn resolve(module: *mut c_void) -> Option<Self> {
+                Some(Self {
+                    $( $name: {
+                        let p = unsafe { GetProcAddress(module, concat!(stringify!($name), "\0").as_ptr().cast()) };
+                        if p.is_null() {
+                            return None;
+                        }
+                        unsafe { transmute::<*const c_void, unsafe extern "system" fn($($ty),*) $(-> $ret)?>(p) }
+                    }, )*
+                })
+            }
+        }
+
+        $(
+            #[allow(non_snake_case)]
+            unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                unsafe { (gdiplus().$name)($($arg),*) }
+            }
+        )*
+    };
+}
+
+gdiplus_fns! {
     fn GdiplusStartup(token: *mut usize, input: *const GdiplusStartupInput, output: *mut c_void) -> i32;
     fn GdiplusShutdown(token: usize);
     fn GdipCreateBitmapFromScan0(
@@ -355,6 +393,29 @@ unsafe extern "system" {
         string_format: *const c_void,
         brush: *const c_void,
     ) -> i32;
+}
+
+// Function pointers into gdiplus.dll, read-only after `load`.
+unsafe impl Send for Gdiplus {}
+unsafe impl Sync for Gdiplus {}
+
+static GDIPLUS: std::sync::OnceLock<Option<Gdiplus>> = std::sync::OnceLock::new();
+
+impl Gdiplus {
+    /// Loads gdiplus.dll; `None` if it or any function is missing.
+    fn load() -> Option<&'static Gdiplus> {
+        GDIPLUS
+            .get_or_init(|| unsafe {
+                let module = LoadLibraryW(to_wide_null("gdiplus.dll").as_ptr());
+                if module.is_null() { None } else { Gdiplus::resolve(module) }
+            })
+            .as_ref()
+    }
+}
+
+/// GDI+ as loaded by [`show_custom_dialog`] before its first call.
+fn gdiplus() -> &'static Gdiplus {
+    GDIPLUS.get().and_then(Option::as_ref).expect("show_custom_dialog loads GDI+ first")
 }
 
 fn to_wide_null(s: &str) -> Vec<u16> {
@@ -870,6 +931,7 @@ unsafe extern "system" fn wnd_proc(hwnd: *mut c_void, msg: u32, w_param: usize, 
 }
 
 fn show_custom_dialog(theme: Theme) -> Option<PromptResult> {
+    Gdiplus::load()?;
     let mut gp_token: usize = 0;
     let startup = GdiplusStartupInput {
         gdiplus_version: 1,
@@ -883,7 +945,8 @@ fn show_custom_dialog(theme: Theme) -> Option<PromptResult> {
 
     let h_inst = unsafe { GetModuleHandleW(null()) };
     let class_name = to_wide_null("AgyStatuslinePromptWindow");
-    let title = to_wide_null("AGY Statusline");
+    // Narrator reads the title: the controls are drawn, not native.
+    let title = to_wide_null(&format!("AGY Statusline：{}", super::ACCESSIBLE_TEXT));
     let cursor_arrow = unsafe { LoadCursorW(null_mut(), IDC_ARROW) };
     let cursor_hand = unsafe { LoadCursorW(null_mut(), IDC_HAND) };
 

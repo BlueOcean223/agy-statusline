@@ -63,20 +63,50 @@ unsafe extern "C" {
     fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
-#[link(name = "AppKit", kind = "framework")]
+// AppKit (which brings Foundation) and CoreGraphics are loaded by `load_frameworks` when the
+// dialog is shown. Linking them would load them into every process of this binary: the resident
+// sidecar and each `hook` run too.
 unsafe extern "C" {
-    static NSFontAttributeName: Id;
-    static NSForegroundColorAttributeName: Id;
+    fn dlopen(path: *const c_char, mode: i32) -> *mut c_void;
+    fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
+}
+const RTLD_NOW: i32 = 0x2;
+const RTLD_GLOBAL: i32 = 0x8;
+
+/// Declares the framework functions this module calls, resolved by [`Frameworks::load`] and
+/// called through wrappers with the C names, so call sites read as if they were linked.
+macro_rules! framework_fns {
+    ($( fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $(-> $ret:ty)?; )*) => {
+        #[allow(non_snake_case)]
+        struct Fns {
+            $( $name: unsafe extern "C" fn($($ty),*) $(-> $ret)?, )*
+        }
+
+        impl Fns {
+            unsafe fn resolve(handle: *mut c_void) -> Option<Self> {
+                Some(Self {
+                    $( $name: {
+                        let p = unsafe { dlsym(handle, concat!(stringify!($name), "\0").as_ptr().cast()) };
+                        if p.is_null() {
+                            return None;
+                        }
+                        unsafe { transmute::<*mut c_void, unsafe extern "C" fn($($ty),*) $(-> $ret)?>(p) }
+                    }, )*
+                })
+            }
+        }
+
+        $(
+            #[allow(non_snake_case)]
+            unsafe fn $name($($arg: $ty),*) $(-> $ret)? {
+                unsafe { (frameworks().fns.$name)($($arg),*) }
+            }
+        )*
+    };
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-unsafe extern "C" {
-    fn CGPathCreateWithRoundedRect(
-        rect: NSRect,
-        corner_width: f64,
-        corner_height: f64,
-        transform: *const c_void,
-    ) -> CGPathRef;
+framework_fns! {
+    fn CGPathCreateWithRoundedRect(rect: NSRect, corner_width: f64, corner_height: f64, transform: *const c_void) -> CGPathRef;
     fn CGPathRelease(path: CGPathRef);
     fn CGContextSaveGState(ctx: CGContextRef);
     fn CGContextRestoreGState(ctx: CGContextRef);
@@ -90,6 +120,48 @@ unsafe extern "C" {
     fn CGContextBeginPath(ctx: CGContextRef);
     fn CGContextMoveToPoint(ctx: CGContextRef, x: f64, y: f64);
     fn CGContextAddLineToPoint(ctx: CGContextRef, x: f64, y: f64);
+}
+
+struct Frameworks {
+    fns: Fns,
+    font_attribute_name: Id,
+    foreground_color_attribute_name: Id,
+}
+
+// Read-only after `load`; the pointers are immutable framework constants.
+unsafe impl Send for Frameworks {}
+unsafe impl Sync for Frameworks {}
+
+static FRAMEWORKS: std::sync::OnceLock<Option<Frameworks>> = std::sync::OnceLock::new();
+
+impl Frameworks {
+    /// Loads AppKit and CoreGraphics; `None` if either or any symbol is missing.
+    fn load() -> Option<&'static Frameworks> {
+        FRAMEWORKS
+            .get_or_init(|| unsafe {
+                let open = |path: &CStr| {
+                    let h = dlopen(path.as_ptr(), RTLD_NOW | RTLD_GLOBAL);
+                    (!h.is_null()).then_some(h)
+                };
+                let appkit = open(c"/System/Library/Frameworks/AppKit.framework/AppKit")?;
+                let cg = open(c"/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")?;
+                let constant = |name: &CStr| {
+                    let p = dlsym(appkit, name.as_ptr()).cast::<Id>();
+                    (!p.is_null()).then(|| *p)
+                };
+                Some(Frameworks {
+                    fns: Fns::resolve(cg)?,
+                    font_attribute_name: constant(c"NSFontAttributeName")?,
+                    foreground_color_attribute_name: constant(c"NSForegroundColorAttributeName")?,
+                })
+            })
+            .as_ref()
+    }
+}
+
+/// The frameworks [`show_dialog`] loaded before creating any AppKit object.
+fn frameworks() -> &'static Frameworks {
+    FRAMEWORKS.get().and_then(Option::as_ref).expect("show_dialog loads the frameworks first")
 }
 
 struct AutoreleasePool(*mut c_void);
@@ -204,7 +276,7 @@ unsafe fn ns_font(size: f64, weight: FontWeight) -> Id {
 
 unsafe fn text_attrs(font: Id, color: Id) -> Id {
     let objs = [font, color];
-    let keys = unsafe { [NSFontAttributeName, NSForegroundColorAttributeName] };
+    let keys = [frameworks().font_attribute_name, frameworks().foreground_color_attribute_name];
     let f: unsafe extern "C" fn(Class, Sel, *const Id, *const Id, usize) -> Id =
         unsafe { transmute(objc_msgSend as *const ()) };
     unsafe { f(cls(c"NSDictionary"), sel(c"dictionaryWithObjects:forKeys:count:"), objs.as_ptr(), keys.as_ptr(), 2) }
@@ -575,7 +647,9 @@ unsafe fn register_classes() -> (Class, Class) {
     (win_cls, view_cls)
 }
 
-pub fn show_dialog(theme_override: Option<Theme>) -> PromptResult {
+/// The user's answer; `None` when AppKit could not be loaded or the window not created.
+pub fn show_dialog(theme_override: Option<Theme>) -> Option<PromptResult> {
+    Frameworks::load()?;
     let _pool = AutoreleasePool::push();
     let theme = theme_override.unwrap_or_else(|| unsafe { detect_system_theme() });
 
@@ -605,7 +679,7 @@ pub fn show_dialog(theme_override: Option<Theme>) -> PromptResult {
         // styleMask = 0 (NSWindowStyleMaskBorderless), backing = 2 (NSBackingStoreBuffered)
         let window = init_win(win_alloc, sel(c"initWithContentRect:styleMask:backing:defer:"), content_rect, 0, 2, NO);
         if window.is_null() {
-            return PromptResult::default();
+            return None;
         }
 
         msg1_void_bool(window, sel(c"setOpaque:"), NO);
@@ -635,6 +709,10 @@ pub fn show_dialog(theme_override: Option<Theme>) -> PromptResult {
         );
         msg1_void_id(view, sel(c"addTrackingArea:"), ta);
 
+        // The controls are drawn, so VoiceOver reads the view as one element with the dialog's text.
+        msg1_void_bool(view, sel(c"setAccessibilityElement:"), YES);
+        msg1_void_id(view, sel(c"setAccessibilityRole:"), ns_string("AXGroup"));
+        msg1_void_id(view, sel(c"setAccessibilityLabel:"), ns_string(super::ACCESSIBLE_TEXT));
         msg1_void_id(window, sel(c"setContentView:"), view);
         msg1_id(window, sel(c"makeFirstResponder:"), view);
 
@@ -655,6 +733,6 @@ pub fn show_dialog(theme_override: Option<Theme>) -> PromptResult {
         let result = RT.with(|cell| cell.borrow_mut().take().and_then(|rt| rt.state.outcome)).unwrap_or_default();
         // Keep `view` alive for the full modal lifetime (already retained by `window`).
         let _ = view;
-        result
+        Some(result)
     }
 }

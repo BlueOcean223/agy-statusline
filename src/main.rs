@@ -151,8 +151,9 @@ fn main() {
         Some(Commands::Live { ids }) => print_live(ids),
         Some(Commands::Status { conversation }) => print_status(&conversation),
         Some(Commands::RelaunchPrompt { theme }) => {
-            let res = prompt_dialog::run_prompt_process(theme.as_deref());
-            std::process::exit(res.to_exit_code());
+            // Without an answer, exit with a code the parent does not take for one.
+            let code = prompt_dialog::run_prompt_process(theme.as_deref()).map_or(1, |res| res.to_exit_code());
+            std::process::exit(code);
         }
         None => {
             if std::env::var("ANTIGRAVITY_SIDECAR_WEB_PORT").is_ok() {
