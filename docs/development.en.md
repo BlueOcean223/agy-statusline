@@ -10,7 +10,7 @@ See [architecture.html](architecture.html) for the design comparison and data fl
 
 | Component | Files | Responsibility |
 |---|---|---|
-| **Sidecar Entry & HTTP** | `src/main.rs`, `src/server.rs`, `src/panel.rs` | Managed by `sidecars/statusline/sidecar.json`: runs the live engine, CDP injector, local HTTP side pane server (mutation routes and `GET /api/checkpoint` require UI token auth), relaunch watcher, and updater |
+| **Sidecar Entry & HTTP** | `src/main.rs`, `src/server.rs`, `src/live/panel.rs` | Managed by `sidecars/statusline/sidecar.json`: runs the live engine, CDP injector, local HTTP side pane server (mutation routes and `GET /api/checkpoint` require UI token auth), relaunch watcher, and updater |
 | **Live Telemetry Engine** | `src/live.rs`, `src/ls.rs`, `src/git.rs`, `src/transcript.rs` | Queries read-only `language_server` APIs incrementally, reads transcripts/annotations & on-demand `transcript_full.jsonl` checkpoints, polls workspace Git status |
 | **Usage, Quota & Miss Analysis** | `src/usage.rs`, `src/quota.rs`, `src/cli_usage.rs`, `src/miss.rs` | Persists 400-day usage aggregates (`usage-history.json`), 8-day weekly quota samples (`quota-samples.json`), and CLI day index (`cli-index.json`); runs read-only SQLite backfill across Desktop and `agy CLI` DBs, per-day call/conversation drill-downs, 6-cause cache-miss analysis, and weekly quota period/early-reset (`↺`) state tracking |
 | **CDP Renderer & i18n** | `src/cdp.rs`, `web/bar.js` | Watches `DevToolsActivePort` every 3s, injects stateless `bar.js` and `i18n/translator.js` (v12) into main and Swarm frames; syncs temporary English toggles, restores English immediately on disable, and auto-reloads stuck `"plugin unavailable"` side panels |

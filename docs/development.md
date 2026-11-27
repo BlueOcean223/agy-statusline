@@ -10,7 +10,7 @@
 
 | 组件 | 路径 | 职责 |
 |---|---|---|
-| **Sidecar 入口** | `src/main.rs`、`src/server.rs`、`src/panel.rs` | 由 `sidecars/statusline/sidecar.json` 拉起并托管：运行 live 引擎、CDP 注入器、本地 HTTP 面板服务（写接口与 `GET /api/checkpoint` 均受 UI 令牌保护）、调试重启守卫与更新中心 |
+| **Sidecar 入口** | `src/main.rs`、`src/server.rs`、`src/live/panel.rs` | 由 `sidecars/statusline/sidecar.json` 拉起并托管：运行 live 引擎、CDP 注入器、本地 HTTP 面板服务（写接口与 `GET /api/checkpoint` 均受 UI 令牌保护）、调试重启守卫与更新中心 |
 | **实时引擎** | `src/live.rs`、`src/ls.rs`、`src/git.rs`、`src/transcript.rs` | 增量拉取 `language_server` 只读接口、读取 transcript/annotations 与按需提取 `transcript_full.jsonl` 压缩摘要、定期采集工作区 Git 状态 |
 | **用量、额度与归因** | `src/usage.rs`、`src/quota.rs`、`src/cli_usage.rs`、`src/miss.rs` | 持久化 400 天每日用量（`usage-history.json`）、8 天每周额度采样（`quota-samples.json`）与 CLI 日期索引（`cli-index.json`）；只读 SQLite 补算桌面与 `agy CLI` 对话库、单日调用/按对话明细、6 类缓存未命中归因分析，以及跨周期分段与提早重置（`↺`）的每周额度状态机 |
 | **CDP 渲染注入** | `src/cdp.rs`、`web/bar.js` | 每 3 秒扫描 `DevToolsActivePort`，向主窗口与 Swarm iframe 注入纯渲染脚本 `bar.js` 与 `i18n/translator.js`（v12）；同步全局临时英文快捷键、关闭中文时即时还原英文，并自动重载卡死在 `"plugin unavailable"` 的侧边栏面板 |
