@@ -13,21 +13,20 @@
 //! Hooks only tell the engine *when* to look (UDP datagram, see `hook.rs`), so a turn's numbers
 //! show up right after the call ends instead of on the next poll.
 
-use crate::call::{Call, ModelId, Tokens};
+use crate::call::{Call, ModelAgg, ModelId, Tokens};
 use crate::cli_usage::{CliScanner, CliSnapshot, apply_cli_delta};
 use crate::config::{
-    Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir,
-    load_config, write_atomic,
+    Config, OnlinePrices, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir, load_config, write_atomic,
 };
 use crate::convdb::{self, ConvMeta, DbSig};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
-use crate::miss::{MissCallInput, MissInfo, miss_scan};
+use crate::miss::{MissInfo, miss_scan};
+use crate::pricing::{Cost, DayCost, Pricer};
 use crate::transcript::{Annotation, Transcript};
 use crate::usage::{
-    AccountInfo, ModelAgg, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history,
-    load_samples, maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str,
-    update_today,
+    AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
+    maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
 };
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -144,58 +143,6 @@ impl LiveCall {
             response_id: usage["responseId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
         };
         Self { call, live_seen, ..Default::default() }
-    }
-}
-
-pub fn price_for<'a>(rules: &'a [ModelRule], call: &Call) -> Option<&'a ModelRule> {
-    let key = call.model.price_key();
-    rules.iter().find(|r| !r.pattern.is_empty() && contains_lowercased(&key, &r.pattern))
-}
-
-/// `hay` is already lowercase. Same as `hay.contains(&pat.to_lowercase())`, without allocating
-/// for ASCII patterns (this runs for every call and rule on every tick).
-fn contains_lowercased(hay: &str, pat: &str) -> bool {
-    if !pat.is_ascii() {
-        return hay.contains(&pat.to_lowercase());
-    }
-    let (h, p) = (hay.as_bytes(), pat.as_bytes());
-    if p.is_empty() {
-        return true;
-    }
-    p.len() <= h.len() && h.windows(p.len()).any(|w| w.iter().zip(p).all(|(a, b)| *a == b.to_ascii_lowercase()))
-}
-
-/// Changes whenever any pricing rule changes (rules are rebuilt from config on every tick).
-fn rules_fingerprint(rules: &[ModelRule]) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    format!("{rules:?}").hash(&mut h);
-    h.finish()
-}
-
-#[derive(Clone, Copy, Debug, Default, Serialize)]
-pub struct Cost {
-    #[serde(rename = "in")]
-    pub input: f64,
-    pub cache: f64,
-    pub cw: f64,
-    pub out: f64,
-}
-
-impl Cost {
-    pub fn total(&self) -> f64 {
-        self.input + self.cache + self.cw + self.out
-    }
-}
-
-pub fn call_cost(rules: &[ModelRule], c: &Call) -> Cost {
-    let Some(r) = price_for(rules, c) else { return Cost::default() };
-    let (p_in, p_cr, p_cw, p_out) = r.rates_at(c.at_ms, now_ms());
-    Cost {
-        input: c.tokens.input as f64 * p_in / 1e6,
-        cache: c.tokens.cache_read as f64 * p_cr / 1e6,
-        cw: c.tokens.cache_write as f64 * p_cw / 1e6,
-        out: c.tokens.output as f64 * p_out / 1e6,
     }
 }
 
@@ -1142,9 +1089,9 @@ impl Engine {
 
     /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
     /// returning `(total_usd, total_tokens, cli_usd)`.
-    pub(crate) fn today_totals(&self, rules: &[ModelRule]) -> (f64, u64, f64) {
+    pub(crate) fn today_totals(&self, pricer: &Pricer) -> (f64, u64, f64) {
         let midnight = local_midnight_ms();
-        let fp = rules_fingerprint(rules);
+        let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
             let (cost, tok) = match conv.today_cost.get() {
@@ -1152,7 +1099,7 @@ impl Engine {
                 _ => {
                     let (mut cost, mut tok) = (0.0, 0u64);
                     for c in conv.calls.iter().filter(|c| c.has_usage() && c.at_ms >= midnight) {
-                        cost += call_cost(rules, c).total();
+                        cost += pricer.call_cost(c).total();
                         tok += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
                     }
                     conv.today_cost.set(Some(TodayCost { rev: conv.rev, midnight, rules: fp, cost, tokens: tok }));
@@ -1164,7 +1111,6 @@ impl Engine {
         }
         // Snapshot today's persisted aggregates + CLI snapshot briefly under USAGE lock, then price lock-free.
         let today = today_str();
-        let now = now_ms();
         let snap = USAGE.lock().ok().and_then(|g| {
             let store = g.as_ref()?;
             let day = store.history.days.get(&today)?;
@@ -1177,57 +1123,20 @@ impl Engine {
             ))
         });
         let persisted = snap.map(|(desk_raw, cli_raw, mut cli_snap, cd, pd)| {
-            let (mut desk_usd, mut desk_tok) = (0.0, 0u64);
-            let (mut cli_usd, mut cli_tok) = (0.0, 0u64);
-            for (model, agg) in &desk_raw {
-                let (_, u) = crate::usage::price_tokens(
-                    rules,
-                    model,
-                    agg.input,
-                    agg.cache_read,
-                    agg.cache_write,
-                    agg.output,
-                    now,
-                    now,
-                );
-                desk_usd += u;
-                desk_tok += agg.total_tokens();
-            }
-            if !cli_raw.is_empty() {
-                // On price-transition days, price CLI calls at their exact timestamps outside USAGE lock.
-                if crate::config::any_price_cut_in(rules, midnight, midnight + 86_400_000) {
-                    for c in cli_snap.calls_for_day(&cd, &pd, &today) {
-                        let key = c.model.price_key();
-                        let (_, u) = crate::usage::price_tokens(
-                            rules,
-                            &key,
-                            c.tokens.input,
-                            c.tokens.cache_read,
-                            c.tokens.cache_write,
-                            c.tokens.output,
-                            c.at_ms,
-                            now,
-                        );
-                        cli_usd += u;
-                        cli_tok += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
-                    }
-                } else {
-                    for (model, agg) in &cli_raw {
-                        let (_, u) = crate::usage::price_tokens(
-                            rules,
-                            model,
-                            agg.input,
-                            agg.cache_read,
-                            agg.cache_write,
-                            agg.output,
-                            now,
-                            now,
-                        );
-                        cli_usd += u;
-                        cli_tok += agg.total_tokens();
-                    }
-                }
-            }
+            // On a price-cut day, the calls this engine holds and the CLI's calls are priced at their
+            // own time, and the rest of today's aggregates at noon.
+            let cut = pricer.is_cut_day(midnight);
+            let desk_exact: Vec<Call> = if cut {
+                let today_calls = self.convs.values().flat_map(|conv| conv.calls.iter());
+                today_calls.filter(|c| c.has_usage() && c.at_ms >= midnight).map(|c| c.call.clone()).collect()
+            } else {
+                Vec::new()
+            };
+            let cli_exact =
+                if cut && !cli_raw.is_empty() { cli_snap.calls_for_day(&cd, &pd, &today) } else { Vec::new() };
+            let sum = |d: DayCost| d.values().fold((0.0, 0u64), |(u, t), (usd, agg)| (u + usd, t + agg.total_tokens()));
+            let (desk_usd, desk_tok) = sum(pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), midnight));
+            let (cli_usd, cli_tok) = sum(pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), midnight));
             (desk_usd, desk_tok, cli_usd, cli_tok)
         });
         match persisted {
@@ -1239,64 +1148,22 @@ impl Engine {
     }
 
     /// Runs 6-cause cache-miss analysis over a conversation's usage calls.
-    pub(crate) fn conv_misses(&self, id: &str, rules: &[ModelRule]) -> Vec<Option<MissInfo>> {
+    pub(crate) fn conv_misses(&self, id: &str, pricer: &Pricer) -> Vec<Option<MissInfo>> {
         let Some(conv) = self.convs.get(id) else {
             return Vec::new();
         };
-        let now = now_ms();
-        let inputs: Vec<MissCallInput> = conv
-            .calls
-            .iter()
-            .filter(|c| c.has_usage())
-            .map(|c| {
-                if let Some(r) = price_for(rules, c) {
-                    let (p_in, p_cr, p_cw, _) = r.rates_at(c.at_ms, now);
-                    MissCallInput {
-                        at_ms: c.at_ms,
-                        ttft_ms: c.ttft_ms,
-                        stream_ms: c.stream_ms,
-                        step: c.steps.first().copied(),
-                        model_name: Some(r.short_name.clone()),
-                        input: c.tokens.input,
-                        cache_read: c.tokens.cache_read,
-                        cache_write: c.tokens.cache_write,
-                        p_in,
-                        p_cache: p_cr,
-                        p_cw,
-                    }
-                } else {
-                    MissCallInput {
-                        at_ms: c.at_ms,
-                        ttft_ms: c.ttft_ms,
-                        stream_ms: c.stream_ms,
-                        step: c.steps.first().copied(),
-                        model_name: None,
-                        input: c.tokens.input,
-                        cache_read: c.tokens.cache_read,
-                        cache_write: c.tokens.cache_write,
-                        p_in: 0.0,
-                        p_cache: 0.0,
-                        p_cw: 0.0,
-                    }
-                }
-            })
-            .collect();
         let markers = conv.transcript.as_ref().map(|t| &t.markers);
-        miss_scan(&inputs, markers)
+        miss_scan(conv.calls.iter().filter(|c| c.has_usage()).map(|c| &c.call), pricer, markers)
     }
 
     pub fn build_payload(&self, panes: &HashSet<String>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
-        let rules = effective_model_rules(&cfg.models, online);
-        let (today, _, today_cli) = self.today_totals(&rules);
-        let price_src = match online {
-            Some(p) if !p.updated.is_empty() => format!("online ({})", p.updated),
-            Some(_) => "online".to_string(),
-            None => "bundled".to_string(),
-        };
+        let pricer = Pricer::new(&cfg.models, online, now_ms());
+        let (today, _, today_cli) = self.today_totals(&pricer);
+        let price_src = pricer.source().to_string();
 
         let mut views = serde_json::Map::new();
         for id in panes {
-            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &rules)).unwrap_or(Value::Null));
+            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &pricer)).unwrap_or(Value::Null));
         }
         let groups: Vec<Value> = self.quota["groups"]
             .as_array()
@@ -1328,7 +1195,7 @@ impl Engine {
         })
     }
 
-    pub(crate) fn agent_line(&self, id: &str, cfg: &Config, rules: &[ModelRule]) -> AgentLine {
+    pub(crate) fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer) -> AgentLine {
         let calls = self.convs.get(id).map(|c| c.calls.as_slice()).unwrap_or(&[]);
         let last = self.last_call(id);
         let ctx_max = if cfg.context_limit_override > 0 {
@@ -1343,7 +1210,7 @@ impl Engine {
         let mut own_cost = 0.0;
         let mut first_call_at = 0i64;
         for c in calls.iter().filter(|c| c.has_usage()) {
-            own_cost += call_cost(rules, c).total();
+            own_cost += pricer.call_cost(c).total();
             if c.at_ms > 0 && (first_call_at == 0 || c.at_ms < first_call_at) {
                 first_call_at = c.at_ms;
             }
@@ -1436,10 +1303,10 @@ impl Engine {
         }
     }
 
-    pub(crate) fn view(&self, id: &str, cfg: &Config, rules: &[ModelRule]) -> View {
+    pub(crate) fn view(&self, id: &str, cfg: &Config, pricer: &Pricer) -> View {
         let root = self.root_of(id);
         let is_sub = root != id;
-        let main = self.agent_line(id, cfg, rules);
+        let main = self.agent_line(id, cfg, pricer);
         let includes_subagents = !is_sub && cfg.include_subagents;
         let ids = if includes_subagents { self.tree(&root) } else { vec![id.to_string()] };
         let midnight = local_midnight_ms();
@@ -1449,7 +1316,7 @@ impl Engine {
         for cid in &ids {
             if let Some(conv) = self.convs.get(cid) {
                 for c in conv.calls.iter().filter(|c| c.has_usage()) {
-                    let cost = call_cost(rules, c).total();
+                    let cost = pricer.call_cost(c).total();
                     cost_conv += cost;
                     if c.at_ms >= midnight {
                         cost_conv_today += cost;
@@ -1460,12 +1327,12 @@ impl Engine {
             }
         }
         let last = self.last_call(id);
-        let cost_last = last.map(|c| call_cost(rules, c));
+        let cost_last = last.map(|c| pricer.call_cost(c));
         let last_usd = cost_last.map(|k| k.total());
         let last_costly = last_usd.is_some_and(|u| cfg.costly_call_usd > 0.0 && u >= cfg.costly_call_usd);
         let last_call_key = last.map(|c| format!("{}:{}:{}", id, main.calls, c.at_ms));
-        let last_miss = self.conv_misses(id, rules).into_iter().last().flatten();
-        let price = last.and_then(|c| price_for(rules, c)).map(|r| r.display_name.clone());
+        let last_miss = self.conv_misses(id, pricer).into_iter().last().flatten();
+        let price = last.and_then(|c| pricer.rule(&c.model)).map(|r| r.display_name.clone());
 
         let mut subs = Vec::new();
         if !is_sub {
@@ -1481,7 +1348,7 @@ impl Engine {
                 .collect();
             ids.sort_by_key(|sid| (!self.is_running(sid), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms))));
             let more = ids.len().saturating_sub(MAX_SUBS);
-            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, rules)).collect();
+            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, pricer)).collect();
             if more > 0 {
                 subs.push(AgentLine { id: format!("+{more}"), ..Default::default() });
             }
@@ -1814,16 +1681,6 @@ fn set_status(shared: &SharedRef, f: impl FnOnce(&mut Shared)) {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn price_pattern_matching_is_case_insensitive_without_allocating() {
-        use super::contains_lowercased;
-        assert!(contains_lowercased("gemini-4-neon gemini 4 neon (xhigh)", "Gemini 4 Neon"));
-        assert!(contains_lowercased("claude-opus", "OPUS"));
-        assert!(!contains_lowercased("gemini", "gemini-4"));
-        assert!(contains_lowercased("flash", ""));
-        assert!(contains_lowercased("模型 ä", "Ä"));
-    }
-
     use super::*;
     use crate::transcript::StepInfo;
 
@@ -1861,8 +1718,8 @@ mod tests {
         assert_eq!(c2.tokens.output, 120);
         assert_eq!(c2.response_id.as_deref(), Some("resp-9"));
         assert_eq!((c2.conv_id.as_str(), c2.at_ms), ("c", 9_999));
-        let rules = crate::config::default_model_rules();
-        let cost = call_cost(&rules, &c2);
+        let pricer = Pricer::new(&crate::config::default_model_rules(), None, 0);
+        let cost = pricer.call_cost(&c2);
         // 500 tokens * $5.0/M = $0.0025
         assert!((cost.cw - 0.0025).abs() < 1e-9);
     }

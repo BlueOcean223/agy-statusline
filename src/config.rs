@@ -602,11 +602,6 @@ pub fn find_cli_data_dir(app_data: &Path) -> PathBuf {
     app_data.parent().unwrap_or(app_data).join("antigravity-cli")
 }
 
-/// Returns true if any model rule has a date-tiered price transition falling inside `[lo_ms, hi_ms)`.
-pub fn any_price_cut_in(rules: &[ModelRule], lo_ms: i64, hi_ms: i64) -> bool {
-    rules.iter().any(|r| r.tiers.iter().filter_map(|t| t.until_ms).any(|u| u > lo_ms && u <= hi_ms))
-}
-
 static TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
@@ -862,10 +857,10 @@ mod tests {
 
     #[test]
     fn detects_price_cut_inside_day_window_and_backs_up_corrupt_config() {
-        let rules = default_model_rules();
+        let pricer = crate::pricing::Pricer::from_rules(default_model_rules(), 0);
         let cut = pt_midnight_ms("2026-12-01").unwrap();
-        assert!(any_price_cut_in(&rules, cut - 3_600_000, cut + 3_600_000));
-        assert!(!any_price_cut_in(&rules, cut - 86_400_000, cut - 3_600_000));
+        assert!(pricer.is_cut_day(cut - 3_600_000));
+        assert!(!pricer.is_cut_day(cut));
 
         let dir = std::env::temp_dir().join(format!("agy-cfg-corrupt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

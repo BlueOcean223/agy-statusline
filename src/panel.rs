@@ -1,8 +1,9 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
-use crate::config::{Config, OnlinePrices, effective_model_rules};
-use crate::live::{Engine, LiveCall, call_cost, now_ms};
+use crate::config::{Config, OnlinePrices};
+use crate::live::{Engine, LiveCall, now_ms};
 use crate::miss::MissSummary;
+use crate::pricing::Pricer;
 use crate::transcript::read_annotation;
 use serde_json::{Value, json};
 use std::collections::HashSet;
@@ -59,7 +60,7 @@ impl Engine {
             },
         };
         self.ensure_loaded(&id);
-        let rules = effective_model_rules(&cfg.models, online);
+        let pricer = Pricer::new(&cfg.models, online, now_ms());
         let root = self.root_of(&id);
         let is_sub = root != id;
         let summary = self.summaries.get(&id).cloned().unwrap_or_default();
@@ -86,7 +87,7 @@ impl Engine {
             cache += c.tokens.cache_read;
             cache_write += c.tokens.cache_write;
             out += c.tokens.output;
-            let k = call_cost(&rules, c);
+            let k = pricer.call_cost(c);
             c_in += k.input;
             c_cache += k.cache;
             c_cw += k.cw;
@@ -102,7 +103,7 @@ impl Engine {
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&rules);
+        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer);
 
         // Context
         let last = own.last().copied();
@@ -126,10 +127,10 @@ impl Engine {
             if d == 0 { 0.0 } else { c.tokens.cache_read as f64 / d as f64 }
         };
         let session_hit = if fresh + cache > 0 { cache as f64 / (fresh + cache) as f64 } else { 0.0 };
-        let own_misses = self.conv_misses(&id, &rules);
+        let own_misses = self.conv_misses(&id, &pricer);
         let mut miss_summary = MissSummary::default();
         for (c, m) in own.iter().zip(own_misses.iter()) {
-            miss_summary.total_usd += call_cost(&rules, c).total();
+            miss_summary.total_usd += pricer.call_cost(c).total();
             if let Some(info) = m {
                 miss_summary.add(info);
             }
@@ -168,7 +169,7 @@ impl Engine {
                         "role": s.sub_role,
                         "model": calls.last().map(|c| c.model.display.clone()),
                         "tokens": calls.iter().map(|c| c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output).sum::<u64>(),
-                        "cost": calls.iter().map(|c| call_cost(&rules, c).total()).sum::<f64>(),
+                        "cost": calls.iter().map(|c| pricer.call_cost(c).total()).sum::<f64>(),
                         "running": self.is_running(&sid),
                         "lastAt": calls.last().map(|c| c.at_ms),
                     })
@@ -187,7 +188,7 @@ impl Engine {
             .enumerate()
             .skip(turns_total.saturating_sub(TURNS_LEN))
             .map(|(idx, c)| {
-                let c_usd = call_cost(&rules, c).total();
+                let c_usd = pricer.call_cost(c).total();
                 let costly = cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd;
                 let miss = own_misses.get(idx).cloned().flatten();
                 json!({
@@ -232,7 +233,7 @@ impl Engine {
             "ctx": {
                 "used": ctx_used, "max": ctx_max, "left": ctx_left, "delta": last_delta,
                 "turnsLeft": turns_left, "series": ctx_series,
-                "compactions": self.view(&id, cfg, &rules).main.compactions,
+                "compactions": self.view(&id, cfg, &pricer).main.compactions,
             },
             "cache": {
                 "lastHit": last.map(hit), "sessionHit": session_hit, "misses": misses,

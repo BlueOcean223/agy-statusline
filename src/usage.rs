@@ -7,11 +7,12 @@
 //! - `quota-samples.json`: up to 8 days of periodic weekly quota snapshots for forecasting & replay.
 //! - `cli-index.json`: day index of `~/.gemini/antigravity-cli/conversations/*.db` files.
 
-use crate::call::{Call, DESKTOP, DedupSet, Tokens};
+use crate::call::{Call, DESKTOP, DedupSet, ModelAgg, ModelId};
 use crate::cli_usage::{CliBackfillMeta, CliSnapshot, read_cli_titles};
-use crate::config::{ModelRule, ReadFile, any_price_cut_in, read_json_keep, write_atomic};
+use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, is_uuid_db, read_calls, signature};
-use crate::miss::{MissCallInput, MissInfo, MissSummary, miss_scan};
+use crate::miss::{MissInfo, MissSummary, miss_scan};
+use crate::pricing::{DayCost, Pricer};
 pub use crate::quota::{
     CycleRecord, DayQuotaRec, QuotaBucketSample, QuotaSamplePoint, QuotaSamples, ResetEvent, note_cycle_end,
     note_quota, note_reset_event, r4, replay_from_samples, same_period,
@@ -50,14 +51,6 @@ pub fn day_start_ms(date: &str) -> Option<i64> {
     chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
         .ok()
         .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .and_then(|dt| dt.and_local_timezone(Local).earliest())
-        .map(|dt| dt.timestamp_millis())
-}
-
-pub fn day_noon_ms(date: &str) -> Option<i64> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(12, 0, 0))
         .and_then(|dt| dt.and_local_timezone(Local).earliest())
         .map(|dt| dt.timestamp_millis())
 }
@@ -116,33 +109,6 @@ pub fn account_from_user_status(v: &Value) -> Option<AccountInfo> {
     Some(AccountInfo { key: fnv1a_hex(&email.to_lowercase()), masked: mask_email(email), tier })
 }
 
-// ---------------------------------------------------------------- model pricing helper
-
-pub fn match_rule<'a>(rules: &'a [ModelRule], key: &str) -> Option<&'a ModelRule> {
-    let low = key.to_lowercase();
-    rules.iter().find(|r| !r.pattern.is_empty() && low.contains(&r.pattern.to_lowercase()))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn price_tokens(
-    rules: &[ModelRule],
-    model_key: &str,
-    input: u64,
-    cache_read: u64,
-    cache_write: u64,
-    output: u64,
-    at_ms: i64,
-    now_ms: i64,
-) -> (Option<String>, f64) {
-    let Some(r) = match_rule(rules, model_key) else {
-        return (None, 0.0);
-    };
-    let (p_in, p_cr, p_cw, p_out) = r.rates_at(at_ms, now_ms);
-    let usd =
-        (input as f64 * p_in + cache_read as f64 * p_cr + cache_write as f64 * p_cw + output as f64 * p_out) / 1e6;
-    (Some(r.short_name.clone()), usd)
-}
-
 pub fn quota_group_id(display_name: &str, window: &str) -> String {
     let low = display_name.to_lowercase();
     let prefix = if low.contains("claude") || low.contains("gpt") || low.contains("3p") || low.contains("third") {
@@ -172,41 +138,6 @@ fn model_belongs_to_group(model_name: &str, bucket_id: &str) -> bool {
 }
 
 // ---------------------------------------------------------------- on-disk history
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ModelAgg {
-    pub calls: u64,
-    pub input: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub output: u64,
-}
-
-impl ModelAgg {
-    pub fn add(&mut self, input: u64, cr: u64, cw: u64, out: u64) {
-        self.calls += 1;
-        self.input += input;
-        self.cache_read += cr;
-        self.cache_write += cw;
-        self.output += out;
-    }
-
-    pub fn add_tokens(&mut self, t: &Tokens) {
-        self.add(t.input, t.cache_read, t.cache_write, t.output);
-    }
-
-    pub fn merge_from(&mut self, other: &ModelAgg) {
-        self.calls += other.calls;
-        self.input += other.input;
-        self.cache_read += other.cache_read;
-        self.cache_write += other.cache_write;
-        self.output += other.output;
-    }
-
-    pub fn total_tokens(&self) -> u64 {
-        self.input + self.cache_read + self.cache_write + self.output
-    }
-}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DayRecord {
@@ -848,8 +779,7 @@ fn analyze_day_calls_with_miss(
     day_cache: &mut DayCallCache,
     date: &str,
     live_calls: &[Call],
-    rules: &[ModelRule],
-    now_ms: i64,
+    pricer: &Pricer,
 ) -> (Vec<AnalyzedCall>, MissSummary) {
     let target_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, date, live_calls).to_vec();
     if target_calls.is_empty() {
@@ -878,51 +808,11 @@ fn analyze_day_calls_with_miss(
     for ((src, cid), mut list) in by_conv {
         list.sort_by_key(|c| (c.at_ms, c.step().unwrap_or(0)));
         let markers = if src == "desktop" { scan_step_markers(app_data, &cid) } else { None };
-        let mut inputs = Vec::with_capacity(list.len());
-        let mut priced = Vec::with_capacity(list.len());
-
-        for c in &list {
-            let price_key = c.model.price_key();
-            if let Some(r) = match_rule(rules, &price_key) {
-                let (p_in, p_cr, p_cw, p_out) = r.rates_at(c.at_ms, now_ms);
-                let usd = (c.tokens.input as f64 * p_in
-                    + c.tokens.cache_read as f64 * p_cr
-                    + c.tokens.cache_write as f64 * p_cw
-                    + c.tokens.output as f64 * p_out)
-                    / 1e6;
-                inputs.push(MissCallInput {
-                    at_ms: c.at_ms,
-                    ttft_ms: c.ttft_ms,
-                    stream_ms: c.stream_ms,
-                    step: c.step(),
-                    model_name: Some(r.short_name.clone()),
-                    input: c.tokens.input,
-                    cache_read: c.tokens.cache_read,
-                    cache_write: c.tokens.cache_write,
-                    p_in,
-                    p_cache: p_cr,
-                    p_cw,
-                });
-                priced.push((Some(r.short_name.clone()), usd));
-            } else {
-                inputs.push(MissCallInput {
-                    at_ms: c.at_ms,
-                    ttft_ms: c.ttft_ms,
-                    stream_ms: c.stream_ms,
-                    step: c.step(),
-                    model_name: None,
-                    input: c.tokens.input,
-                    cache_read: c.tokens.cache_read,
-                    cache_write: c.tokens.cache_write,
-                    p_in: 0.0,
-                    p_cache: 0.0,
-                    p_cw: 0.0,
-                });
-                priced.push((None, 0.0));
-            }
-        }
-
-        let misses = miss_scan(&inputs, markers.as_ref());
+        let misses = miss_scan(&list, pricer, markers.as_ref());
+        let priced: Vec<(Option<String>, f64)> = list
+            .iter()
+            .map(|c| (pricer.rule(&c.model).map(|r| r.short_name.clone()), pricer.call_cost(c).total()))
+            .collect();
         for ((c, (short_opt, usd)), miss_opt) in list.into_iter().zip(priced).zip(misses) {
             if local_day_str(c.at_ms) != date {
                 continue;
@@ -955,12 +845,12 @@ fn cycle_spend(
     bucket_id: &str,
     from_ms: i64,
     to_ms: i64,
-    rules: &[ModelRule],
-    now_ms: i64,
+    pricer: &Pricer,
 ) -> (f64, u64, bool) {
     if to_ms <= from_ms {
         return (0.0, 0, false);
     }
+    let in_group = |c: &&Call| model_belongs_to_group(&c.model.price_key(), bucket_id);
     let start_day = local_day_str(from_ms);
     let end_day = local_day_str(to_ms.saturating_sub(1).max(from_ms));
     let mut usd = 0.0;
@@ -977,51 +867,20 @@ fn cycle_spend(
         let day_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, bd, live_calls);
         if !day_calls.is_empty() {
             any_exact_boundary = true;
-            for c in day_calls.iter().filter(|c| c.at_ms >= from_ms && c.at_ms < to_ms) {
-                let price_key = c.model.price_key();
-                if !model_belongs_to_group(&price_key, bucket_id) {
-                    continue;
-                }
-                let (_, u) = price_tokens(
-                    rules,
-                    &price_key,
-                    c.tokens.input,
-                    c.tokens.cache_read,
-                    c.tokens.cache_write,
-                    c.tokens.output,
-                    c.at_ms,
-                    now_ms,
-                );
-                usd += u;
-                tokens += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
+            for c in day_calls.iter().filter(|c| c.at_ms >= from_ms && c.at_ms < to_ms).filter(in_group) {
+                usd += pricer.call_cost(c).total();
+                tokens += c.tokens.total();
             }
-        } else if let Some(drec) = h.days.get(bd) {
-            let group_has_persisted = drec
-                .raw
-                .iter()
-                .chain(drec.cli_raw.iter())
-                .any(|(m, a)| a.calls > 0 && model_belongs_to_group(m, bucket_id));
-            if group_has_persisted {
+        } else if let Some(drec) = h.days.get(bd)
+            && let Some(d_start) = day_start_ms(bd)
+        {
+            let aggs: Vec<_> = group_aggregates(drec, bucket_id).collect();
+            if aggs.iter().any(|(_, a)| a.calls > 0) {
                 // Boundary day had usage in persisted summary but no raw call details: whole-day fallback.
                 all_boundaries_exact = false;
-                let noon = day_noon_ms(bd).unwrap_or(now_ms);
-                for (model, agg) in drec.raw.iter().chain(drec.cli_raw.iter()) {
-                    if !model_belongs_to_group(model, bucket_id) {
-                        continue;
-                    }
-                    let (_, u) = price_tokens(
-                        rules,
-                        model,
-                        agg.input,
-                        agg.cache_read,
-                        agg.cache_write,
-                        agg.output,
-                        noon,
-                        now_ms,
-                    );
-                    usd += u;
-                    tokens += agg.total_tokens();
-                }
+                let (u, t) = day_sum(&pricer.price_day(aggs, None, d_start));
+                usd += u;
+                tokens += t;
             }
         }
     }
@@ -1031,19 +890,30 @@ fn cycle_spend(
         if dk == &start_day || dk == &end_day {
             continue;
         }
-        let noon = day_noon_ms(dk).unwrap_or(now_ms);
-        for (model, agg) in drec.raw.iter().chain(drec.cli_raw.iter()) {
-            if !model_belongs_to_group(model, bucket_id) {
-                continue;
-            }
-            let (_, u) =
-                price_tokens(rules, model, agg.input, agg.cache_read, agg.cache_write, agg.output, noon, now_ms);
-            usd += u;
-            tokens += agg.total_tokens();
-        }
+        let Some(d_start) = day_start_ms(dk) else { continue };
+        let exact: Option<Vec<Call>> = pricer.is_cut_day(d_start).then(|| {
+            let day_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls);
+            day_calls.iter().filter(in_group).cloned().collect()
+        });
+        let (u, t) = day_sum(&pricer.price_day(group_aggregates(drec, bucket_id), exact.as_deref(), d_start));
+        usd += u;
+        tokens += t;
     }
 
     (usd, tokens, all_boundaries_exact && (any_exact_boundary || usd > 0.0))
+}
+
+/// A day's desktop and CLI aggregates for models in quota group `bucket_id`.
+fn group_aggregates<'a>(drec: &'a DayRecord, bucket_id: &'a str) -> impl Iterator<Item = (&'a String, &'a ModelAgg)> {
+    drec.raw
+        .iter()
+        .chain(drec.cli_raw.iter())
+        .filter(move |(key, _)| model_belongs_to_group(&ModelId::from_bucket_key(key).price_key(), bucket_id))
+}
+
+/// USD and tokens of a priced day.
+fn day_sum(day: &DayCost) -> (f64, u64) {
+    day.values().fold((0.0, 0), |(u, t), (usd, agg)| (u + usd, t + agg.total_tokens()))
 }
 
 // ---------------------------------------------------------------- API views
@@ -1059,9 +929,8 @@ pub fn build_usage_view(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     live_calls: &[Call],
-    rules: &[ModelRule],
+    pricer: &Pricer,
     now_ms: i64,
-    price_source: &str,
 ) -> Value {
     let mut day_cache = DayCallCache::default();
     let is_all = span_req.eq_ignore_ascii_case("all");
@@ -1113,10 +982,9 @@ pub fn build_usage_view(
 
     for dk in &date_keys {
         let d_start = day_start_ms(dk).unwrap_or(now_ms);
-        let d_noon = day_noon_ms(dk).unwrap_or(now_ms);
         let rec = h.days.get(dk);
 
-        let mut by_model: BTreeMap<String, (f64, ModelAgg)> = BTreeMap::new();
+        let mut by_model = DayCost::new();
         let mut day_usd = 0.0;
         let mut day_in = 0u64;
         let mut day_cr = 0u64;
@@ -1127,98 +995,21 @@ pub fn build_usage_view(
 
         if let Some(r) = rec {
             let persisted_cli_calls: u64 = r.cli_raw.values().map(|a| a.calls).sum();
-            if any_price_cut_in(rules, d_start, d_start + 86_400_000) {
-                // On price-transition days, price surviving detail calls at their exact timestamps
-                // while preserving any remaining persisted counts/tokens (e.g. from deleted DBs).
-                let mut persisted_by_label: BTreeMap<String, (String, ModelAgg)> = BTreeMap::new();
-                for (raw_name, agg) in r.raw.iter().chain(r.cli_raw.iter()) {
-                    let label = match_rule(rules, raw_name)
-                        .map(|rule| rule.short_name.clone())
-                        .unwrap_or_else(|| "Other".to_string());
-                    let entry =
-                        persisted_by_label.entry(label).or_insert_with(|| (raw_name.clone(), ModelAgg::default()));
-                    entry.1.merge_from(agg);
-                }
-
-                let exact_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls);
-                let mut exact_by_label: BTreeMap<String, (f64, ModelAgg)> = BTreeMap::new();
-                let mut exact_cli_calls = 0u64;
-                for c in exact_calls {
-                    let price_key = c.model.price_key();
-                    let (short_opt, usd) = price_tokens(
-                        rules,
-                        &price_key,
-                        c.tokens.input,
-                        c.tokens.cache_read,
-                        c.tokens.cache_write,
-                        c.tokens.output,
-                        c.at_ms,
-                        now_ms,
-                    );
-                    let label = short_opt.unwrap_or_else(|| "Other".to_string());
-                    let entry = exact_by_label.entry(label).or_default();
-                    entry.0 += usd;
-                    entry.1.add(c.tokens.input, c.tokens.cache_read, c.tokens.cache_write, c.tokens.output);
-                    if c.source == "cli" {
-                        exact_cli_calls += 1;
-                    }
-                }
-
-                let mut labels: HashSet<String> = persisted_by_label.keys().cloned().collect();
-                labels.extend(exact_by_label.keys().cloned());
-                for label in labels {
-                    let (mut usd, mut agg) = exact_by_label.remove(&label).unwrap_or_default();
-                    if let Some((raw_name, p_agg)) = persisted_by_label.remove(&label) {
-                        let rem_calls = p_agg.calls.saturating_sub(agg.calls);
-                        let rem_in = p_agg.input.saturating_sub(agg.input);
-                        let rem_cr = p_agg.cache_read.saturating_sub(agg.cache_read);
-                        let rem_cw = p_agg.cache_write.saturating_sub(agg.cache_write);
-                        let rem_out = p_agg.output.saturating_sub(agg.output);
-                        if rem_calls > 0 || rem_in > 0 || rem_cr > 0 || rem_cw > 0 || rem_out > 0 {
-                            let (_, rem_usd) =
-                                price_tokens(rules, &raw_name, rem_in, rem_cr, rem_cw, rem_out, d_noon, now_ms);
-                            usd += rem_usd;
-                            agg.calls += rem_calls;
-                            agg.input += rem_in;
-                            agg.cache_read += rem_cr;
-                            agg.cache_write += rem_cw;
-                            agg.output += rem_out;
-                        }
-                    }
-                    day_usd += usd;
-                    day_in += agg.input;
-                    day_cr += agg.cache_read;
-                    day_cw += agg.cache_write;
-                    day_out += agg.output;
-                    day_calls += agg.calls;
-                    by_model.insert(label, (usd, agg));
-                }
-                day_cli_calls = exact_cli_calls.max(persisted_cli_calls);
-            } else {
-                for (raw_name, agg) in r.raw.iter().chain(r.cli_raw.iter()) {
-                    let (short_opt, usd) = price_tokens(
-                        rules,
-                        raw_name,
-                        agg.input,
-                        agg.cache_read,
-                        agg.cache_write,
-                        agg.output,
-                        d_noon,
-                        now_ms,
-                    );
-                    let label = short_opt.unwrap_or_else(|| "Other".to_string());
-                    let entry = by_model.entry(label).or_default();
-                    entry.0 += usd;
-                    entry.1.merge_from(agg);
-                    day_usd += usd;
-                    day_in += agg.input;
-                    day_cr += agg.cache_read;
-                    day_cw += agg.cache_write;
-                    day_out += agg.output;
-                    day_calls += agg.calls;
-                }
-                day_cli_calls = persisted_cli_calls;
+            // On price-cut days, the calls still on disk are priced at their own time.
+            let exact: Option<Vec<Call>> = pricer
+                .is_cut_day(d_start)
+                .then(|| day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls).to_vec());
+            let exact_cli_calls = exact.iter().flatten().filter(|c| c.source == crate::call::CLI).count() as u64;
+            by_model = pricer.price_day(r.raw.iter().chain(r.cli_raw.iter()), exact.as_deref(), d_start);
+            for (usd, agg) in by_model.values() {
+                day_usd += usd;
+                day_in += agg.input;
+                day_cr += agg.cache_read;
+                day_cw += agg.cache_write;
+                day_out += agg.output;
+                day_calls += agg.calls;
             }
+            day_cli_calls = exact_cli_calls.max(persisted_cli_calls);
             if day_cli_calls > 0 {
                 has_cli = true;
             }
@@ -1331,24 +1122,15 @@ pub fn build_usage_view(
                 cli,
                 &mut day_cache,
                 live_calls,
-                rules,
+                pricer,
                 now_ms,
             )
         })
         .unwrap_or_default();
 
     // Today's cache-miss summary across desktop + CLI calls (including cross-midnight baseline).
-    let (_, miss_today) = analyze_day_calls_with_miss(
-        app_data,
-        cli_dir,
-        plugin_data,
-        cli,
-        &mut day_cache,
-        &today,
-        live_calls,
-        rules,
-        now_ms,
-    );
+    let (_, miss_today) =
+        analyze_day_calls_with_miss(app_data, cli_dir, plugin_data, cli, &mut day_cache, &today, live_calls, pricer);
 
     json!({
         "span": if is_all { json!("all") } else { json!(span_days) },
@@ -1368,7 +1150,7 @@ pub fn build_usage_view(
         "resets": acct_resets,
         "account": account,
         "forecasts": forecasts,
-        "priceSource": price_source,
+        "priceSource": pricer.source(),
         "backfill": h.bf,
     })
 }
@@ -1384,7 +1166,7 @@ fn weekly_forecasts(
     cli: &mut CliSnapshot,
     day_cache: &mut DayCallCache,
     live_calls: &[Call],
-    rules: &[ModelRule],
+    pricer: &Pricer,
     now_ms: i64,
 ) -> Vec<Value> {
     let Some(list) = samples.by_acct.get(acct_key) else { return Vec::new() };
@@ -1435,20 +1217,8 @@ fn weekly_forecasts(
             .find(|r| r.acct_key == acct_key && r.bucket_id == bid && (r.at_ms - start_ms).abs() < 12 * 3_600_000)
             .cloned();
 
-        let (cycle_usd, cycle_tokens, cap_exact) = cycle_spend(
-            h,
-            app_data,
-            cli_dir,
-            plugin_data,
-            cli,
-            day_cache,
-            live_calls,
-            bid,
-            start_ms,
-            now_ms,
-            rules,
-            now_ms,
-        );
+        let (cycle_usd, cycle_tokens, cap_exact) =
+            cycle_spend(h, app_data, cli_dir, plugin_data, cli, day_cache, live_calls, bid, start_ms, now_ms, pricer);
         let cap_usd = (last.used >= 0.005 && cycle_usd > 0.0).then(|| (cycle_usd / last.used).round());
         let cap_tokens = (last.used >= 0.005 && cycle_tokens > 0).then(|| (cycle_tokens as f64 / last.used) as u64);
 
@@ -1471,8 +1241,7 @@ fn weekly_forecasts(
                     bid,
                     c.start_ms,
                     c.end_ms,
-                    rules,
-                    now_ms,
+                    pricer,
                 );
                 let p_cap_usd = (c.used >= 0.005 && p_usd > 0.0).then(|| (p_usd / c.used).round());
                 let p_cap_tok = (c.used >= 0.005 && p_tok > 0).then(|| (p_tok as f64 / c.used) as u64);
@@ -1531,24 +1300,14 @@ pub fn build_day_calls_view(
     cli: &mut CliSnapshot,
     date: &str,
     live_calls: &[Call],
-    rules: &[ModelRule],
-    now_ms: i64,
+    pricer: &Pricer,
     costly_threshold: f64,
     limit: usize,
 ) -> Value {
     let mut day_cache = DayCallCache::default();
     let cli_titles = read_cli_titles(cli_dir);
-    let (analyzed, miss_summary) = analyze_day_calls_with_miss(
-        app_data,
-        cli_dir,
-        plugin_data,
-        cli,
-        &mut day_cache,
-        date,
-        live_calls,
-        rules,
-        now_ms,
-    );
+    let (analyzed, miss_summary) =
+        analyze_day_calls_with_miss(app_data, cli_dir, plugin_data, cli, &mut day_cache, date, live_calls, pricer);
 
     let mut titles: HashMap<(&'static str, String), String> = HashMap::new();
     let mut tot_usd = 0.0;
@@ -1737,7 +1496,8 @@ pub fn build_day_calls_view(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::call::ModelId;
+    use crate::call::{ModelId, Tokens};
+    use crate::config::ModelRule;
 
     #[test]
     fn masks_emails_and_hashes_deterministically() {
@@ -1876,9 +1636,8 @@ mod tests {
             &root,
             &mut cli,
             &live,
-            &rules,
+            &Pricer::from_rules(rules, cut_ms + 7_200_000),
             cut_ms + 7_200_000,
-            "bundled",
         );
         assert_eq!(view["today"]["calls"], 2, "must preserve persisted call count");
         assert_eq!(view["today"]["tokens"], 100_000, "must preserve persisted tokens");
@@ -1888,11 +1647,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// On a price-cut day, persisted rows are labelled by matching the raw model name alone,
-    /// while exact calls are labelled by matching "raw display". When the two pick different
-    /// rules, the remainder subtraction never meets and the same call is counted twice.
+    /// On a price-cut day, persisted rows and exact calls must get the same label, or the
+    /// remainder subtraction never meets and the same call is counted twice. Here the raw name
+    /// alone would match "orchestrator" (Carbon) while raw+display matches "hydrogen" (ADR 0001).
     #[test]
-    #[ignore = "known bug: price-cut day double counts when raw and raw+display match different rules; fixed by the Pricer refactor (ADR 0001)"]
     fn transition_day_counts_call_once_when_raw_and_display_match_different_rules() {
         let root = std::env::temp_dir().join(format!("agy-trans-label-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -1931,13 +1689,13 @@ mod tests {
         // Same order as the built-in rules: "hydrogen" is checked before the generic "orchestrator".
         let rules = vec![rule("hydrogen", "Hydrogen"), rule("orchestrator", "Carbon")];
 
-        // One call, persisted under its raw model name (as `model_bucket_key` stores it)...
+        let model = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
+        // One call, persisted under its model identity...
         let mut h = UsageHistory { v: 2, live_from: today.clone(), writable: true, ..Default::default() };
         let mut day_rec = DayRecord::default();
-        day_rec.raw.insert(
-            "orchestrator-exec".into(),
-            ModelAgg { calls: 1, input: 50_000, cache_read: 0, cache_write: 0, output: 0 },
-        );
+        day_rec
+            .raw
+            .insert(model.bucket_key(), ModelAgg { calls: 1, input: 50_000, cache_read: 0, cache_write: 0, output: 0 });
         h.days.insert(today.clone(), day_rec);
 
         // ...and the same call still available as an exact record.
@@ -1946,7 +1704,7 @@ mod tests {
             source: "desktop",
             at_ms: cut_ms + 3_600_000,
             steps: vec![1],
-            model: ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)"),
+            model,
             tokens: Tokens { input: 50_000, ..Default::default() },
             response_id: Some("resp-1".into()),
             ..Default::default()
@@ -1962,9 +1720,8 @@ mod tests {
             &root,
             &mut cli,
             &live,
-            &rules,
+            &Pricer::from_rules(rules, cut_ms + 7_200_000),
             cut_ms + 7_200_000,
-            "bundled",
         );
         let _ = fs::remove_dir_all(&root);
         assert_eq!(view["today"]["calls"], 1, "one call must be counted once");
@@ -2010,8 +1767,17 @@ mod tests {
         ];
 
         let mut cli = CliSnapshot::default();
-        let out =
-            build_day_calls_view(&root, &root, &root, &mut cli, day2, &live, &rules, midnight + 600_000, 0.50, 600);
+        let out = build_day_calls_view(
+            &root,
+            &root,
+            &root,
+            &mut cli,
+            day2,
+            &live,
+            &Pricer::from_rules(rules, midnight + 600_000),
+            0.50,
+            600,
+        );
         assert_eq!(out["totalCalls"], 1, "only day2 calls should be returned");
         assert_eq!(out["missSummary"]["count"], 1, "cross-midnight first call must be counted as cache miss");
         assert!(out["calls"][0]["miss"].is_object());
@@ -2151,8 +1917,7 @@ mod tests {
             "gemini-weekly",
             from_ms,
             to_ms,
-            &rules,
-            to_ms,
+            &Pricer::from_rules(rules, to_ms),
         );
         assert!(usd > 0.0);
         assert!(!exact, "capExact must be false when start_day fell back to whole-day summary");

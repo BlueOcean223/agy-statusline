@@ -5,6 +5,8 @@
 //! rates instead of cache-read rates, records the wasted USD and attributes one of 6 causes:
 //! `model` | `compact` | `user` | `turn` | `wait` | `other`.
 
+use crate::call::Call;
+use crate::pricing::Pricer;
 use crate::transcript::StepMarkers;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -46,22 +48,41 @@ pub struct MissInfo {
     pub from_model: String,
 }
 
-/// Input tuple describing one chronologically-ordered call in a single conversation.
-#[derive(Clone, Debug)]
-pub struct MissCallInput {
-    pub at_ms: i64,
-    pub ttft_ms: Option<f64>,
-    pub stream_ms: Option<f64>,
-    pub step: Option<u64>,
-    /// Matched pricing group name (`None` when the model has no price rule).
-    pub model_name: Option<String>,
-    pub input: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub p_in: f64,
-    pub p_cache: f64,
+/// One call as the scan sees it: priced, in conversation order.
+struct Input {
+    at_ms: i64,
+    ttft_ms: Option<f64>,
+    stream_ms: Option<f64>,
+    step: Option<u64>,
+    /// Matched rule's short name (`None` when no rule prices the model).
+    model_name: Option<String>,
+    input: u64,
+    cache_read: u64,
+    cache_write: u64,
+    p_in: f64,
+    p_cache: f64,
     /// Cache-write USD/1M rate (equals `p_in` for models without separate cache-write billing).
-    pub p_cw: f64,
+    p_cw: f64,
+}
+
+impl Input {
+    fn new(c: &Call, pricer: &Pricer) -> Self {
+        let priced = pricer.rates(&c.model, c.at_ms);
+        let p = priced.map(|(_, p)| p).unwrap_or_default();
+        Self {
+            at_ms: c.at_ms,
+            ttft_ms: c.ttft_ms,
+            stream_ms: c.stream_ms,
+            step: c.step(),
+            model_name: priced.map(|(r, _)| r.short_name.clone()),
+            input: c.tokens.input,
+            cache_read: c.tokens.cache_read,
+            cache_write: c.tokens.cache_write,
+            p_in: p.input,
+            p_cache: p.cache_read,
+            p_cw: p.cache_write,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -105,7 +126,12 @@ fn has_step_between(set: &std::collections::HashSet<u64>, a: Option<u64>, b: Opt
 
 /// Scans chronologically ordered calls of a single conversation and returns per-call `MissInfo`.
 /// Pass `markers = None` for CLI conversations where step types are not available (pauses → `wait`).
-pub fn miss_scan(list: &[MissCallInput], markers: Option<&StepMarkers>) -> Vec<Option<MissInfo>> {
+pub fn miss_scan<'a>(
+    calls: impl IntoIterator<Item = &'a Call>,
+    pricer: &Pricer,
+    markers: Option<&StepMarkers>,
+) -> Vec<Option<MissInfo>> {
+    let list: Vec<Input> = calls.into_iter().map(|c| Input::new(c, pricer)).collect();
     let mut out = vec![None; list.len()];
     let mut last_by_model: HashMap<String, usize> = HashMap::new();
     let mut last_big: Option<usize> = None;
@@ -173,44 +199,49 @@ pub fn miss_scan(list: &[MissCallInput], markers: Option<&StepMarkers>) -> Vec<O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call::{ModelId, Tokens};
     use std::collections::HashSet;
 
-    fn gem(at_s: i64, inp: u64, cr: u64, dur_s: f64, step: Option<u64>) -> MissCallInput {
-        MissCallInput {
+    fn pricer() -> Pricer {
+        let rule = |pattern: &str, short: &str, inp, cache, cw| crate::config::ModelRule {
+            pattern: pattern.into(),
+            short_name: short.into(),
+            input_per_m: inp,
+            cache_read_per_m: cache,
+            cache_write_per_m: cw,
+            ..Default::default()
+        };
+        Pricer::from_rules(vec![rule("carbon", "Carbon", 4.0, 0.4, 0.0), rule("opus", "Opus 5.5", 5.0, 0.5, 6.25)], 0)
+    }
+
+    fn call(model: &str, at_s: i64, t: Tokens, dur_s: Option<f64>, step: Option<u64>) -> Call {
+        Call {
+            model: ModelId::new(model, ""),
+            tokens: t,
             at_ms: at_s * 1000,
-            ttft_ms: Some(dur_s * 500.0),
-            stream_ms: Some(dur_s * 500.0),
-            step,
-            model_name: Some("Carbon".into()),
-            input: inp,
-            cache_read: cr,
-            cache_write: 0,
-            p_in: 4.0,
-            p_cache: 0.4,
-            p_cw: 4.0,
+            ttft_ms: dur_s.map(|d| d * 500.0),
+            stream_ms: dur_s.map(|d| d * 500.0),
+            steps: step.into_iter().collect(),
+            ..Default::default()
         }
     }
 
-    fn cla(at_s: i64, inp: u64, cr: u64, cw: u64, step: Option<u64>) -> MissCallInput {
-        MissCallInput {
-            at_ms: at_s * 1000,
-            ttft_ms: None,
-            stream_ms: None,
-            step,
-            model_name: Some("Opus 5.5".into()),
-            input: inp,
-            cache_read: cr,
-            cache_write: cw,
-            p_in: 5.0,
-            p_cache: 0.5,
-            p_cw: 6.25,
-        }
+    fn gem(at_s: i64, input: u64, cache_read: u64, dur_s: f64, step: Option<u64>) -> Call {
+        call("gemini-4-carbon", at_s, Tokens { input, cache_read, ..Default::default() }, Some(dur_s), step)
+    }
+
+    fn cla(at_s: i64, input: u64, cache_read: u64, cache_write: u64, step: Option<u64>) -> Call {
+        call("claude-opus-5-5", at_s, Tokens { input, cache_read, cache_write, output: 0 }, None, step)
+    }
+
+    fn scan(list: &[Call], markers: Option<&StepMarkers>) -> Vec<Option<MissInfo>> {
+        miss_scan(list, &pricer(), markers)
     }
 
     #[test]
     fn cache_hit_is_not_flagged() {
         let m = StepMarkers::default();
-        let r = miss_scan(&[gem(0, 300_000, 0, 0.0, Some(1)), gem(20, 5_000, 300_000, 0.0, Some(2))], Some(&m));
+        let r = scan(&[gem(0, 300_000, 0, 0.0, Some(1)), gem(20, 5_000, 300_000, 0.0, Some(2))], Some(&m));
         assert!(r[0].is_none() && r[1].is_none());
     }
 
@@ -219,7 +250,7 @@ mod tests {
         let list = [gem(0, 300_000, 0, 0.0, Some(1)), gem(400, 310_000, 0, 0.0, Some(5))];
         let mut mu = StepMarkers::default();
         mu.user.insert(3);
-        let u = miss_scan(&list, Some(&mu))[1].clone().unwrap();
+        let u = scan(&list, Some(&mu))[1].clone().unwrap();
         assert_eq!(u.cause, MissCause::User);
         assert_eq!(u.tok, 300_000);
         assert!((u.usd - 1.08).abs() < 1e-4);
@@ -227,18 +258,18 @@ mod tests {
         assert_eq!(u.from_model, "Carbon");
 
         let empty = StepMarkers::default();
-        assert_eq!(miss_scan(&list, Some(&empty))[1].as_ref().unwrap().cause, MissCause::Turn);
+        assert_eq!(scan(&list, Some(&empty))[1].as_ref().unwrap().cause, MissCause::Turn);
 
         let mut after = StepMarkers::default();
         after.user.insert(7);
-        assert_eq!(miss_scan(&list, Some(&after))[1].as_ref().unwrap().cause, MissCause::Turn);
+        assert_eq!(scan(&list, Some(&after))[1].as_ref().unwrap().cause, MissCause::Turn);
 
-        assert_eq!(miss_scan(&list, None)[1].as_ref().unwrap().cause, MissCause::Wait);
+        assert_eq!(scan(&list, None)[1].as_ref().unwrap().cause, MissCause::Wait);
     }
 
     #[test]
     fn idle_subtracts_previous_call_duration() {
-        let r = miss_scan(&[gem(0, 200_000, 0, 50.0, None), gem(90, 210_000, 0, 0.0, None)], None);
+        let r = scan(&[gem(0, 200_000, 0, 50.0, None), gem(90, 210_000, 0, 0.0, None)], None);
         let m = r[1].as_ref().unwrap();
         assert_eq!(m.cause, MissCause::Other);
         assert_eq!(m.idle_ms, 40_000);
@@ -247,10 +278,10 @@ mod tests {
     #[test]
     fn compaction_detected_by_checkpoint_step_or_prompt_drop() {
         let m = StepMarkers { user: HashSet::new(), ckpt: HashSet::from([4]) };
-        let a = miss_scan(&[gem(0, 400_000, 0, 0.0, Some(1)), gem(30, 380_000, 0, 0.0, Some(9))], Some(&m));
+        let a = scan(&[gem(0, 400_000, 0, 0.0, Some(1)), gem(30, 380_000, 0, 0.0, Some(9))], Some(&m));
         assert_eq!(a[1].as_ref().unwrap().cause, MissCause::Compact);
 
-        let b = miss_scan(&[gem(0, 400_000, 0, 0.0, None), gem(30, 100_000, 0, 0.0, None)], None);
+        let b = scan(&[gem(0, 400_000, 0, 0.0, None), gem(30, 100_000, 0, 0.0, None)], None);
         assert_eq!(b[1].as_ref().unwrap().cause, MissCause::Compact);
         assert_eq!(b[1].as_ref().unwrap().tok, 100_000);
     }
@@ -258,13 +289,13 @@ mod tests {
     #[test]
     fn model_switch_uses_cache_write_rate_and_remembers_previous_model() {
         let m = StepMarkers::default();
-        let r = miss_scan(&[gem(0, 300_000, 0, 0.0, Some(1)), cla(10, 0, 0, 300_000, Some(2))], Some(&m));
+        let r = scan(&[gem(0, 300_000, 0, 0.0, Some(1)), cla(10, 0, 0, 300_000, Some(2))], Some(&m));
         let info = r[1].as_ref().unwrap();
         assert_eq!(info.cause, MissCause::Model);
         assert_eq!(info.from_model, "Carbon");
         assert!((info.usd - 300_000.0 * (6.25 - 0.5) / 1e6).abs() < 1e-4);
 
-        let back = miss_scan(
+        let back = scan(
             &[gem(0, 300_000, 0, 0.0, Some(1)), cla(10, 0, 0, 300_000, Some(2)), gem(20, 5_000, 300_000, 0.0, Some(3))],
             Some(&m),
         );
@@ -273,20 +304,18 @@ mod tests {
 
     #[test]
     fn small_misses_and_unpriced_calls_are_ignored() {
-        let r = miss_scan(&[gem(0, 50_000, 0, 0.0, None), gem(10, 15_000, 40_000, 0.0, None)], None);
+        let r = scan(&[gem(0, 50_000, 0, 0.0, None), gem(10, 15_000, 40_000, 0.0, None)], None);
         assert!(r[1].is_none());
 
-        let r2 = miss_scan(
-            &[gem(0, 300_000, 0, 0.0, None), gem(5, 5_000, 0, 0.0, None), gem(400, 310_000, 0, 0.0, None)],
-            None,
-        );
+        let r2 =
+            scan(&[gem(0, 300_000, 0, 0.0, None), gem(5, 5_000, 0, 0.0, None), gem(400, 310_000, 0, 0.0, None)], None);
         assert!(r2[1].is_none());
         assert_eq!(r2[2].as_ref().unwrap().tok, 300_000);
         assert_eq!(r2[2].as_ref().unwrap().cause, MissCause::Wait);
 
         let mut unpriced = gem(10, 300_000, 0, 0.0, None);
-        unpriced.model_name = None;
-        let r3 = miss_scan(&[gem(0, 300_000, 0, 0.0, None), unpriced, gem(20, 5_000, 300_000, 0.0, None)], None);
+        unpriced.model = ModelId::new("mystery", "");
+        let r3 = scan(&[gem(0, 300_000, 0, 0.0, None), unpriced, gem(20, 5_000, 300_000, 0.0, None)], None);
         assert!(r3.iter().all(Option::is_none));
     }
 }
