@@ -1888,6 +1888,89 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// On a price-cut day, persisted rows are labelled by matching the raw model name alone,
+    /// while exact calls are labelled by matching "raw display". When the two pick different
+    /// rules, the remainder subtraction never meets and the same call is counted twice.
+    #[test]
+    #[ignore = "known bug: price-cut day double counts when raw and raw+display match different rules; fixed by the Pricer refactor (ADR 0001)"]
+    fn transition_day_counts_call_once_when_raw_and_display_match_different_rules() {
+        let root = std::env::temp_dir().join(format!("agy-trans-label-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let today = today_str();
+        let d_start = day_start_ms(&today).unwrap();
+        let cut_ms = d_start + 16 * 3_600_000;
+        let rule = |pattern: &str, short: &str| ModelRule {
+            pattern: pattern.into(),
+            display_name: format!("Gemini 4 {short}"),
+            short_name: short.into(),
+            context_limit: 1_000_000,
+            input_per_m: 2.0,
+            cache_read_per_m: 0.1,
+            cache_write_per_m: 0.0,
+            output_per_m: 10.0,
+            online_key: String::new(),
+            tiers: vec![
+                crate::config::PriceTier {
+                    until_ms: Some(cut_ms),
+                    input_per_m: 2.0,
+                    cache_read_per_m: 0.1,
+                    cache_write_per_m: 0.0,
+                    output_per_m: 10.0,
+                },
+                crate::config::PriceTier {
+                    until_ms: None,
+                    input_per_m: 4.0,
+                    cache_read_per_m: 0.2,
+                    cache_write_per_m: 0.0,
+                    output_per_m: 20.0,
+                },
+            ],
+        };
+        // Same order as the built-in rules: "hydrogen" is checked before the generic "orchestrator".
+        let rules = vec![rule("hydrogen", "Hydrogen"), rule("orchestrator", "Carbon")];
+
+        // One call, persisted under its raw model name (as `model_bucket_key` stores it)...
+        let mut h = UsageHistory { v: 2, live_from: today.clone(), writable: true, ..Default::default() };
+        let mut day_rec = DayRecord::default();
+        day_rec.raw.insert(
+            "orchestrator-exec".into(),
+            ModelAgg { calls: 1, input: 50_000, cache_read: 0, cache_write: 0, output: 0 },
+        );
+        h.days.insert(today.clone(), day_rec);
+
+        // ...and the same call still available as an exact record.
+        let live = vec![Call {
+            conv_id: "00000000-0000-4000-8000-000000000002".into(),
+            source: "desktop",
+            at_ms: cut_ms + 3_600_000,
+            steps: vec![1],
+            model: ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)"),
+            tokens: Tokens { input: 50_000, ..Default::default() },
+            response_id: Some("resp-1".into()),
+            ..Default::default()
+        }];
+
+        let mut cli = CliSnapshot::default();
+        let view = build_usage_view(
+            &h,
+            &QuotaSamples::default(),
+            "7",
+            &root,
+            &root,
+            &root,
+            &mut cli,
+            &live,
+            &rules,
+            cut_ms + 7_200_000,
+            "bundled",
+        );
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(view["today"]["calls"], 1, "one call must be counted once");
+        assert_eq!(view["today"]["tokens"], 50_000, "one call's tokens must be counted once");
+    }
+
     #[test]
     fn cross_midnight_first_call_detects_cache_miss_from_previous_day_baseline() {
         let root = std::env::temp_dir().join(format!("agy-midnight-miss-{}", std::process::id()));
