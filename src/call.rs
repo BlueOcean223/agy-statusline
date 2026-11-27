@@ -249,6 +249,14 @@ mod tests {
     }
 
     #[test]
+    fn cache_hit_is_none_without_a_prompt() {
+        let t = |input, cache_read, output| Tokens { input, cache_read, output, ..Default::default() };
+        assert_eq!(t(0, 0, 50).cache_hit(), None, "output only: nothing to hit");
+        assert_eq!(t(0, 30, 0).cache_hit(), Some(1.0));
+        assert_eq!(t(10, 30, 0).cache_hit(), Some(0.75));
+    }
+
+    #[test]
     fn model_id_clips_long_names_and_falls_back_for_buckets() {
         let long = "x".repeat(80);
         assert_eq!(ModelId::new(&long, "").raw.chars().count(), 64);

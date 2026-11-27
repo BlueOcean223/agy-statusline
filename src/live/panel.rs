@@ -92,7 +92,7 @@ impl Engine {
         let turns_left = (avg_growth > 0 && ctx_max > 0).then(|| ctx_left as i64 / avg_growth);
 
         // Cache & 6-cause miss analysis
-        let session_hit = tokens.cache_hit().unwrap_or(0.0);
+        let session_hit = tokens.cache_hit();
         let own_misses = req.misses(&id);
         let mut miss_summary = MissSummary::default();
         for (p, m) in own.iter().zip(own_misses.iter()) {
@@ -157,7 +157,7 @@ impl Engine {
                     at: c.at_ms,
                     model: c.model.display.clone(),
                     ctx: c.ctx_used,
-                    hit: c.tokens.cache_hit().unwrap_or(0.0),
+                    hit: c.tokens.cache_hit(),
                     out: c.tokens.output,
                     cost: c_usd,
                     costly: cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd,
@@ -293,7 +293,8 @@ pub struct PanelCtx {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelCache {
-    pub session_hit: f64,
+    /// `None` when no call had a prompt to hit.
+    pub session_hit: Option<f64>,
     pub misses: usize,
     pub miss_summary: MissSummary,
     /// What the cached tokens would have cost as fresh input, less what they cost.
@@ -352,7 +353,8 @@ pub struct Turn {
     pub at: i64,
     pub model: String,
     pub ctx: u64,
-    pub hit: f64,
+    /// `None` when the call's prompt was empty.
+    pub hit: Option<f64>,
     pub out: u64,
     pub cost: f64,
     pub costly: bool,
@@ -377,17 +379,11 @@ mod tests {
         let bar = out["bar"].clone();
         let view = &bar["views"][&p.id];
         let m = &view["main"];
-        // A last call with nothing to hit (no input, no cache read) showed as 0% before.
-        let last_hit = match (&m["cacheHit"], &m["lastAt"]) {
-            (Value::Null, Value::Null) => Value::Null,
-            (Value::Null, _) => json!(0.0),
-            (hit, _) => hit.clone(),
-        };
         let moved = [
             ("ctx", "used", json!(m["ctxUsed"].as_u64().unwrap_or(0))),
             ("ctx", "max", m["ctxMax"].clone()),
             ("ctx", "compactions", m["compactions"].clone()),
-            ("cache", "lastHit", last_hit),
+            ("cache", "lastHit", m["cacheHit"].clone()),
             ("speed", "lastTps", m["tps"].clone()),
             ("speed", "lastTtftMs", m["ttftMs"].clone()),
             ("tokens", "cost", view["costConv"].clone()),

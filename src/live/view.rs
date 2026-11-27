@@ -8,6 +8,7 @@ use crate::config::{BarLook, BarSegments, Config, OnlinePrices};
 use crate::git::GitInfo;
 use crate::miss::{MissInfo, miss_scan};
 use crate::pricing::{Cost, Pricer};
+use crate::quota::group_of;
 use serde::Serialize;
 use serde_json::Value;
 use std::cell::{OnceCell, RefCell};
@@ -297,26 +298,11 @@ impl<'a> ViewReq<'a> {
 
     /// The quota windows of the group `call`'s model counts against.
     fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
-        let Some(groups) = self.eng.quota["groups"].as_array().filter(|g| !g.is_empty()) else {
-            return Vec::new();
-        };
-        let name = call.map(|c| model_family(&c.model.display)).unwrap_or_default();
-        let group = groups
-            .iter()
-            .find(|g| !name.is_empty() && g["description"].as_str().unwrap_or("").contains(&name))
-            .or_else(|| {
-                // Claude/GPT models live in the third-party group.
-                let third = call.is_some_and(|c| {
-                    let k = c.model.price_key();
-                    k.contains("claude") || k.contains("gpt")
-                });
-                groups.iter().find(|g| {
-                    let d = g["displayName"].as_str().unwrap_or("").to_lowercase();
-                    if third { d.contains("claude") } else { d.contains("gemini") }
-                })
-            })
-            .unwrap_or(&groups[0]);
-        quota_views(group, self.clock.now)
+        let groups = self.eng.quota["groups"].as_array().map(Vec::as_slice).unwrap_or_default();
+        match group_of(call.map(|c| &c.model), groups) {
+            Some(group) => quota_views(group, self.clock.now),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -456,9 +442,4 @@ fn quota_views(group: &Value, now: i64) -> Vec<QuotaView> {
     // 5h first, then weekly.
     out.sort_by_key(|q| if q.window == "5h" { 0 } else { 1 });
     out
-}
-
-/// "Gemini 4 Neon (XHigh)" → "Gemini 4 Neon"; matches the quota group's model list.
-fn model_family(display: &str) -> String {
-    display.split(" (").next().unwrap_or(display).trim().to_string()
 }

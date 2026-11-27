@@ -255,20 +255,10 @@
     other: ['other', '间隔不到 1 分钟也没命中（服务端缓存未接上或前缀变化）'],
   };
   const MISS_ORDER = ['user', 'turn', 'wait', 'compact', 'model', 'other'];
-  function fmtIdle(ms) {
-    const n = Math.max(0, Number(ms) || 0);
-    if (n < 60e3) return Math.round(n / 1000) + ' 秒';
-    if (n < 3600e3) return Math.round(n / 60e3) + ' 分钟';
-    return (n / 3600e3).toFixed(1) + ' 小时';
-  }
   function missNote(m) {
     if (!m) return '';
-    const why = m.cause === 'user' ? `你隔了 ${fmtIdle(m.idleMs)} 才发下一条消息`
-      : m.cause === 'turn' ? `一轮中间停了 ${fmtIdle(m.idleMs)}（长命令、等你批准、等子代理）`
-        : m.cause === 'wait' ? `隔了 ${fmtIdle(m.idleMs)} 才发下一次请求（agy CLI）`
-          : m.cause === 'model' ? `换了模型（上一大调用：${m.fromModel || '其他模型'}）`
-            : m.cause === 'other' ? `离上一次调用结束仅隔 ${fmtIdle(m.idleMs)} 也未命中（服务端缓存未接上或前缀变化）`
-              : (MISS_CAUSE[m.cause]?.[1] || m.cause);
+    // The status bar's wording (web/bar.js, loaded first); the panel and the bar explain a miss alike.
+    const why = window.__agyBar?.missExplain(m) || MISS_CAUSE[m.cause]?.[1] || m.cause;
     return `缓存未命中：约 ${Number(m.tok || 0).toLocaleString()} token 未走缓存，多花约 ${fmtUsd(m.usd)}\n原因：${why}`;
   }
   function formatResetTip(resets) {
@@ -436,8 +426,8 @@
     const ctxUsed = m.ctxUsed || 0;
     const ctxMax = m.ctxMax || 0;
     const compactions = m.compactions || 0;
-    // A last call with nothing to hit (no input, no cache read) shows as 0%.
-    const lastHit = m.cacheHit ?? (m.lastAt != null ? 0 : null);
+    // `null` when the last call had nothing to hit (no input, no cache read): shown as "—".
+    const lastHit = m.cacheHit;
     const ctxPct = ctxMax ? (ctxUsed / ctxMax) * 100 : 0;
     const ctxColor = ctxPct >= 85 ? 'var(--k-crit)' : ctxPct >= 65 ? 'var(--k-warn)' : 'var(--k-context)';
     const cacheHitPct = (lastHit || 0) * 100;
@@ -728,7 +718,7 @@
               <div class="item-info">
                 <div class="turn-label">${esc(t.label)}</div>
                 <div class="turn-step">
-                  <span>#${t.step ?? '–'} · ${hms(t.at)} · ctx ${fmtTok(t.ctx)} (${Math.round(t.hit * 100)}% hit)</span>
+                  <span>#${t.step ?? '–'} · ${hms(t.at)} · ctx ${fmtTok(t.ctx)} (${t.hit != null ? Math.round(t.hit * 100) + '%' : '—'} hit)</span>
                   ${missTag}
                 </div>
               </div>

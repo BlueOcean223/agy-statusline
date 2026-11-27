@@ -13,6 +13,7 @@ use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, is_uuid_db, read_calls, signature};
 use crate::miss::{MissInfo, MissSummary, miss_scan};
 use crate::pricing::{DayCost, Pricer, day_sum};
+use crate::quota::QuotaKind;
 pub use crate::quota::{
     CycleRecord, DayQuotaRec, QuotaBucketSample, QuotaSamplePoint, QuotaSamples, ResetEvent, note_cycle_end,
     note_quota, note_reset_event, r4, replay_from_samples, same_period,
@@ -119,31 +120,7 @@ pub fn account_from_user_status(v: &Value) -> Option<AccountInfo> {
 }
 
 pub fn quota_group_id(display_name: &str, window: &str) -> String {
-    let low = display_name.to_lowercase();
-    let prefix = if low.contains("claude") || low.contains("gpt") || low.contains("3p") || low.contains("third") {
-        "3p"
-    } else if low.contains("gemini") {
-        "gemini"
-    } else {
-        "other"
-    };
-    format!("{prefix}-{window}")
-}
-
-fn model_belongs_to_group(model_name: &str, bucket_id: &str) -> bool {
-    let low = model_name.to_lowercase();
-    let is_3p = low.contains("claude")
-        || low.contains("opus")
-        || low.contains("sonnet")
-        || low.contains("haiku")
-        || low.contains("gpt");
-    if bucket_id.starts_with("3p-") {
-        is_3p
-    } else if bucket_id.starts_with("gemini-") {
-        !is_3p
-    } else {
-        true
-    }
+    QuotaKind::of_group(display_name).bucket_id(window)
 }
 
 // ---------------------------------------------------------------- on-disk history
@@ -858,7 +835,8 @@ fn cycle_spend(
     if to_ms <= from_ms {
         return (0.0, 0, false);
     }
-    let in_group = |c: &&Call| model_belongs_to_group(&c.model.price_key(), bucket_id);
+    let kind = QuotaKind::of_bucket_id(bucket_id);
+    let in_group = |c: &&Call| kind.counts(&c.model);
     let start_day = local_day_str(from_ms);
     let end_day = local_day_str(to_ms.saturating_sub(1).max(from_ms));
     let mut usd = 0.0;
@@ -916,7 +894,7 @@ fn group_aggregates<'a>(drec: &'a DayRecord, bucket_id: &'a str) -> impl Iterato
     drec.raw
         .iter()
         .chain(drec.cli_raw.iter())
-        .filter(move |(key, _)| model_belongs_to_group(&ModelId::from_bucket_key(key).price_key(), bucket_id))
+        .filter(move |(key, _)| QuotaKind::of_bucket_id(bucket_id).counts(&ModelId::from_bucket_key(key)))
 }
 
 // ---------------------------------------------------------------- API views

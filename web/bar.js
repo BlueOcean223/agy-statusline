@@ -26,6 +26,7 @@
     if (n < 3600e3) return Math.round(n / 60e3) + ' 分钟';
     return (n / 3600e3).toFixed(1) + ' 小时';
   };
+  // Why a call missed the cache, in one line. The side panel uses it too (window.__agyBar.missExplain).
   const missExplain = (m) => {
     if (!m) return '';
     if (m.cause === 'user') return '你隔了 ' + fmtIdle(m.idleMs) + ' 才发下一条消息';
@@ -33,7 +34,8 @@
     if (m.cause === 'wait') return '隔了 ' + fmtIdle(m.idleMs) + ' 才发下一次请求（agy CLI）';
     if (m.cause === 'compact') return '上下文刚被压缩或截短';
     if (m.cause === 'model') return '换了模型（上一大调用：' + (m.fromModel || '其他模型') + '）';
-    return '间隔仅 ' + fmtIdle(m.idleMs) + ' 也未命中（服务端缓存未接上或前缀变化）';
+    if (m.cause === 'other') return '离上一次调用结束仅隔 ' + fmtIdle(m.idleMs) + ' 也未命中（服务端缓存未接上或前缀变化）';
+    return String(m.cause || '');
   };
 
   // ---------------------------------------------------------------- palettes (8 themes × light/dark)
@@ -776,6 +778,7 @@ ${PAL_CSS}
 
   window.__agyBar = {
     PALETTES: Object.entries(PALETTE_DEFS).map(([id, [name, desc]]) => ({ id, name, desc })),
+    missExplain,
     update(payload) { data = payload; render(true); },
     destroy() {
       clearInterval(timer);

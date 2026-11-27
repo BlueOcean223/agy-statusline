@@ -3,7 +3,9 @@
 //!
 //! Pure state-machine logic with no file I/O so it can be thoroughly unit-tested in isolation.
 
+use crate::call::ModelId;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 
 pub const QUOTA_SEGS: usize = 8;
@@ -420,9 +422,123 @@ where
     changes
 }
 
+/// Which quota a model's calls count against: Gemini models share one, Claude and GPT models the
+/// third-party one. The status bar's quota windows, the Usage tab's cycle spend and the quota
+/// sample ids all classify through this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuotaKind {
+    Gemini,
+    ThirdParty,
+    Other,
+}
+
+impl QuotaKind {
+    /// A model is third-party when its raw or display name says so; anything else is Gemini.
+    pub fn of_model(model: &ModelId) -> Self {
+        let key = model.price_key();
+        if ["claude", "opus", "sonnet", "haiku", "gpt"].iter().any(|k| key.contains(k)) {
+            Self::ThirdParty
+        } else {
+            Self::Gemini
+        }
+    }
+
+    /// A quota group, from its display name.
+    pub fn of_group(display_name: &str) -> Self {
+        let low = display_name.to_lowercase();
+        if ["claude", "gpt", "3p", "third"].iter().any(|k| low.contains(k)) {
+            Self::ThirdParty
+        } else if low.contains("gemini") {
+            Self::Gemini
+        } else {
+            Self::Other
+        }
+    }
+
+    /// A quota bucket id as written by [`QuotaKind::bucket_id`].
+    pub fn of_bucket_id(id: &str) -> Self {
+        if id.starts_with("3p-") {
+            Self::ThirdParty
+        } else if id.starts_with("gemini-") {
+            Self::Gemini
+        } else {
+            Self::Other
+        }
+    }
+
+    /// `"<kind>-<window>"`, e.g. `"3p-weekly"`: how quota samples and history name a bucket.
+    pub fn bucket_id(self, window: &str) -> String {
+        let prefix = match self {
+            Self::Gemini => "gemini",
+            Self::ThirdParty => "3p",
+            Self::Other => "other",
+        };
+        format!("{prefix}-{window}")
+    }
+
+    /// Whether `model`'s calls count against buckets of this kind (every model counts against
+    /// an unrecognised group).
+    pub fn counts(self, model: &ModelId) -> bool {
+        self == Self::Other || Self::of_model(model) == self
+    }
+}
+
+/// The quota group (from the language_server's `groups`) that `model`'s calls count against: the
+/// group whose description names the model's family, else the first group of its kind, else the
+/// first group. A missing model counts as Gemini.
+pub fn group_of<'a>(model: Option<&ModelId>, groups: &'a [Value]) -> Option<&'a Value> {
+    // "Gemini 4 Neon (XHigh)" -> "Gemini 4 Neon", as the group descriptions list models.
+    let family = model.map(|m| m.display.split(" (").next().unwrap_or(&m.display).trim()).unwrap_or("");
+    let kind = model.map_or(QuotaKind::Gemini, QuotaKind::of_model);
+    groups
+        .iter()
+        .find(|g| !family.is_empty() && g["description"].as_str().unwrap_or("").contains(family))
+        .or_else(|| groups.iter().find(|g| QuotaKind::of_group(g["displayName"].as_str().unwrap_or("")) == kind))
+        .or_else(|| groups.first())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn groups() -> Vec<Value> {
+        serde_json::json!([
+            { "displayName": "Gemini Models", "description": "Gemini 4 Neon, Gemini 4 Hydrogen" },
+            { "displayName": "Claude & GPT Models", "description": "Claude Opus 5.5, GPT-6" },
+        ])
+        .as_array()
+        .unwrap()
+        .clone()
+    }
+
+    #[test]
+    fn group_of_prefers_the_description_then_the_kind_then_the_first_group() {
+        let gs = groups();
+        let name = |m: Option<ModelId>| group_of(m.as_ref(), &gs).map(|g| g["displayName"].as_str().unwrap());
+        assert_eq!(name(Some(ModelId::new("x", "Claude Opus 5.5 (Thinking)"))), Some("Claude & GPT Models"));
+        // Not named in any description: classified by its raw name, as the Usage tab's cycle spend does.
+        let opus = ModelId::new("opus-next", "Next");
+        assert_eq!(QuotaKind::of_model(&opus), QuotaKind::ThirdParty);
+        assert_eq!(name(Some(opus)), Some("Claude & GPT Models"));
+        assert_eq!(name(Some(ModelId::new("neon-2", "Neon 2"))), Some("Gemini Models"));
+        assert_eq!(name(None), Some("Gemini Models"));
+        assert!(group_of(None, &[]).is_none());
+    }
+
+    #[test]
+    fn bucket_ids_round_trip_through_the_kind() {
+        for (group, id) in
+            [("Claude & GPT Models", "3p-weekly"), ("Gemini Models", "gemini-weekly"), ("Misc", "other-weekly")]
+        {
+            let kind = QuotaKind::of_group(group);
+            assert_eq!(kind.bucket_id("weekly"), id);
+            assert_eq!(QuotaKind::of_bucket_id(id), kind);
+        }
+        let opus = ModelId::new("claude-opus-5-5", "Claude Opus 5.5");
+        assert!(
+            QuotaKind::ThirdParty.counts(&opus) && !QuotaKind::Gemini.counts(&opus) && QuotaKind::Other.counts(&opus)
+        );
+    }
     use chrono::DateTime;
 
     fn ts(s: &str) -> i64 {
