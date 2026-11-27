@@ -28,7 +28,7 @@ pub struct StepInfo {
 /// [`read_since`]), so the engine can read with its lock released and merge the result after.
 #[derive(Default)]
 pub struct Transcript {
-    offset: u64,
+    pos: ReadPos,
     mtime_ms: i64,
     pub steps: HashMap<u64, StepInfo>,
     pub markers: StepMarkers,
@@ -37,11 +37,26 @@ pub struct Transcript {
     pub subagent_hints: HashSet<String>,
 }
 
+/// Where a read starts: the byte offset, and how many reads were merged before it. A read is
+/// merged only if nothing else was merged since it started (comparing offsets alone would accept
+/// a read that started before a rewrite reset the offset back to where it was).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadPos {
+    offset: u64,
+    merged: u64,
+}
+
+impl ReadPos {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 /// Lines appended to a transcript after a byte offset, read by [`read_since`].
 #[derive(Debug, Default)]
 pub struct TranscriptChunk {
-    /// The offset the read started from, as passed to [`read_since`].
-    from: u64,
+    /// Where the read started, as passed to [`read_since`].
+    at: ReadPos,
     /// The file was rewritten (shorter than `from`), so this was parsed from the start.
     reset: bool,
     /// Offset after the last complete line read.
@@ -57,10 +72,11 @@ pub fn transcript_path(app_data: &Path, id: &str) -> PathBuf {
     app_data.join("brain").join(id).join(".system_generated/logs/transcript.jsonl")
 }
 
-/// Reads the complete lines appended to `id`'s transcript after byte `from` (a partially written
-/// last line is left for the next read).
-pub fn read_since(app_data: &Path, id: &str, from: u64) -> TranscriptChunk {
-    let mut chunk = TranscriptChunk { from, end: from, ..Default::default() };
+/// Reads the complete lines appended to `id`'s transcript after `at` (a partially written last
+/// line is left for the next read).
+pub fn read_since(app_data: &Path, id: &str, at: ReadPos) -> TranscriptChunk {
+    let from = at.offset;
+    let mut chunk = TranscriptChunk { at, end: from, ..Default::default() };
     let Ok(mut f) = File::open(transcript_path(app_data, id)) else { return chunk };
     let Ok(md) = f.metadata() else { return chunk };
     chunk.mtime_ms = md
@@ -112,8 +128,8 @@ pub fn read_since(app_data: &Path, id: &str, from: u64) -> TranscriptChunk {
 
 impl Transcript {
     /// Where the next [`read_since`] should start.
-    pub fn offset(&self) -> u64 {
-        self.offset
+    pub fn position(&self) -> ReadPos {
+        self.pos
     }
 
     /// The file's modification time at the last merged read.
@@ -121,27 +137,28 @@ impl Transcript {
         self.mtime_ms
     }
 
-    /// Merges a chunk read from [`Transcript::offset`]. Returns `None`, merging nothing but the
-    /// file time, if another chunk was merged since that read was started (the read is stale);
-    /// otherwise whether any new line was parsed.
+    /// Merges a chunk read from [`Transcript::position`]. Returns `None`, merging nothing, if
+    /// another chunk was merged since that read was started (the read is stale); otherwise
+    /// whether any new line was parsed.
     pub fn apply(&mut self, chunk: TranscriptChunk) -> Option<bool> {
-        self.mtime_ms = chunk.mtime_ms;
-        if chunk.from != self.offset {
+        if chunk.at != self.pos {
             return None;
         }
+        self.mtime_ms = chunk.mtime_ms;
+        let mut offset = self.pos.offset;
         if chunk.reset {
-            self.offset = 0;
+            offset = 0;
             self.steps.clear();
             self.markers.user.clear();
             self.markers.ckpt.clear();
             self.subagent_hints.clear();
         }
-        let parsed_new = chunk.end != self.offset;
+        let parsed_new = chunk.end != offset;
         self.steps.extend(chunk.steps);
         self.markers.user.extend(chunk.markers.user);
         self.markers.ckpt.extend(chunk.markers.ckpt);
         self.subagent_hints.extend(chunk.subagent_hints);
-        self.offset = chunk.end;
+        self.pos = ReadPos { offset: chunk.end, merged: self.pos.merged + 1 };
         Some(parsed_new)
     }
 }
@@ -430,7 +447,16 @@ mod tests {
         }
 
         fn read(&self, t: &Transcript) -> TranscriptChunk {
-            read_since(&self.dir, self.id, t.offset())
+            read_since(&self.dir, self.id, t.position())
+        }
+
+        fn set_mtime(&self, secs: u64) {
+            let f = File::options().write(true).open(transcript_path(&self.dir, self.id)).unwrap();
+            f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
+        }
+
+        fn len(&self) -> u64 {
+            fs::metadata(transcript_path(&self.dir, self.id)).unwrap().len()
         }
     }
 
@@ -448,9 +474,11 @@ mod tests {
     fn reads_complete_lines_incrementally() {
         let f = Fixture::new("incremental");
         let mut t = Transcript::default();
-        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + r#"{"step_index": 3"#));
+        let complete = line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE");
+        f.write(&(complete.clone() + r#"{"step_index": 3"#));
         assert_eq!(t.apply(f.read(&t)), Some(true));
         assert_eq!(t.steps.len(), 2, "the partial last line waits");
+        assert_eq!(t.position().offset(), complete.len() as u64);
         assert!(t.markers.user.contains(&1));
         assert_eq!(t.steps[&2].label.as_deref(), Some("Final reply"));
         assert!(t.mtime_ms() > 0);
@@ -459,19 +487,34 @@ mod tests {
         assert_eq!(t.apply(f.read(&t)), Some(true));
         assert_eq!(t.steps.len(), 3);
         assert!(t.markers.ckpt.contains(&3));
+        assert_eq!(t.position().offset(), f.len());
         assert_eq!(t.apply(f.read(&t)), Some(false), "nothing new");
+    }
+
+    fn hint_line(sub: &str) -> String {
+        let content = format!("[Message] timestamp=2026-11-27T01:00:00Z sender={sub} priority=HIGH");
+        format!("{}\n", json!({ "step_index": 4, "type": "SYSTEM_MESSAGE", "content": content }))
     }
 
     #[test]
     fn a_rewritten_file_is_read_from_the_start() {
         let f = Fixture::new("rewrite");
         let mut t = Transcript::default();
-        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + &line(3, "PLANNER_RESPONSE")));
+        let sub = "1d1ccfdb-56ca-48fb-a613-a38ffe68f9e4";
+        f.write(&(line(1, "USER_INPUT") + &line(2, "CHECKPOINT") + &hint_line(sub)));
         t.apply(f.read(&t));
+        assert!(t.subagent_hints.contains(sub), "hints are merged");
         f.write(&line(7, "USER_INPUT"));
         assert_eq!(t.apply(f.read(&t)), Some(true));
         assert_eq!(t.steps.keys().copied().collect::<Vec<_>>(), vec![7]);
-        assert!(!t.markers.user.contains(&1));
+        assert!(!t.markers.user.contains(&1) && t.markers.ckpt.is_empty() && t.subagent_hints.is_empty());
+        assert_eq!(t.position().offset(), f.len());
+
+        // Rewritten again to a single partial line: everything is dropped, nothing parsed yet.
+        f.write(r#"{"step_index": 9"#);
+        assert_eq!(t.apply(f.read(&t)), Some(false));
+        assert!(t.steps.is_empty());
+        assert_eq!(t.position().offset(), 0);
     }
 
     #[test]
@@ -479,22 +522,42 @@ mod tests {
         let f = Fixture::new("stale");
         let mut t = Transcript::default();
         f.write(&line(1, "USER_INPUT"));
+        f.set_mtime(1_000);
         // Two reads from the same offset (the side panel and the engine loop).
-        let (first, second) = (f.read(&t), f.read(&t));
-        assert_eq!(t.apply(first), Some(true));
-        assert_eq!(t.apply(second), None);
+        let first = f.read(&t);
         f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE")));
+        let second = f.read(&t);
+        let mtime = second.mtime_ms;
+        assert_eq!(t.apply(second), Some(true));
+        assert_eq!(t.apply(first), None);
+        assert_eq!(t.mtime_ms(), mtime, "a stale read leaves the file time alone");
+        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + &line(3, "PLANNER_RESPONSE")));
         assert_eq!(t.apply(f.read(&t)), Some(true));
-        assert_eq!(t.steps.len(), 2, "nothing lost or read twice");
+        assert_eq!(t.steps.len(), 3, "nothing lost");
+        assert_eq!(t.position().offset(), f.len(), "nothing read twice");
+    }
+
+    #[test]
+    fn a_read_from_before_a_rewrite_is_stale_even_at_the_same_offset() {
+        let f = Fixture::new("aba");
+        let mut t = Transcript::default();
+        f.write(&line(1, "USER_INPUT"));
+        let old = f.read(&t); // started before everything below, from offset 0
+        t.apply(f.read(&t));
+        f.write(r#"{"step_index": 2"#); // rewritten: back to offset 0
+        assert_eq!(t.apply(f.read(&t)), Some(false));
+        assert_eq!(t.position().offset(), 0);
+        assert_eq!(t.apply(old), None, "same offset, but merged after a rewrite");
+        assert!(t.steps.is_empty());
     }
 
     #[test]
     fn a_missing_transcript_reads_as_nothing() {
         let f = Fixture::new("missing");
         let mut t = Transcript::default();
-        let chunk = read_since(&f.dir, "00000000-0000-4000-8000-000000000009", 0);
+        let chunk = read_since(&f.dir, "00000000-0000-4000-8000-000000000009", t.position());
         assert_eq!(t.apply(chunk), Some(false));
-        assert_eq!((t.offset(), t.mtime_ms()), (0, 0));
+        assert_eq!((t.position().offset(), t.mtime_ms()), (0, 0));
     }
 
     #[test]

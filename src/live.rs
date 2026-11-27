@@ -23,7 +23,7 @@ use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::miss::{MissInfo, miss_scan};
 use crate::pricing::{Cost, DayCost, Pricer};
-use crate::transcript::{Annotation, Transcript, TranscriptChunk};
+use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
     maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
@@ -1565,17 +1565,27 @@ pub fn run(shared: SharedRef) {
 
         // The ENGINE lock is taken only to plan and to merge; RPCs, SQLite and transcript reads,
         // directory scans and git run unlocked so side-panel requests are never stuck behind them.
+        // Finding the language_server spawns processes and probes ports, so it runs before the
+        // ENGINE lock is taken; nothing else installs an engine meanwhile.
+        let connected = if ENGINE.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+            match LsClient::connect() {
+                Some(ls) => {
+                    let addr = ls.addr.clone();
+                    set_status(&shared, |s| s.ls_status = format!("connected to {addr}"));
+                    Some(Engine::new(ls))
+                }
+                None => {
+                    set_status(&shared, |s| s.ls_status = "language_server not found".into());
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let status_plan = {
             let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
             if engine.is_none() {
-                match LsClient::connect() {
-                    Some(ls) => {
-                        let addr = ls.addr.clone();
-                        set_status(&shared, |s| s.ls_status = format!("connected to {addr}"));
-                        *engine = Some(Engine::new(ls));
-                    }
-                    None => set_status(&shared, |s| s.ls_status = "language_server not found".into()),
-                }
+                *engine = connected;
             }
             engine.as_mut().map(|eng| {
                 for (e, c) in &events {
