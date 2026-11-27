@@ -25,7 +25,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const DEBUG_ARG: &str = "--remote-debugging-port=0";
-const PROMPT_AFTER: Duration = Duration::from_secs(20);
+/// Short debounce before the process check. The sidecar starts well after Antigravity has written
+/// `DevToolsActivePort`, and the command-line check (`NoFlag`) is the real guard against restarts,
+/// so a long wait only delays the prompt.
+const PROMPT_AFTER: Duration = Duration::from_secs(3);
+/// Poll quickly right after sidecar start (when a missing port is first noticed), then back off.
+const FAST_TICK: Duration = Duration::from_secs(1);
+const SLOW_TICK: Duration = Duration::from_secs(5);
+const FAST_TICK_WINDOW: Duration = Duration::from_secs(60);
 const COOLDOWN_MS: i64 = 120_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,7 +497,7 @@ fn ask_user_confirm(plugin_data: &Path) -> bool {
     res.relaunch
 }
 
-/// Watches CDP connectivity; when unreachable for >= 20s and `relaunch_mode` is `ask` or `auto`,
+/// Watches CDP connectivity; when unreachable for >= 3s and `relaunch_mode` is `ask` or `auto`,
 /// verifies the Antigravity main process truly lacks `--remote-debugging-port` before acting.
 pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
     if !is_supported() {
@@ -503,9 +510,10 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             .unwrap_or_else(|| format!("pid-{}", std::process::id()));
         let mut last_check: Option<(Instant, LaunchFlag)> = None;
         let mut synced_ok = false;
+        let started = Instant::now();
 
         loop {
-            thread::sleep(Duration::from_secs(5));
+            thread::sleep(if started.elapsed() < FAST_TICK_WINDOW { FAST_TICK } else { SLOW_TICK });
             let (port_ok, port_since) = match shared.0.lock() {
                 Ok(s) => (s.cdp_port_ok, s.cdp_port_since),
                 Err(_) => continue,
