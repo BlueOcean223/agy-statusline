@@ -1511,13 +1511,12 @@ fn model_family(display: &str) -> String {
     display.split(" (").next().unwrap_or(display).trim().to_string()
 }
 
+/// Start of today in local time (see `day_start_in` for days whose 00:00 does not exist).
 fn local_midnight_ms() -> i64 {
-    Local::now()
-        .date_naive()
-        .and_hms_opt(0, 0, 0)
-        .and_then(|d| d.and_local_timezone(Local).earliest())
-        .map(|d| d.timestamp_millis())
-        .unwrap_or(0)
+    let now = Local::now();
+    // `now` is itself a valid instant of today, so the fallback is never reached in practice;
+    // if it were, counting nothing as today beats counting all history as today.
+    crate::usage::day_start_in(now.date_naive(), &Local).unwrap_or_else(|| now.timestamp_millis())
 }
 
 // ---------------------------------------------------------------- daemon loop
@@ -1539,7 +1538,9 @@ pub fn run(shared: SharedRef) {
     spawn_hook_listener(&plugin_data, shared.clone());
 
     let mut last_payload = String::new();
-    let mut last_usage_sync = Instant::now() - Duration::from_secs(60);
+    // `None` = never synced, so the first tick syncs. Not `Instant::now() - 60s`: on Windows an
+    // Instant cannot predate boot, and that subtraction panics in the first minute of uptime.
+    let mut last_usage_sync: Option<Instant> = None;
     loop {
         let tick_started = Instant::now();
         let (panes, interest, events, online_prices) = {
@@ -1589,9 +1590,9 @@ pub fn run(shared: SharedRef) {
             let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
             if let (Some(eng), Some(fetched)) = (engine.as_mut(), fetched) {
                 eng.apply_convs(fetched);
-                if last_usage_sync.elapsed() >= Duration::from_secs(5) {
+                if last_usage_sync.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
                     writes = eng.sync_usage_store();
-                    last_usage_sync = Instant::now();
+                    last_usage_sync = Some(Instant::now());
                 }
                 let running = eng.summaries.values().filter(|s| s.active()).count();
                 let ui_zh = cfg.ui_zh;

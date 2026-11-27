@@ -48,11 +48,20 @@ pub fn today_str() -> String {
 }
 
 pub fn day_start_ms(date: &str) -> Option<i64> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .ok()
-        .and_then(|d| d.and_hms_opt(0, 0, 0))
-        .and_then(|dt| dt.and_local_timezone(Local).earliest())
-        .map(|dt| dt.timestamp_millis())
+    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok().and_then(|d| day_start_in(d, &Local))
+}
+
+/// First instant of `date` in `tz`, in Unix ms. Usually local 00:00, but where DST starts at
+/// midnight (America/Santiago, Asia/Beirut, ...) 00:00 does not exist and the day begins at the
+/// end of the gap, e.g. 01:00. Scans forward minute by minute; `None` only if no valid local
+/// minute exists within 24h of midnight (a day skipped entirely, like Samoa's 2011-12-30, yields
+/// the next day's start).
+pub(crate) fn day_start_in<Tz: TimeZone>(date: chrono::NaiveDate, tz: &Tz) -> Option<i64> {
+    let midnight = date.and_time(chrono::NaiveTime::MIN);
+    (0..=24 * 60).find_map(|m| {
+        let local = midnight.checked_add_signed(chrono::Duration::minutes(m))?;
+        local.and_local_timezone(tz.clone()).earliest().map(|dt| dt.timestamp_millis())
+    })
 }
 
 fn prev_day_str(date: &str) -> Option<String> {
@@ -1498,6 +1507,94 @@ mod tests {
     use super::*;
     use crate::call::{ModelId, Tokens};
     use crate::config::ModelRule;
+
+    /// A zone with one offset change at `at_ms` (UTC), so DST cases are testable without
+    /// depending on the machine's timezone or a tz database.
+    #[derive(Clone, Copy, Debug)]
+    struct OneShift {
+        at_ms: i64,
+        before_secs: i32,
+        after_secs: i32,
+    }
+
+    impl TimeZone for OneShift {
+        type Offset = chrono::FixedOffset;
+
+        fn from_offset(offset: &chrono::FixedOffset) -> Self {
+            let secs = offset.local_minus_utc();
+            OneShift { at_ms: i64::MAX, before_secs: secs, after_secs: secs }
+        }
+
+        fn offset_from_local_date(&self, local: &chrono::NaiveDate) -> chrono::MappedLocalTime<chrono::FixedOffset> {
+            self.offset_from_local_datetime(&local.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_local_datetime(
+            &self,
+            local: &chrono::NaiveDateTime,
+        ) -> chrono::MappedLocalTime<chrono::FixedOffset> {
+            let utc_ms = |off: i32| local.and_utc().timestamp_millis() - i64::from(off) * 1000;
+            let fixed = |off: i32| chrono::FixedOffset::east_opt(off).unwrap();
+            let before = (utc_ms(self.before_secs) < self.at_ms).then(|| fixed(self.before_secs));
+            let after = (utc_ms(self.after_secs) >= self.at_ms).then(|| fixed(self.after_secs));
+            match (before, after) {
+                (Some(a), Some(b)) => chrono::MappedLocalTime::Ambiguous(a, b),
+                (Some(o), None) | (None, Some(o)) => chrono::MappedLocalTime::Single(o),
+                (None, None) => chrono::MappedLocalTime::None,
+            }
+        }
+
+        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> chrono::FixedOffset {
+            self.offset_from_utc_datetime(&utc.and_time(chrono::NaiveTime::MIN))
+        }
+
+        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
+            let secs = if utc.and_utc().timestamp_millis() < self.at_ms { self.before_secs } else { self.after_secs };
+            chrono::FixedOffset::east_opt(secs).unwrap()
+        }
+    }
+
+    fn utc_ms(s: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis()
+    }
+
+    fn date(s: &str) -> chrono::NaiveDate {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    #[test]
+    fn day_start_is_midnight_on_ordinary_days() {
+        assert_eq!(day_start_in(date("2026-11-27"), &chrono::Utc), Some(utc_ms("2026-11-27T00:00:00Z")));
+        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
+        assert_eq!(day_start_in(date("2026-11-27"), &plus8), Some(utc_ms("2026-11-26T16:00:00Z")));
+    }
+
+    #[test]
+    fn day_start_skips_a_dst_gap_at_midnight() {
+        // Santiago-style: at local 00:00 (-04) clocks jump to 01:00 (-03).
+        let tz = OneShift { at_ms: utc_ms("2026-09-06T04:00:00Z"), before_secs: -4 * 3600, after_secs: -3 * 3600 };
+        let midnight = date("2026-09-06").and_time(chrono::NaiveTime::MIN);
+        assert!(midnight.and_local_timezone(tz).earliest().is_none(), "00:00 must not exist in this zone");
+        assert_eq!(day_start_in(date("2026-09-06"), &tz), Some(utc_ms("2026-09-06T04:00:00Z")));
+        // Neighbouring days are unaffected.
+        assert_eq!(day_start_in(date("2026-09-05"), &tz), Some(utc_ms("2026-09-05T04:00:00Z")));
+        assert_eq!(day_start_in(date("2026-09-07"), &tz), Some(utc_ms("2026-09-07T03:00:00Z")));
+    }
+
+    #[test]
+    fn day_start_takes_the_earlier_of_a_repeated_midnight() {
+        // At local 01:00 (+01) clocks fall back to 00:00 (+00), so 00:00–01:00 happens twice.
+        let tz = OneShift { at_ms: utc_ms("2026-10-25T00:00:00Z"), before_secs: 3600, after_secs: 0 };
+        assert_eq!(day_start_in(date("2026-10-25"), &tz), Some(utc_ms("2026-10-24T23:00:00Z")));
+    }
+
+    #[test]
+    fn day_start_of_a_skipped_day_is_the_next_day_start() {
+        // Samoa 2011: 2011-12-29 24:00 (-10) became 2011-12-31 00:00 (+14).
+        let tz = OneShift { at_ms: utc_ms("2011-12-30T10:00:00Z"), before_secs: -10 * 3600, after_secs: 14 * 3600 };
+        assert_eq!(day_start_in(date("2011-12-30"), &tz), Some(utc_ms("2011-12-30T10:00:00Z")));
+        assert_eq!(day_start_in(date("2011-12-31"), &tz), Some(utc_ms("2011-12-30T10:00:00Z")));
+    }
 
     #[test]
     fn masks_emails_and_hashes_deterministically() {

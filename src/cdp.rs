@@ -377,15 +377,17 @@ fn run_page(id: &str, url: &str, ws_url: &str, shared: &SharedRef) -> Result<(),
     let mut zh_add_id: Option<u64> = None;
     let mut zh_script: Option<String> = None;
     let mut zh_old_script: Option<String> = None;
-    let mut polled_at = Instant::now() - POLL_EVERY;
+    // `None` = never polled, so the first loop polls. Not `Instant::now() - POLL_EVERY`: on
+    // Windows an Instant cannot predate boot, and that subtraction panics right after boot.
+    let mut polled_at: Option<Instant> = None;
     let mut discarded_at = Instant::now();
     loop {
         if discarded_at.elapsed() >= DISCARD_CONSOLE_EVERY {
             discarded_at = Instant::now();
             page.send("Runtime.discardConsoleEntries", json!({}))?;
         }
-        if poll_id.is_none() && polled_at.elapsed() >= POLL_EVERY {
-            polled_at = Instant::now();
+        if poll_id.is_none() && polled_at.is_none_or(|t| t.elapsed() >= POLL_EVERY) {
+            polled_at = Some(Instant::now());
             page.send(
                 "Runtime.evaluate",
                 json!({ "expression": "window.__agyBar ? window.__agyBar.panes() : null", "returnByValue": true }),
