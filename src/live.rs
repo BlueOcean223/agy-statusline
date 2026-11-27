@@ -215,12 +215,14 @@ struct TodayCost {
     tokens: u64,
 }
 
-/// Where `refresh_conv` reads a conversation's generator records from.
+/// Where a conversation's generator records are read from (see `fetch_conv`).
 #[derive(Clone, Debug)]
 pub(crate) enum ConvReq {
     /// From the language_server, re-reading from `offset` (the last known record) of `len`.
-    Ls { id: String, offset: usize, len: usize },
-    /// From the conversation database; `have` is the signature already read, if any.
+    /// `steps` is the summary's step count when planned: what the records will be current to.
+    Ls { id: String, offset: usize, len: usize, steps: Option<u64> },
+    /// From the conversation database; `have` is the signature already read, if any. A result
+    /// planned against another signature than the one loaded when it is merged is stale.
     Db { id: String, have: Option<DbSig> },
 }
 
@@ -246,7 +248,7 @@ pub(crate) enum Applied {
     Stale,
 }
 
-/// Network/disk half of `refresh_conv`; runs without the ENGINE lock.
+/// Reads what `req` asks for; runs without the ENGINE lock.
 fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Result<ConvData, String> {
     match req {
         ConvReq::Ls { id, offset, .. } => ls
@@ -632,7 +634,7 @@ pub struct Engine {
     /// Conversation id → transcript mtime, from `brain/` (see `transcript::scan_brain`).
     disk: HashMap<String, i64>,
     disk_at: Option<Instant>,
-    /// Candidate subagent ids from transcripts already probed via `refresh_conv`.
+    /// Candidate subagent ids from transcripts already probed (see `plan_hints`).
     probed_hints: HashSet<String>,
     /// Workspace path → (when read, git status).
     git: HashMap<String, (Instant, Option<GitInfo>)>,
@@ -703,6 +705,9 @@ impl Engine {
         let Some(ts) = j["trajectorySummaries"].as_object() else { return };
         let now = now_ms();
         self.ls_loaded = ts.keys().cloned().collect();
+        // A failed read was a database read; the language_server can be asked right away.
+        let ls_loaded = &self.ls_loaded;
+        self.failed.retain(|id, _| !ls_loaded.contains(id));
         for (id, s) in ts {
             // Read from its database earlier; the language_server has it now, so switch over.
             if self.convs.get(id).is_some_and(|c| c.db_sig.is_some()) {
@@ -758,7 +763,8 @@ impl Engine {
         if self.ls_loaded.contains(id) {
             let len = conv.map_or(0, |c| c.calls.len());
             // Re-read the last record: it may have been written before its usage was filled in.
-            ConvReq::Ls { id: id.to_string(), offset: len.saturating_sub(1), len }
+            let steps = self.summaries.get(id).map(|s| s.step_count);
+            ConvReq::Ls { id: id.to_string(), offset: len.saturating_sub(1), len, steps }
         } else {
             ConvReq::Db { id: id.to_string(), have: conv.filter(|c| c.loaded_once).and_then(|c| c.db_sig) }
         }
@@ -768,9 +774,11 @@ impl Engine {
     fn apply_conv(&mut self, req: &ConvReq, data: ConvData) -> Applied {
         let now = Instant::now();
         match (req, data) {
-            (ConvReq::Ls { id, offset, len }, ConvData::Ls(j)) => {
+            (ConvReq::Ls { id, offset, len, steps }, ConvData::Ls(j)) => {
                 let seen_at = now_ms();
-                let step_count = self.summaries.get(id.as_str()).map(|s| s.step_count);
+                // As planned, not as now: if the summary moved on during the fetch (the panel and
+                // the engine loop fetch concurrently), the next plan sees the steps changed.
+                let step_count = *steps;
                 let conv = self.convs.entry(id.clone()).or_default();
                 if conv.calls.len() != *len {
                     return Applied::Stale;
@@ -821,9 +829,13 @@ impl Engine {
                 }
                 Applied::Unchanged
             }
-            (ConvReq::Db { id, .. }, ConvData::Db(Some((sig, mut calls, summary)))) => {
+            (ConvReq::Db { id, have }, ConvData::Db(Some((sig, mut calls, summary)))) => {
                 if self.ls_loaded.contains(id.as_str()) {
                     // The language_server loaded it meanwhile; read it from there instead.
+                    return Applied::Stale;
+                }
+                if self.convs.get(id.as_str()).is_some_and(|c| c.loaded_once && c.db_sig != *have) {
+                    // Another read was merged since this one was planned; it may be newer.
                     return Applied::Stale;
                 }
                 let conv = self.convs.entry(id.clone()).or_default();
@@ -1488,8 +1500,9 @@ pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
 /// The side panel's JSON for `requested` (default: the most recent conversation). What it needs
 /// and is not loaded yet is read with the ENGINE lock released, as in the engine loop, so a panel
-/// request never holds the lock across an RPC or a database read. Concurrent reads of the same
-/// conversation by the engine loop are dropped as stale when merged.
+/// request never holds the lock across an RPC or a database read. If the engine loop reads the
+/// same conversation meanwhile, whichever result is merged second is dropped as stale (see
+/// `ConvReq`).
 pub fn panel_json(
     shared: Option<&SharedRef>,
     requested: Option<&str>,
@@ -1502,18 +1515,20 @@ pub fn panel_json(
         None => return json!({ "id": null, "error": "language_server not connected" }),
     };
     let Some(id) = target else { return json!({ "id": null }) };
-    // Keeps the engine loop refreshing this conversation while the panel shows it.
-    if let Some(shared) = shared
-        && let Ok(mut s) = shared.0.lock()
-    {
-        s.panel.insert(id.clone(), Instant::now());
-    }
+    let mut tried = HashSet::new();
     for _ in 0..tick::LOAD_ROUNDS {
-        let Some(plan) = engine().as_mut().and_then(|eng| eng.plan_load(&id)) else { break };
+        let Some(plan) = engine().as_mut().and_then(|eng| eng.plan_load(&id, &mut tried)) else { break };
         let fetched = plan.fetch();
         if let Some(eng) = engine().as_mut() {
             eng.apply_convs(fetched);
         }
+    }
+    // Keeps the engine loop refreshing this conversation while the panel shows it. Registered
+    // after loading, so the engine loop doesn't read the same conversations alongside this load.
+    if let Some(shared) = shared
+        && let Ok(mut s) = shared.0.lock()
+    {
+        s.panel.insert(id.clone(), Instant::now());
     }
     match engine().as_ref() {
         Some(eng) => eng.panel(&id, cfg, online),

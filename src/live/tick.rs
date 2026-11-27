@@ -135,8 +135,9 @@ impl Engine {
     /// Loads what the side panel needs for `id` without releasing `self` (the CLI; the sidecar
     /// releases the ENGINE lock between phases, see `live::panel_json`).
     pub fn load_for_panel(&mut self, id: &str) {
+        let mut tried = HashSet::new();
         for _ in 0..LOAD_ROUNDS {
-            let Some(plan) = self.plan_load(id) else { break };
+            let Some(plan) = self.plan_load(id, &mut tried) else { break };
             self.apply_convs(plan.fetch());
         }
     }
@@ -339,9 +340,11 @@ impl Engine {
     }
 
     /// Plans reading what the side panel needs for `id` and does not have yet: the conversation,
-    /// its root's subagent tree, and subagents named in their transcripts. `None` when nothing is
-    /// missing; keeping loaded conversations current is left to the engine loop.
-    pub(super) fn plan_load(&mut self, id: &str) -> Option<ConvPlan> {
+    /// its root's subagent tree, and subagents named in their transcripts. `tried` holds what
+    /// earlier rounds of the same request asked for, so a failing read is tried once per request.
+    /// `None` when nothing is missing; keeping loaded conversations current is left to the engine
+    /// loop.
+    pub(super) fn plan_load(&mut self, id: &str, tried: &mut HashSet<String>) -> Option<ConvPlan> {
         let root = self.root_of(id);
         let mut seeds = vec![id.to_string()];
         seeds.extend(self.tree(&root).into_iter().filter(|cid| cid != id));
@@ -349,13 +352,13 @@ impl Engine {
         let mut convs: Vec<ConvReq> = Vec::new();
         let mut queued: HashSet<String> = HashSet::new();
         for cid in &seeds {
-            let backoff = self.failed.get(cid).is_some_and(|t| t.elapsed() < FAIL_BACKOFF);
-            if self.convs.contains_key(cid) || backoff {
+            if self.convs.contains_key(cid) || tried.contains(cid) {
                 continue;
             }
             let req = self.conv_req(cid);
             if matches!(req, ConvReq::Db { .. }) {
-                if db_budget == 0 {
+                // Failed reads are database reads (see `apply_summaries`).
+                if db_budget == 0 || self.failed.get(cid).is_some_and(|t| t.elapsed() < FAIL_BACKOFF) {
                     continue;
                 }
                 db_budget -= 1;
@@ -363,7 +366,9 @@ impl Engine {
             queued.insert(cid.clone());
             convs.push(req);
         }
+        queued.extend(tried.iter().cloned());
         self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
+        tried.extend(convs.iter().map(|r| r.id().to_string()));
         let ls = self.ls.clone();
         (!convs.is_empty()).then(|| ConvPlan {
             ls,
@@ -626,8 +631,13 @@ mod tests {
         Ok(ConvData::Db(Some((DbSig { mtime_ms: 1, len: 1 }, Vec::new(), Box::new(summary)))))
     }
 
-    fn panel_round(e: &mut Engine, id: &str, data: impl Fn(&str) -> Result<ConvData, String>) -> Vec<String> {
-        let Some(plan) = e.plan_load(id) else { return Vec::new() };
+    fn panel_round(
+        e: &mut Engine,
+        id: &str,
+        tried: &mut HashSet<String>,
+        data: impl Fn(&str) -> Result<ConvData, String>,
+    ) -> Vec<String> {
+        let Some(plan) = e.plan_load(id, tried) else { return Vec::new() };
         let ids: Vec<String> = plan.convs.iter().map(|r| r.id().to_string()).collect();
         let convs = plan.convs.into_iter().map(|r| (r.clone(), data(r.id()))).collect();
         e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep: plan.keep });
@@ -641,14 +651,15 @@ mod tests {
         // The sibling is known from the language_server's summaries but its records are not loaded.
         e.summaries.insert(sibling.clone(), Summary { root: Some(root.clone()), ..Default::default() });
         let data = |id: &str| db_conv((id != root).then_some(root.as_str()));
+        let mut tried = HashSet::new();
 
         // Round 1: only the subagent is known; its database names the root.
-        assert_eq!(panel_round(&mut e, &sub, data), vec![sub.clone()]);
+        assert_eq!(panel_round(&mut e, &sub, &mut tried, data), vec![sub.clone()]);
         // Round 2: the root's tree, minus what is loaded.
-        let mut second = panel_round(&mut e, &sub, data);
+        let mut second = panel_round(&mut e, &sub, &mut tried, data);
         second.sort();
         assert_eq!(second, vec![root.clone(), sibling.clone()]);
-        assert!(e.plan_load(&sub).is_none(), "everything loaded: nothing to plan");
+        assert!(e.plan_load(&sub, &mut HashSet::new()).is_none(), "everything loaded: nothing to plan");
     }
 
     #[test]
@@ -659,10 +670,99 @@ mod tests {
         e.convs.insert(idle.clone(), Conv::default());
         assert!(e.evict_at.is_none());
 
-        let planned = panel_round(&mut e, &missing, |_| Err("no database".to_string()));
+        let planned = panel_round(&mut e, &missing, &mut HashSet::new(), |_| Err("no database".to_string()));
         assert_eq!(planned, vec![missing.clone()]);
         assert!(e.convs.contains_key(&idle), "a panel load only adds conversations");
+        // The engine loop's next merge reports its own tick's errors; the panel's must not be among them.
+        apply(&mut e, Vec::new());
         assert!(e.last_error.is_none(), "panel load errors do not reach the bar");
-        assert!(e.plan_load(&missing).is_none(), "a failed read waits for FAIL_BACKOFF");
+        assert!(e.plan_load(&missing, &mut HashSet::new()).is_none(), "a failed read waits for FAIL_BACKOFF");
+
+        // Once the language_server has it, it is read from there without waiting.
+        e.apply_summaries(&json!({ "trajectorySummaries": { missing.clone(): {} } }));
+        let plan = e.plan_load(&missing, &mut HashSet::new()).expect("planned");
+        assert!(matches!(plan.convs.as_slice(), [ConvReq::Ls { .. }]));
+    }
+
+    #[test]
+    fn panel_load_tries_a_failing_read_once_per_request() {
+        let mut e = engine();
+        let a = uuid(1);
+        e.ls_loaded.insert(a.clone());
+        let mut tried = HashSet::new();
+        let fail = |_: &str| Err("timed out".to_string());
+        assert_eq!(panel_round(&mut e, &a, &mut tried, fail), vec![a.clone()]);
+        assert!(e.plan_load(&a, &mut tried).is_none(), "the same request does not ask again");
+        assert!(e.plan_load(&a, &mut HashSet::new()).is_some(), "the next request does");
+    }
+
+    #[test]
+    fn panel_load_reads_transcript_hints_within_the_database_budget() {
+        let mut e = engine();
+        let root = uuid(1);
+        let hint = uuid(500);
+        for n in 0..DB_LOADS_PER_TICK + 6 {
+            e.summaries.insert(uuid(100 + n), Summary { root: Some(root.clone()), ..Default::default() });
+        }
+        let plan = e.plan_load(&root, &mut HashSet::new()).expect("planned");
+        assert_eq!(plan.convs.len(), DB_LOADS_PER_TICK, "root and tree members share one budget");
+
+        let mut e = engine();
+        let mut t = Transcript::new(&e.app_data, &root);
+        t.subagent_hints.insert(hint.clone());
+        e.convs.insert(root.clone(), Conv { loaded_once: true, transcript: Some(t), ..Default::default() });
+        e.disk.insert(hint.clone(), 1);
+        let ids: Vec<String> = e
+            .plan_load(&root, &mut HashSet::new())
+            .expect("planned")
+            .convs
+            .iter()
+            .map(|r| r.id().to_string())
+            .collect();
+        assert_eq!(ids, vec![hint]);
+    }
+
+    #[test]
+    fn a_database_read_planned_before_another_merge_is_stale() {
+        let mut e = engine();
+        let a = uuid(1);
+        let (older, newer) = (e.conv_req(&a), e.conv_req(&a));
+        let read = |len| {
+            Ok(ConvData::Db(Some((
+                DbSig { mtime_ms: len as i64, len },
+                vec![LiveCall::default(); len as usize],
+                Box::default(),
+            ))))
+        };
+        apply(&mut e, vec![(newer, read(3))]);
+        apply(&mut e, vec![(older, read(2))]);
+        assert_eq!(e.convs[&a].calls.len(), 3, "the read merged second was planned before the first");
+    }
+
+    #[test]
+    fn records_are_current_to_the_steps_seen_when_planned() {
+        let mut e = engine();
+        let a = uuid(1);
+        e.ls_loaded.insert(a.clone());
+        e.summaries.insert(a.clone(), Summary { step_count: 5, ..Default::default() });
+        let req = e.conv_req(&a);
+        // The engine loop refreshes the summary while this read is in flight.
+        e.summaries.get_mut(&a).unwrap().step_count = 7;
+        apply(&mut e, vec![(req, ls_page(&[record(10)]))]);
+        assert_eq!(e.convs[&a].loaded_steps, 5);
+        let plan = e.plan_convs(&HashSet::from([a.clone()]));
+        assert!(plan.convs.iter().any(|r| r.id() == a), "steps changed since the read: read again");
+    }
+
+    #[test]
+    fn a_failed_database_read_does_not_hold_back_the_language_server_read() {
+        let mut e = engine();
+        let a = uuid(1);
+        let interest = HashSet::from([a.clone()]);
+        let req = e.conv_req(&a);
+        apply(&mut e, vec![(req, Err("no database yet".to_string()))]);
+        assert!(e.plan_convs(&interest).convs.is_empty(), "the database read backs off");
+        e.apply_summaries(&json!({ "trajectorySummaries": { a.clone(): {} } }));
+        assert!(matches!(e.plan_convs(&interest).convs.as_slice(), [ConvReq::Ls { .. }]));
     }
 }
