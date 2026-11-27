@@ -6,14 +6,13 @@
 
 use crate::call::{Call, ModelAgg, ModelId, Tokens};
 use crate::config::{ModelRule, OnlinePrices, effective_model_rules};
+use crate::day::LocalDay;
 use serde::Serialize;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
 /// Label for usage of models no rule matches; it costs nothing.
 pub const OTHER: &str = "Other";
-
-const DAY_MS: i64 = 86_400_000;
 
 /// USD per 1M tokens.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -146,30 +145,30 @@ impl Pricer {
         self.cost(&c.model, &c.tokens, c.at_ms)
     }
 
-    /// True when some price changes during the day starting at `day_start_ms`. Such a day is
-    /// priced call by call, so pass its calls to [`Pricer::price_day`].
-    pub fn is_cut_day(&self, day_start_ms: i64) -> bool {
+    /// True when some price changes during `day` (after its first instant, up to its end). Such a
+    /// day is priced call by call, so pass its calls to [`Pricer::price_day`].
+    pub fn is_cut_day(&self, day: &LocalDay) -> bool {
         self.rules
             .iter()
             .flat_map(|r| &r.tiers)
             .filter_map(|t| t.until_ms)
-            .any(|u| u > day_start_ms && u <= day_start_ms + DAY_MS)
+            .any(|u| u > day.start_ms() && u <= day.end_ms())
     }
 
     /// Prices one day of daily aggregates (keys as written by [`ModelId::bucket_key`]).
     ///
     /// On a price-cut day with `exact` calls, each call is priced at its own time and whatever the
-    /// aggregates hold beyond those calls (the remainder, e.g. from deleted databases) at noon.
-    /// Otherwise everything is priced at noon.
+    /// aggregates hold beyond those calls (the remainder, e.g. from deleted databases) at local
+    /// noon. Otherwise everything is priced at local noon.
     pub fn price_day<'a>(
         &self,
         aggregates: impl IntoIterator<Item = (&'a String, &'a ModelAgg)>,
         exact: Option<&[Call]>,
-        day_start_ms: i64,
+        day: &LocalDay,
     ) -> DayCost {
-        let noon = day_start_ms + DAY_MS / 2;
+        let noon = day.noon_ms();
         let mut out = DayCost::new();
-        let Some(exact) = exact.filter(|_| self.is_cut_day(day_start_ms)) else {
+        let Some(exact) = exact.filter(|_| self.is_cut_day(day)) else {
             for (key, agg) in aggregates {
                 let model = ModelId::from_bucket_key(key);
                 let e = out.entry(self.label(&model)).or_default();
@@ -216,10 +215,24 @@ fn contains_lowercased(hay: &str, pat: &str) -> bool {
 mod tests {
     use super::*;
     use crate::config::PriceTier;
+    use crate::day::tests::{date, fall_back, spring_forward, utc_ms};
+    use chrono::FixedOffset;
 
+    /// 2027-01-15T08:00:00Z.
     const CUT: i64 = 1_800_000_000_000;
+    const HOUR: i64 = 3_600_000;
+
+    /// The day containing [`CUT`] in a zone where the cut lands at 10:00, before noon.
+    fn cut_day() -> LocalDay {
+        LocalDay::of_in(CUT, &FixedOffset::east_opt(2 * 3600).unwrap())
+    }
 
     fn rule(pattern: &str, short: &str) -> ModelRule {
+        rule_cut_at(pattern, short, CUT)
+    }
+
+    /// $2/M input until `cut`, $4/M after.
+    fn rule_cut_at(pattern: &str, short: &str, cut: i64) -> ModelRule {
         let tier = |until_ms, input_per_m| PriceTier {
             until_ms,
             input_per_m,
@@ -230,7 +243,7 @@ mod tests {
         ModelRule {
             pattern: pattern.into(),
             short_name: short.into(),
-            tiers: vec![tier(Some(CUT), 2.0), tier(None, 4.0)],
+            tiers: vec![tier(Some(cut), 2.0), tier(None, 4.0)],
             ..Default::default()
         }
     }
@@ -274,8 +287,9 @@ mod tests {
     #[test]
     fn price_cut_day_prices_calls_exactly_and_the_remainder_at_noon() {
         let p = pricer();
-        let day = CUT - 10 * 3_600_000; // the cut lands at 10:00, before noon
-        assert!(p.is_cut_day(day));
+        let day = cut_day();
+        assert_eq!(day.start_ms(), CUT - 10 * HOUR);
+        assert!(p.is_cut_day(&day));
         let m = ModelId::new("hydrogen", "Gemini 4 Hydrogen");
         let mut agg = ModelAgg::default();
         agg.add_tokens(&Tokens { input: 300_000, ..Default::default() });
@@ -284,7 +298,7 @@ mod tests {
         let aggs = aggs.iter().map(|(k, a)| (k, a));
 
         // One surviving call before the cut ($2/M); the other 300k are the remainder, at noon ($4/M).
-        let day_cost = p.price_day(aggs, Some(&[call(&m, 100_000, day + 3_600_000)]), day);
+        let day_cost = p.price_day(aggs, Some(&[call(&m, 100_000, day.start_ms() + HOUR)]), &day);
         let (usd, totals) = &day_cost["Hydrogen"];
         assert_eq!((totals.calls, totals.input), (2, 400_000));
         assert!((usd - (0.2 + 1.2)).abs() < 1e-9, "got {usd}");
@@ -293,12 +307,12 @@ mod tests {
     #[test]
     fn price_cut_day_counts_a_call_once_when_raw_alone_would_match_another_rule() {
         let p = pricer();
-        let day = CUT - 10 * 3_600_000;
+        let day = cut_day();
         let m = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
         let mut agg = ModelAgg::default();
         agg.add_tokens(&Tokens { input: 50_000, ..Default::default() });
         let aggs = [(m.bucket_key(), agg)];
-        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[call(&m, 50_000, CUT + 1)]), day);
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[call(&m, 50_000, CUT + 1)]), &day);
         assert_eq!(day_cost.keys().collect::<Vec<_>>(), vec!["Hydrogen"]);
         assert_eq!(day_cost["Hydrogen"].1.calls, 1);
     }
@@ -306,12 +320,51 @@ mod tests {
     #[test]
     fn ordinary_day_prices_aggregates_at_noon() {
         let p = pricer();
-        let day = CUT + 5 * DAY_MS;
-        assert!(!p.is_cut_day(day));
+        let day = LocalDay::of_in(CUT + 5 * 24 * HOUR, &FixedOffset::east_opt(2 * 3600).unwrap());
+        assert!(!p.is_cut_day(&day));
         let mut agg = ModelAgg::default();
         agg.add_tokens(&Tokens { input: 1_000_000, ..Default::default() });
         let aggs = [("hydrogen".to_string(), agg)]; // a key written before ADR 0001
-        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[]), day);
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[]), &day);
         assert_eq!(day_cost["Hydrogen"].0, 4.0);
+    }
+
+    fn one_rule_cut_at(cut: i64) -> Pricer {
+        Pricer::from_rules(vec![rule_cut_at("hydrogen", "Hydrogen", cut)], cut)
+    }
+
+    #[test]
+    fn a_cut_in_the_25th_hour_of_a_fall_back_day_is_on_that_day() {
+        let tz = fall_back();
+        let day = LocalDay::on_in(date("2026-10-25"), &tz);
+        // Local 23:30, 24.5 hours after the day began.
+        let cut = utc_ms("2026-10-25T22:30:00Z");
+        assert_eq!(cut - day.start_ms(), 24 * HOUR + 30 * 60_000);
+        assert!(one_rule_cut_at(cut).is_cut_day(&day));
+        assert!(!one_rule_cut_at(cut).is_cut_day(&LocalDay::on_in(date("2026-10-26"), &tz)));
+    }
+
+    #[test]
+    fn a_cut_just_after_a_spring_forward_day_is_on_the_next_day() {
+        let tz = spring_forward();
+        let day = LocalDay::on_in(date("2026-03-29"), &tz);
+        // Local 00:30 on the 30th, 23.5 hours after the 29th began.
+        let cut = utc_ms("2026-03-29T22:30:00Z");
+        assert!(!one_rule_cut_at(cut).is_cut_day(&day));
+        assert!(one_rule_cut_at(cut).is_cut_day(&LocalDay::on_in(date("2026-03-30"), &tz)));
+    }
+
+    #[test]
+    fn aggregates_are_priced_at_wall_clock_noon_on_a_dst_day() {
+        let tz = spring_forward();
+        let day = LocalDay::on_in(date("2026-03-29"), &tz);
+        // Local 12:30: after noon (11 hours in), but before `start + 12h`.
+        let cut = utc_ms("2026-03-29T10:30:00Z");
+        let p = one_rule_cut_at(cut);
+        let mut agg = ModelAgg::default();
+        agg.add_tokens(&Tokens { input: 1_000_000, ..Default::default() });
+        let aggs = [("hydrogen".to_string(), agg)];
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), None, &day);
+        assert_eq!(day_cost["Hydrogen"].0, 2.0, "priced at local noon, before the cut");
     }
 }

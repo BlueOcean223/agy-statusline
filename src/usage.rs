@@ -11,6 +11,7 @@ use crate::call::{CLI, Call, DESKTOP, DedupSet, ModelAgg, ModelId, Tokens};
 use crate::cli_usage::{CliBackfillMeta, CliSnapshot, read_cli_titles};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, is_uuid_db, read_calls, signature};
+use crate::day::LocalDay;
 use crate::miss::{MissInfo, MissSummary, miss_scan};
 use crate::pricing::{DayCost, Pricer, day_sum};
 use crate::quota::QuotaKind;
@@ -19,7 +20,6 @@ pub use crate::quota::{
     note_quota, note_reset_event, r4, replay_from_samples, same_period,
 };
 use crate::transcript::{read_annotation, scan_step_markers};
-use chrono::{Local, TimeZone};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -34,42 +34,6 @@ pub const DEFAULT_DAY_CALLS_LIMIT: usize = 600;
 
 fn r6(v: f64) -> f64 {
     (v * 1_000_000.0).round() / 1_000_000.0
-}
-
-pub fn local_day_str(ms: i64) -> String {
-    Local
-        .timestamp_millis_opt(ms)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%d").to_string())
-        .unwrap_or_else(|| Local::now().format("%Y-%m-%d").to_string())
-}
-
-pub fn today_str() -> String {
-    Local::now().format("%Y-%m-%d").to_string()
-}
-
-pub fn day_start_ms(date: &str) -> Option<i64> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").ok().and_then(|d| day_start_in(d, &Local))
-}
-
-/// First instant of `date` in `tz`, in Unix ms. Usually local 00:00, but where DST starts at
-/// midnight (America/Santiago, Asia/Beirut, ...) 00:00 does not exist and the day begins at the
-/// end of the gap, e.g. 01:00. Scans forward minute by minute; `None` only if no valid local
-/// minute exists within 24h of midnight (a day skipped entirely, like Samoa's 2011-12-30, yields
-/// the next day's start).
-pub(crate) fn day_start_in<Tz: TimeZone>(date: chrono::NaiveDate, tz: &Tz) -> Option<i64> {
-    let midnight = date.and_time(chrono::NaiveTime::MIN);
-    (0..=24 * 60).find_map(|m| {
-        let local = midnight.checked_add_signed(chrono::Duration::minutes(m))?;
-        local.and_local_timezone(tz.clone()).earliest().map(|dt| dt.timestamp_millis())
-    })
-}
-
-fn prev_day_str(date: &str) -> Option<String> {
-    chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .ok()?
-        .checked_sub_days(chrono::Days::new(1))
-        .map(|d| d.format("%Y-%m-%d").to_string())
 }
 
 // ---------------------------------------------------------------- account masking
@@ -200,16 +164,16 @@ pub fn load_history(plugin_data: &Path) -> UsageHistory {
     match read_json_keep::<UsageHistory>(&path) {
         ReadFile::Ok(mut h) => {
             if h.live_from.is_empty() {
-                h.live_from = today_str();
+                h.live_from = LocalDay::today().key();
             }
             h.writable = true;
             h
         }
         ReadFile::Missing | ReadFile::Corrupt { kept: true } => {
-            UsageHistory { v: 2, live_from: today_str(), writable: true, ..Default::default() }
+            UsageHistory { v: 2, live_from: LocalDay::today().key(), writable: true, ..Default::default() }
         }
         ReadFile::Unreadable | ReadFile::Corrupt { kept: false } => {
-            UsageHistory { v: 2, live_from: today_str(), writable: false, ..Default::default() }
+            UsageHistory { v: 2, live_from: LocalDay::today().key(), writable: false, ..Default::default() }
         }
     }
 }
@@ -247,8 +211,8 @@ pub fn maybe_replay_samples(h: &mut UsageHistory, samples: &QuotaSamples) -> boo
         let changes = replay_from_samples(
             &mut days_qa,
             samples,
-            local_day_str,
-            |d| day_start_ms(d).unwrap_or(0),
+            |ms| LocalDay::of(ms).key(),
+            |d| LocalDay::parse(d).map_or(0, |d| d.start_ms()),
             |acct_key, b, at_ms, ev| {
                 note_reset_event(&mut resets, acct_key, b, at_ms, ev);
                 note_cycle_end(&mut cycles, acct_key, b, at_ms, ev);
@@ -476,7 +440,7 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
         h.bf = Some(BackfillMeta { version: BACKFILL_V, at_ms: now_ms, ..Default::default() });
         return true;
     };
-    let today = today_str();
+    let today = LocalDay::today();
     let mut seen = DedupSet::default();
     let mut acc: BTreeMap<String, (HashMap<String, ModelAgg>, HashSet<String>)> = BTreeMap::new();
     let (mut dbs, mut calls, mut errors) = (0usize, 0usize, 0usize);
@@ -491,11 +455,11 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
                     if !seen.insert(&r) {
                         continue;
                     }
-                    let day = local_day_str(r.at_ms);
+                    let day = LocalDay::of(r.at_ms);
                     if day >= today {
                         continue;
                     }
-                    let (raw, convs) = acc.entry(day).or_default();
+                    let (raw, convs) = acc.entry(day.key()).or_default();
                     raw.entry(r.model.bucket_key()).or_default().add_tokens(&r.tokens);
                     convs.insert(r.conv_id);
                     calls += 1;
@@ -717,44 +681,35 @@ impl DayCallCache {
         cli_dir: &Path,
         plugin_data: &Path,
         cli: &mut CliSnapshot,
-        date: &str,
+        day: &LocalDay,
         live_calls: &[Call],
     ) -> &'a [Call] {
-        if !self.days.contains_key(date) {
+        self.days.entry(day.key()).or_insert_with(|| {
             let dbs = self.desktop_dbs.get_or_insert_with(|| list_desktop_dbs(app_data));
-            let calls = collect_all_day_calls(dbs, cli_dir, plugin_data, cli, date, live_calls);
-            self.days.insert(date.to_string(), calls);
-        }
-        self.days.get(date).map(Vec::as_slice).unwrap_or(&[])
+            collect_all_day_calls(dbs, cli_dir, plugin_data, cli, day, live_calls)
+        })
     }
 }
 
-/// Collects all desktop + CLI calls for a single calendar day (`YYYY-MM-DD`).
+/// Collects all desktop + CLI calls for a single local day.
 fn collect_all_day_calls(
     desktop_dbs: &[DesktopDb],
     cli_dir: &Path,
     plugin_data: &Path,
     cli: &mut CliSnapshot,
-    date: &str,
+    day: &LocalDay,
     live_calls: &[Call],
 ) -> Vec<Call> {
-    let Some(start) = day_start_ms(date) else {
-        return Vec::new();
-    };
-    // Add 26h buffer then filter by exact local_day_str to stay DST-safe.
-    let mut out: Vec<Call> = collect_desktop_calls_in_range(desktop_dbs, start, start + 26 * 3_600_000, live_calls)
-        .into_iter()
-        .filter(|c| local_day_str(c.at_ms) == date)
-        .collect();
-    out.extend(cli.calls_for_day(cli_dir, plugin_data, date));
+    let mut out = collect_desktop_calls_in_range(desktop_dbs, day.start_ms(), day.end_ms(), live_calls);
+    out.extend(cli.calls_for_day(cli_dir, plugin_data, &day.key()));
     out
 }
 
 type AnalyzedCall = (Call, Option<String>, f64, Option<MissInfo>);
 
-/// Runs per-conversation chronological `miss_scan` for `date`, seeding each active conversation
+/// Runs per-conversation chronological `miss_scan` for `day`, seeding each active conversation
 /// with its previous-day calls so cross-midnight first cache misses are accurately detected,
-/// while returning only `date`'s calls and miss totals.
+/// while returning only `day`'s calls and miss totals.
 #[allow(clippy::too_many_arguments)]
 fn analyze_day_calls_with_miss(
     app_data: &Path,
@@ -762,11 +717,11 @@ fn analyze_day_calls_with_miss(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     day_cache: &mut DayCallCache,
-    date: &str,
+    day: &LocalDay,
     live_calls: &[Call],
     pricer: &Pricer,
 ) -> (Vec<AnalyzedCall>, MissSummary) {
-    let target_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, date, live_calls).to_vec();
+    let target_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, day, live_calls).to_vec();
     if target_calls.is_empty() {
         return (Vec::new(), MissSummary::default());
     }
@@ -774,13 +729,11 @@ fn analyze_day_calls_with_miss(
         target_calls.iter().map(|c| (c.source, c.conv_id.clone())).collect();
 
     let mut by_conv: HashMap<(&'static str, String), Vec<Call>> = HashMap::new();
-    if let Some(prev_date) = prev_day_str(date) {
-        let prev_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, &prev_date, live_calls);
-        for c in prev_calls {
-            let key = (c.source, c.conv_id.clone());
-            if active_convs.contains(&key) {
-                by_conv.entry(key).or_default().push(c.clone());
-            }
+    let prev_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, &day.prev(), live_calls);
+    for c in prev_calls {
+        let key = (c.source, c.conv_id.clone());
+        if active_convs.contains(&key) {
+            by_conv.entry(key).or_default().push(c.clone());
         }
     }
     for c in target_calls {
@@ -799,7 +752,7 @@ fn analyze_day_calls_with_miss(
             .map(|c| (pricer.rule(&c.model).map(|r| r.short_name.clone()), pricer.call_cost(c).total()))
             .collect();
         for ((c, (short_opt, usd)), miss_opt) in list.into_iter().zip(priced).zip(misses) {
-            if local_day_str(c.at_ms) != date {
+            if !day.contains(c.at_ms) {
                 continue;
             }
             summary.total_usd += usd;
@@ -837,17 +790,17 @@ fn cycle_spend(
     }
     let kind = QuotaKind::of_bucket_id(bucket_id);
     let in_group = |c: &&Call| kind.counts(&c.model);
-    let start_day = local_day_str(from_ms);
-    let end_day = local_day_str(to_ms.saturating_sub(1).max(from_ms));
+    let start_day = LocalDay::of(from_ms);
+    let end_day = LocalDay::of(to_ms.saturating_sub(1).max(from_ms));
     let mut usd = 0.0;
     let mut tokens = 0u64;
     let mut all_boundaries_exact = true;
     let mut any_exact_boundary = false;
 
     // 1. Boundary day(s): exact call-level filtering over [from_ms, to_ms).
-    let mut boundary_days = vec![start_day.clone()];
+    let mut boundary_days = vec![start_day];
     if end_day != start_day {
-        boundary_days.push(end_day.clone());
+        boundary_days.push(end_day);
     }
     for bd in &boundary_days {
         let day_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, bd, live_calls);
@@ -857,14 +810,12 @@ fn cycle_spend(
                 usd += pricer.call_cost(c).total();
                 tokens += c.tokens.total();
             }
-        } else if let Some(drec) = h.days.get(bd)
-            && let Some(d_start) = day_start_ms(bd)
-        {
+        } else if let Some(drec) = h.days.get(&bd.key()) {
             let aggs: Vec<_> = group_aggregates(drec, bucket_id).collect();
             if aggs.iter().any(|(_, a)| a.calls > 0) {
                 // Boundary day had usage in persisted summary but no raw call details: whole-day fallback.
                 all_boundaries_exact = false;
-                let (u, t) = day_sum(&pricer.price_day(aggs, None, d_start));
+                let (u, t) = day_sum(&pricer.price_day(aggs, None, bd));
                 usd += u;
                 tokens += t;
             }
@@ -872,16 +823,16 @@ fn cycle_spend(
     }
 
     // 2. Full calendar days strictly between `start_day` and `end_day`.
-    for (dk, drec) in h.days.range(start_day.clone()..=end_day.clone()) {
-        if dk == &start_day || dk == &end_day {
+    for (dk, drec) in h.days.range(start_day.key()..=end_day.key()) {
+        let Some(day) = LocalDay::parse(dk) else { continue };
+        if day == start_day || day == end_day {
             continue;
         }
-        let Some(d_start) = day_start_ms(dk) else { continue };
-        let exact: Option<Vec<Call>> = pricer.is_cut_day(d_start).then(|| {
-            let day_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls);
+        let exact: Option<Vec<Call>> = pricer.is_cut_day(&day).then(|| {
+            let day_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, &day, live_calls);
             day_calls.iter().filter(in_group).cloned().collect()
         });
-        let (u, t) = day_sum(&pricer.price_day(group_aggregates(drec, bucket_id), exact.as_deref(), d_start));
+        let (u, t) = day_sum(&pricer.price_day(group_aggregates(drec, bucket_id), exact.as_deref(), &day));
         usd += u;
         tokens += t;
     }
@@ -915,8 +866,7 @@ pub fn build_usage_view(
 ) -> Value {
     let mut day_cache = DayCallCache::default();
     let is_all = span_req.eq_ignore_ascii_case("all");
-    let today = today_str();
-    let today_date = Local::now().date_naive();
+    let today = LocalDay::today();
     let acct_key = h.cur_acct.as_deref();
 
     let span_days: usize = if is_all {
@@ -924,9 +874,9 @@ pub fn build_usage_view(
             .days
             .iter()
             .find(|(_, d)| !d.raw.is_empty() || !d.cli_raw.is_empty())
-            .and_then(|(k, _)| chrono::NaiveDate::parse_from_str(k, "%Y-%m-%d").ok());
+            .and_then(|(k, _)| LocalDay::parse(k));
         match earliest {
-            Some(first) => ((today_date - first).num_days().max(0) as usize + 1).clamp(7, HISTORY_KEEP_DAYS),
+            Some(first) => ((today.date() - first.date()).num_days().max(0) as usize + 1).clamp(7, HISTORY_KEEP_DAYS),
             None => 7,
         }
     } else if span_req.parse::<usize>().unwrap_or(7) >= 20 {
@@ -935,52 +885,45 @@ pub fn build_usage_view(
         7
     };
 
-    let mut date_keys: Vec<String> = (0..span_days)
-        .rev()
-        .filter_map(|offset| {
-            today_date.checked_sub_days(chrono::Days::new(offset as u64)).map(|d| d.format("%Y-%m-%d").to_string())
-        })
-        .collect();
-    if date_keys.is_empty() {
-        date_keys.push(today.clone());
-    }
+    // The last `span_days` days, oldest first, ending today.
+    let span: Vec<LocalDay> = (0..span_days.max(1)).rev().map(|n| today.back(n)).collect();
 
     // Index early-reset events by calendar day for the active account.
     let acct_resets: Vec<&ResetEvent> =
         acct_key.map(|ak| h.resets.iter().filter(|r| r.acct_key == ak).collect()).unwrap_or_default();
     let mut resets_by_day: HashMap<String, Vec<Value>> = HashMap::new();
     for r in &acct_resets {
-        resets_by_day.entry(local_day_str(r.at_ms)).or_default().push(json!(r));
+        resets_by_day.entry(LocalDay::of(r.at_ms).key()).or_default().push(json!(r));
     }
 
     let mut model_totals: HashMap<String, (f64, u64, u64)> = HashMap::new();
-    let mut days_out: Vec<Value> = Vec::with_capacity(date_keys.len());
+    let mut days_out: Vec<Value> = Vec::with_capacity(span.len());
     let mut total_usd = 0.0;
     let mut total_tokens = 0u64;
     let mut total_calls = 0u64;
     let mut active_days = 0usize;
     let mut has_cli = false;
 
-    for dk in &date_keys {
-        let d_start = day_start_ms(dk).unwrap_or(now_ms);
+    for day in &span {
+        let dk = &day.key();
         let rec = h.days.get(dk);
 
         let mut by_model = DayCost::new();
         let mut day_usd = 0.0;
-        let mut day = ModelAgg::default();
+        let mut totals = ModelAgg::default();
         let mut day_cli_calls = 0u64;
 
         if let Some(r) = rec {
             let persisted_cli_calls = conv_calls(&r.cli_raw);
             // On price-cut days, the calls still on disk are priced at their own time.
             let exact: Option<Vec<Call>> = pricer
-                .is_cut_day(d_start)
-                .then(|| day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls).to_vec());
+                .is_cut_day(day)
+                .then(|| day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, day, live_calls).to_vec());
             let exact_cli_calls = exact.iter().flatten().filter(|c| c.source == CLI).count() as u64;
-            by_model = pricer.price_day(r.raw.iter().chain(r.cli_raw.iter()), exact.as_deref(), d_start);
+            by_model = pricer.price_day(r.raw.iter().chain(r.cli_raw.iter()), exact.as_deref(), day);
             for (usd, agg) in by_model.values() {
                 day_usd += usd;
-                day.merge_from(agg);
+                totals.merge_from(agg);
             }
             day_cli_calls = exact_cli_calls.max(persisted_cli_calls);
             if day_cli_calls > 0 {
@@ -995,13 +938,13 @@ pub fn build_usage_view(
             e.2 += agg.total_tokens();
         }
 
-        let day_tokens = day.total_tokens();
-        if day.calls > 0 {
+        let day_tokens = totals.total_tokens();
+        if totals.calls > 0 {
             active_days += 1;
         }
         total_usd += day_usd;
         total_tokens += day_tokens;
-        total_calls += day.calls;
+        total_calls += totals.calls;
 
         let (mut q_gemini, mut q_claude) = (None::<f64>, None::<f64>);
         if let (Some(r), Some(ak)) = (rec, acct_key)
@@ -1042,18 +985,18 @@ pub fn build_usage_view(
         let day_resets = resets_by_day.get(dk).cloned().unwrap_or_default();
         days_out.push(json!({
             "date": dk,
-            "isToday": dk == &today,
+            "isToday": *day == today,
             "bf": rec.is_some_and(|r| r.bf),
             "convs": rec.map(|r| r.convs + r.cli_convs).unwrap_or(0),
             "cliCalls": day_cli_calls,
             "usd": r6(day_usd),
-            "calls": day.calls,
-            "in": day.input,
-            "cr": day.cache_read,
-            "cw": day.cache_write,
-            "out": day.output,
+            "calls": totals.calls,
+            "in": totals.input,
+            "cr": totals.cache_read,
+            "cw": totals.cache_write,
+            "out": totals.output,
             "tokens": day_tokens,
-            "hit": day.tokens().cache_hit(),
+            "hit": totals.tokens().cache_hit(),
             "qGemini": q_gemini,
             "qClaude": q_claude,
             "resets": day_resets,
@@ -1273,8 +1216,12 @@ pub fn build_day_calls_view(
 ) -> Value {
     let mut day_cache = DayCallCache::default();
     let cli_titles = read_cli_titles(cli_dir);
-    let (analyzed, miss_summary) =
-        analyze_day_calls_with_miss(app_data, cli_dir, plugin_data, cli, &mut day_cache, date, live_calls, pricer);
+    let (analyzed, miss_summary) = match LocalDay::parse(date) {
+        Some(day) => {
+            analyze_day_calls_with_miss(app_data, cli_dir, plugin_data, cli, &mut day_cache, &day, live_calls, pricer)
+        }
+        None => (Vec::new(), MissSummary::default()),
+    };
 
     let mut titles: HashMap<(&'static str, String), String> = HashMap::new();
     let mut tot_usd = 0.0;
@@ -1445,94 +1392,6 @@ mod tests {
     use crate::call::{ModelId, Tokens};
     use crate::config::ModelRule;
 
-    /// A zone with one offset change at `at_ms` (UTC), so DST cases are testable without
-    /// depending on the machine's timezone or a tz database.
-    #[derive(Clone, Copy, Debug)]
-    struct OneShift {
-        at_ms: i64,
-        before_secs: i32,
-        after_secs: i32,
-    }
-
-    impl TimeZone for OneShift {
-        type Offset = chrono::FixedOffset;
-
-        fn from_offset(offset: &chrono::FixedOffset) -> Self {
-            let secs = offset.local_minus_utc();
-            OneShift { at_ms: i64::MAX, before_secs: secs, after_secs: secs }
-        }
-
-        fn offset_from_local_date(&self, local: &chrono::NaiveDate) -> chrono::MappedLocalTime<chrono::FixedOffset> {
-            self.offset_from_local_datetime(&local.and_time(chrono::NaiveTime::MIN))
-        }
-
-        fn offset_from_local_datetime(
-            &self,
-            local: &chrono::NaiveDateTime,
-        ) -> chrono::MappedLocalTime<chrono::FixedOffset> {
-            let utc_ms = |off: i32| local.and_utc().timestamp_millis() - i64::from(off) * 1000;
-            let fixed = |off: i32| chrono::FixedOffset::east_opt(off).unwrap();
-            let before = (utc_ms(self.before_secs) < self.at_ms).then(|| fixed(self.before_secs));
-            let after = (utc_ms(self.after_secs) >= self.at_ms).then(|| fixed(self.after_secs));
-            match (before, after) {
-                (Some(a), Some(b)) => chrono::MappedLocalTime::Ambiguous(a, b),
-                (Some(o), None) | (None, Some(o)) => chrono::MappedLocalTime::Single(o),
-                (None, None) => chrono::MappedLocalTime::None,
-            }
-        }
-
-        fn offset_from_utc_date(&self, utc: &chrono::NaiveDate) -> chrono::FixedOffset {
-            self.offset_from_utc_datetime(&utc.and_time(chrono::NaiveTime::MIN))
-        }
-
-        fn offset_from_utc_datetime(&self, utc: &chrono::NaiveDateTime) -> chrono::FixedOffset {
-            let secs = if utc.and_utc().timestamp_millis() < self.at_ms { self.before_secs } else { self.after_secs };
-            chrono::FixedOffset::east_opt(secs).unwrap()
-        }
-    }
-
-    fn utc_ms(s: &str) -> i64 {
-        chrono::DateTime::parse_from_rfc3339(s).unwrap().timestamp_millis()
-    }
-
-    fn date(s: &str) -> chrono::NaiveDate {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
-    }
-
-    #[test]
-    fn day_start_is_midnight_on_ordinary_days() {
-        assert_eq!(day_start_in(date("2026-11-27"), &chrono::Utc), Some(utc_ms("2026-11-27T00:00:00Z")));
-        let plus8 = chrono::FixedOffset::east_opt(8 * 3600).unwrap();
-        assert_eq!(day_start_in(date("2026-11-27"), &plus8), Some(utc_ms("2026-11-26T16:00:00Z")));
-    }
-
-    #[test]
-    fn day_start_skips_a_dst_gap_at_midnight() {
-        // Santiago-style: at local 00:00 (-04) clocks jump to 01:00 (-03).
-        let tz = OneShift { at_ms: utc_ms("2026-09-06T04:00:00Z"), before_secs: -4 * 3600, after_secs: -3 * 3600 };
-        let midnight = date("2026-09-06").and_time(chrono::NaiveTime::MIN);
-        assert!(midnight.and_local_timezone(tz).earliest().is_none(), "00:00 must not exist in this zone");
-        assert_eq!(day_start_in(date("2026-09-06"), &tz), Some(utc_ms("2026-09-06T04:00:00Z")));
-        // Neighbouring days are unaffected.
-        assert_eq!(day_start_in(date("2026-09-05"), &tz), Some(utc_ms("2026-09-05T04:00:00Z")));
-        assert_eq!(day_start_in(date("2026-09-07"), &tz), Some(utc_ms("2026-09-07T03:00:00Z")));
-    }
-
-    #[test]
-    fn day_start_takes_the_earlier_of_a_repeated_midnight() {
-        // At local 01:00 (+01) clocks fall back to 00:00 (+00), so 00:00–01:00 happens twice.
-        let tz = OneShift { at_ms: utc_ms("2026-10-25T00:00:00Z"), before_secs: 3600, after_secs: 0 };
-        assert_eq!(day_start_in(date("2026-10-25"), &tz), Some(utc_ms("2026-10-24T23:00:00Z")));
-    }
-
-    #[test]
-    fn day_start_of_a_skipped_day_is_the_next_day_start() {
-        // Samoa 2011: 2011-12-29 24:00 (-10) became 2011-12-31 00:00 (+14).
-        let tz = OneShift { at_ms: utc_ms("2011-12-30T10:00:00Z"), before_secs: -10 * 3600, after_secs: 14 * 3600 };
-        assert_eq!(day_start_in(date("2011-12-30"), &tz), Some(utc_ms("2011-12-30T10:00:00Z")));
-        assert_eq!(day_start_in(date("2011-12-31"), &tz), Some(utc_ms("2011-12-30T10:00:00Z")));
-    }
-
     #[test]
     fn masks_emails_and_hashes_deterministically() {
         assert_eq!(mask_email("alice.smith@gmail.com"), "al***th@gmail.com");
@@ -1609,8 +1468,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        let today = today_str();
-        let d_start = day_start_ms(&today).unwrap();
+        let day = LocalDay::today();
+        let today = day.key();
+        let d_start = day.start_ms();
         let cut_ms = d_start + 16 * 3_600_000;
         let rules = vec![ModelRule {
             pattern: "carbon".into(),
@@ -1690,8 +1550,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
 
-        let today = today_str();
-        let d_start = day_start_ms(&today).unwrap();
+        let day = LocalDay::today();
+        let today = day.key();
+        let d_start = day.start_ms();
         let cut_ms = d_start + 16 * 3_600_000;
         let rule = |pattern: &str, short: &str| ModelRule {
             pattern: pattern.into(),
@@ -1770,7 +1631,7 @@ mod tests {
 
         let rules = crate::config::default_model_rules();
         let day2 = "2026-11-25";
-        let midnight = day_start_ms(day2).unwrap();
+        let midnight = LocalDay::parse(day2).unwrap().start_ms();
         let conv_id = "00000000-0000-4000-8000-0000000000aa";
 
         let live = vec![
@@ -1854,7 +1715,7 @@ mod tests {
         fs::create_dir_all(root.join("conversations")).unwrap();
         let cid = "00000000-0000-4000-8000-0000000000cc";
         let db_path = root.join("conversations").join(format!("{cid}.db"));
-        let today = today_str();
+        let today = LocalDay::today();
         let at_s = (crate::live::now_ms() / 1000) as u64;
         let row = Gen {
             input: 1000,
@@ -1915,8 +1776,8 @@ mod tests {
         let rules = crate::config::default_model_rules();
         let start_day = "2026-11-24";
         let end_day = "2026-11-25";
-        let from_ms = day_start_ms(start_day).unwrap() + 10 * 3_600_000;
-        let to_ms = day_start_ms(end_day).unwrap() + 12 * 3_600_000;
+        let from_ms = LocalDay::parse(start_day).unwrap().start_ms() + 10 * 3_600_000;
+        let to_ms = LocalDay::parse(end_day).unwrap().start_ms() + 12 * 3_600_000;
 
         // Start day only exists in persisted summary (no raw calls), while end day has live calls.
         let mut h = UsageHistory { v: 2, live_from: start_day.into(), writable: true, ..Default::default() };

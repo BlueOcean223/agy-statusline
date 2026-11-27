@@ -257,7 +257,8 @@ impl Engine {
     /// Decides what to (re)load. `interest` holds the conversations on screen (chat panes and the
     /// side panel); everything touched today is also kept current for today's cost.
     pub(super) fn plan_convs(&mut self, interest: &HashSet<String>) -> ConvPlan {
-        let Clock { now, midnight } = Clock::read();
+        let clock = Clock::read();
+        let (now, midnight) = (clock.now, clock.today.start_ms());
         let mut want: HashSet<String> = HashSet::new();
         for (id, s) in &self.summaries {
             if s.modified_ms >= midnight {
@@ -534,7 +535,7 @@ impl Engine {
     fn evict(&mut self, keep: &HashSet<String>, at: Instant) {
         let idle = |t: &Instant| at.saturating_duration_since(*t) >= EVICT_IDLE;
         let now = now_ms();
-        let today = today_str();
+        let today = LocalDay::today().key();
         if self.evict_day != today {
             // Lets yesterday's probed subagent ids be tried again; bounds the set.
             self.probed_hints.clear();
@@ -615,7 +616,7 @@ mod tests {
     fn database_reads_per_tick_are_capped_and_on_screen_conversations_go_first() {
         let mut e = engine();
         // Tomorrow is "today or later" even if local midnight passes while the test runs.
-        let now = now_ms() + 86_400_000;
+        let now = LocalDay::today().next().start_ms();
         for n in 0..DB_LOADS_PER_TICK + 6 {
             e.disk.insert(uuid(n), now);
         }

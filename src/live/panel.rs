@@ -469,33 +469,33 @@ mod tests {
     #[test]
     fn panel_of_a_root_conversation_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_root", &as_shown(&e.panel(&ids.root, &view_config(), None, CLOCK)));
+        assert_snapshot("panel_root", &as_shown(&e.panel(&ids.root, &view_config(), None, clock())));
     }
 
     #[test]
     fn panel_of_a_root_without_subagent_totals_matches_its_snapshot() {
         let (e, ids) = view_fixture();
         let cfg = Config { include_subagents: false, ..view_config() };
-        assert_snapshot("panel_root_own", &as_shown(&e.panel(&ids.root, &cfg, None, CLOCK)));
+        assert_snapshot("panel_root_own", &as_shown(&e.panel(&ids.root, &cfg, None, clock())));
     }
 
     #[test]
     fn panel_of_a_subagent_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_subagent", &as_shown(&e.panel(&ids.running, &view_config(), None, CLOCK)));
+        assert_snapshot("panel_subagent", &as_shown(&e.panel(&ids.running, &view_config(), None, clock())));
     }
 
     #[test]
     fn panel_of_an_idle_subagent_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_idle_subagent", &as_shown(&e.panel(&ids.old, &view_config(), None, CLOCK)));
+        assert_snapshot("panel_idle_subagent", &as_shown(&e.panel(&ids.old, &view_config(), None, clock())));
     }
 
     #[test]
     fn bar_payload_matches_its_snapshot() {
         let (e, ids) = view_fixture();
         let panes = HashSet::from([ids.root.clone(), ids.running.clone(), ids.other.clone()]);
-        let bar = e.build_payload(&panes, &view_config(), None, CLOCK);
+        let bar = e.build_payload(&panes, &view_config(), None, clock());
         assert_snapshot("bar", &serde_json::to_value(bar).unwrap());
     }
 

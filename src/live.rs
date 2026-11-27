@@ -19,15 +19,16 @@ use crate::config::{
     Config, OnlinePrices, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir, load_config, write_atomic,
 };
 use crate::convdb::{self, ConvMeta, DbSig};
+use crate::day::LocalDay;
 use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::pricing::{Pricer, day_sum};
 use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
-    maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
+    maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, update_today,
 };
-use chrono::{DateTime, Local, TimeZone};
+use chrono::DateTime;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::UdpSocket;
@@ -238,12 +239,12 @@ impl Conv {
     }
 }
 
-/// A conversation's cost and tokens today, valid while `rev`, local midnight and the pricing
+/// A conversation's cost and tokens today, valid while `rev`, the local day and the pricing
 /// rules' fingerprint are unchanged.
 #[derive(Clone, Copy, Debug)]
 struct TodayCost {
     rev: u64,
-    midnight: i64,
+    day: LocalDay,
     rules: u64,
     cost: f64,
     tokens: u64,
@@ -589,7 +590,7 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
                 && let Ok(mut guard) = USAGE.lock()
                 && let Some(store) = guard.as_mut()
             {
-                let today = today_str();
+                let today = LocalDay::today().key();
                 for (day, rec) in local_h.days {
                     if day < today {
                         let dst = store.history.days.entry(day).or_default();
@@ -957,11 +958,11 @@ impl Engine {
     /// Merges today's live usage into the usage store. Returns the files to write; call
     /// `PendingWrites::write` after releasing the ENGINE lock.
     pub fn sync_usage_store(&self) -> PendingWrites {
-        let midnight = Clock::read().midnight;
-        let today = crate::usage::local_day_str(midnight);
+        let day = LocalDay::today();
+        let today = day.key();
         let mut live_by_conv: HashMap<String, HashMap<String, ModelAgg>> = HashMap::new();
         for (cid, conv) in &self.convs {
-            for c in conv.calls_since(midnight) {
+            for c in conv.calls_since(day.start_ms()) {
                 live_by_conv
                     .entry(cid.clone())
                     .or_default()
@@ -1063,19 +1064,20 @@ impl Engine {
     }
 
     /// Today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`).
-    fn today_totals(&self, pricer: &Pricer, midnight: i64) -> TodayTotals {
+    fn today_totals(&self, pricer: &Pricer, day: &LocalDay) -> TodayTotals {
+        let midnight = day.start_ms();
         let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
             let (cost, tok) = match conv.today_cost.get() {
-                Some(t) if t.rev == conv.rev && t.midnight == midnight && t.rules == fp => (t.cost, t.tokens),
+                Some(t) if t.rev == conv.rev && t.day == *day && t.rules == fp => (t.cost, t.tokens),
                 _ => {
                     let (mut cost, mut tok) = (0.0, 0u64);
                     for c in conv.calls_since(midnight) {
                         cost += pricer.call_cost(c).total();
                         tok += c.tokens.total();
                     }
-                    conv.today_cost.set(Some(TodayCost { rev: conv.rev, midnight, rules: fp, cost, tokens: tok }));
+                    conv.today_cost.set(Some(TodayCost { rev: conv.rev, day: *day, rules: fp, cost, tokens: tok }));
                     (cost, tok)
                 }
             };
@@ -1083,7 +1085,7 @@ impl Engine {
             live_tok += tok;
         }
         // Snapshot today's persisted aggregates + CLI snapshot briefly under USAGE lock, then price lock-free.
-        let today = crate::usage::local_day_str(midnight);
+        let today = day.key();
         let snap = USAGE.lock().ok().and_then(|g| {
             let store = g.as_ref()?;
             let day = store.history.days.get(&today)?;
@@ -1098,7 +1100,7 @@ impl Engine {
         let persisted = snap.map(|(desk_raw, cli_raw, mut cli_snap, cd, pd)| {
             // On a price-cut day, the calls this engine holds and the CLI's calls are priced at their
             // own time, and the rest of today's aggregates at noon.
-            let cut = pricer.is_cut_day(midnight);
+            let cut = pricer.is_cut_day(day);
             let desk_exact: Vec<Call> = if cut {
                 self.convs.values().flat_map(|conv| conv.calls_since(midnight)).map(|c| c.call.clone()).collect()
             } else {
@@ -1106,10 +1108,8 @@ impl Engine {
             };
             let cli_exact =
                 if cut && !cli_raw.is_empty() { cli_snap.calls_for_day(&cd, &pd, &today) } else { Vec::new() };
-            let (desk_usd, desk_tok) =
-                day_sum(&pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), midnight));
-            let (cli_usd, cli_tok) =
-                day_sum(&pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), midnight));
+            let (desk_usd, desk_tok) = day_sum(&pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), day));
+            let (cli_usd, cli_tok) = day_sum(&pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), day));
             (desk_usd, desk_tok, cli_usd, cli_tok)
         });
         match persisted {
@@ -1167,27 +1167,19 @@ fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::St
     }
 }
 
-/// When a view is built: the wall clock, read once per request, and the start of its local day.
+/// When a view is built: the wall clock, read once per request, and the local day it falls in.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
     pub now: i64,
-    /// Local midnight starting the day that contains `now`.
-    pub midnight: i64,
+    /// The local day that contains `now`.
+    pub today: LocalDay,
 }
 
 impl Clock {
     pub fn read() -> Self {
         let now = now_ms();
-        Self { now, midnight: local_midnight_at(now) }
+        Self { now, today: LocalDay::of(now) }
     }
-}
-
-/// Local midnight of the day containing `now_ms`.
-fn local_midnight_at(now_ms: i64) -> i64 {
-    let Some(now) = Local.timestamp_millis_opt(now_ms).single() else { return now_ms };
-    // `now` is itself a valid instant of today, so the fallback is never reached in practice;
-    // if it were, counting nothing as today beats counting all history as today.
-    crate::usage::day_start_in(now.date_naive(), &Local).unwrap_or_else(|| now.timestamp_millis())
 }
 
 // ---------------------------------------------------------------- daemon loop

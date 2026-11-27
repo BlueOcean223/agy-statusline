@@ -27,9 +27,13 @@ const HOUR: i64 = 60 * MIN;
 
 /// 2026-11-27T12:00:00Z.
 pub(super) const NOW: i64 = 1_795_780_800_000;
-/// A fixed clock for view tests, with the day starting 12 hours before [`NOW`] whatever the
-/// machine's time zone.
-pub(super) const CLOCK: Clock = Clock { now: NOW, midnight: NOW - 12 * HOUR };
+/// A fixed clock for view tests: [`NOW`] on 2026-11-27 in UTC, so the day starts 12 hours before
+/// it whatever the machine's time zone.
+pub(super) fn clock() -> Clock {
+    let clock = Clock { now: NOW, today: crate::day::LocalDay::of_in(NOW, &chrono::Utc) };
+    assert_eq!(clock.today.start_ms(), NOW - 12 * HOUR);
+    clock
+}
 
 /// Pricing rules for view tests, fixed here so changes to the shipped defaults don't move them.
 pub(super) fn view_config() -> Config {

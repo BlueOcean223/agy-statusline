@@ -8,9 +8,8 @@
 use crate::call::{CLI, Call, DedupSet, ModelAgg};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, db_path, is_uuid_db, signature};
-use crate::usage::{
-    DbCache, HISTORY_KEEP_DAYS, UsageHistory, conv_calls, day_start_ms, local_day_str, read_usage_calls, today_str,
-};
+use crate::day::LocalDay;
+use crate::usage::{DbCache, HISTORY_KEEP_DAYS, UsageHistory, conv_calls, read_usage_calls};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,7 +38,7 @@ pub(crate) struct CliDbCalls {
 
 impl CliDbCalls {
     fn new(calls: Vec<Call>) -> Self {
-        let keys: Vec<String> = calls.iter().map(|c| local_day_str(c.at_ms)).collect();
+        let keys: Vec<String> = calls.iter().map(|c| LocalDay::of(c.at_ms).key()).collect();
         let mut days = keys.clone();
         days.sort();
         days.dedup();
@@ -94,7 +93,7 @@ pub struct CliBackfillMeta {
 /// Result of one background CLI SQLite scan, computed completely outside `USAGE` lock.
 pub struct CliScanDelta {
     pub from_ms: i64,
-    pub today: String,
+    pub today: LocalDay,
     pub now_ms: i64,
     pub full: bool,
     pub partial_errors: bool,
@@ -264,15 +263,14 @@ impl CliScanner {
         });
 
         let full = cli_bf.is_none_or(|b| b.version < CLI_BF_V);
-        let today = today_str();
-        let yest = local_day_str(now_ms - 86_400_000);
+        let today = LocalDay::of(now_ms);
         let from_day = if full {
-            local_day_str(now_ms - (HISTORY_KEEP_DAYS as i64 - 1) * 86_400_000)
+            today.back(HISTORY_KEEP_DAYS - 1)
         } else {
             let last_at = cli_bf.map(|b| b.at_ms).filter(|&t| t > 0).unwrap_or(now_ms);
-            yest.min(local_day_str(last_at))
+            today.prev().min(LocalDay::of(last_at))
         };
-        let from_ms = day_start_ms(&from_day).unwrap_or(now_ms - 86_400_000);
+        let from_ms = from_day.start_ms();
         let keep_from = now_ms - CLI_CALLS_KEEP_MS;
         let scan_cut = from_ms.min(keep_from);
 
@@ -356,12 +354,9 @@ impl CliScanner {
 /// Applies a completed `CliScanDelta` onto `UsageHistory` under the `USAGE` lock (microseconds).
 pub fn apply_cli_delta(h: &mut UsageHistory, mut delta: CliScanDelta) -> bool {
     let mut changed = false;
-    let mut t = delta.from_ms + 43_200_000; // Local noon step avoids DST 23h/25h skip bugs.
-    loop {
-        let d = local_day_str(t);
-        if d > delta.today {
-            break;
-        }
+    let mut day = LocalDay::of(delta.from_ms);
+    while day <= delta.today {
+        let d = day.key();
         match delta.agg.remove(&d) {
             Some((cli_raw, next_convs)) => {
                 let entry = h.days.entry(d.clone()).or_default();
@@ -386,7 +381,7 @@ pub fn apply_cli_delta(h: &mut UsageHistory, mut delta: CliScanDelta) -> bool {
             }
             None => {}
         }
-        t += 86_400_000;
+        day = day.next();
     }
 
     if delta.full || changed || h.cli_bf.as_ref().is_none_or(|b| delta.now_ms - b.at_ms > 300_000) {
@@ -510,12 +505,12 @@ mod tests {
         );
 
         let mut scanner = CliScanner::default();
-        let mut h = UsageHistory { v: 2, live_from: today_str(), writable: true, ..Default::default() };
+        let mut h = UsageHistory { v: 2, live_from: LocalDay::today().key(), writable: true, ..Default::default() };
         let delta = scanner.scan_delta(&cli_dir, &pd, h.cli_bf.as_ref(), now_ms).unwrap();
         assert!(delta.partial_errors);
         assert!(apply_cli_delta(&mut h, delta));
 
-        let today_rec = h.days.get(&today_str()).expect("healthy DB should populate today");
+        let today_rec = h.days.get(&LocalDay::today().key()).expect("healthy DB should populate today");
         assert_eq!(today_rec.cli_raw[&neon_key()].calls, 1);
         assert_eq!(today_rec.cli_convs, 1);
         let _ = fs::remove_dir_all(&root);
@@ -539,8 +534,8 @@ mod tests {
 
     #[test]
     fn cli_db_calls_buckets_calls_by_local_day_in_row_order() {
-        let d1 = day_start_ms("2026-11-20").unwrap() + 3_600_000;
-        let d2 = day_start_ms("2026-11-21").unwrap() + 3_600_000;
+        let d1 = LocalDay::parse("2026-11-20").unwrap().start_ms() + 3_600_000;
+        let d2 = LocalDay::parse("2026-11-21").unwrap().start_ms() + 3_600_000;
         let db = CliDbCalls::new(vec![call_at(d2, "a"), call_at(d1, "b"), call_at(d2 + 60_000, "c")]);
         assert_eq!(db.days, vec!["2026-11-20".to_string(), "2026-11-21".to_string()]);
         let keys = |date| db.on_day(date).filter_map(|c| c.response_id.clone()).collect::<Vec<_>>();
@@ -572,7 +567,7 @@ mod tests {
         // The first (full) scan aggregates the 40-day-old DB, then drops it from memory.
         let mut scanner = CliScanner::default();
         let delta = scanner.scan_delta(&cli_dir, &pd, None, now_ms).unwrap();
-        let old_day = local_day_str(old_at);
+        let old_day = LocalDay::of(old_at).key();
         assert_eq!(delta.agg[&old_day].0[&neon_key()].calls, 1);
         assert!(!scanner.cache.contains_key(old_fname));
         assert!(scanner.cache.contains_key(new_fname));
@@ -583,7 +578,7 @@ mod tests {
         let calls = snap.calls_for_day(&cli_dir, &pd, &old_day);
         assert_eq!(calls.iter().filter_map(|c| c.response_id.as_deref()).collect::<Vec<_>>(), vec!["req-old"]);
         assert!(lock_old(&scanner.old).contains(&conv_dir.join(old_fname)));
-        assert_eq!(snap.calls_for_day(&cli_dir, &pd, &today_str()).len(), 1);
+        assert_eq!(snap.calls_for_day(&cli_dir, &pd, &LocalDay::today().key()).len(), 1);
 
         // A scan with no DB changes hands out the same shared maps (cheap snapshot clones).
         let bf = CliBackfillMeta { version: CLI_BF_V, at_ms: now_ms };

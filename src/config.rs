@@ -862,8 +862,11 @@ mod tests {
     fn detects_price_cut_inside_day_window_and_backs_up_corrupt_config() {
         let pricer = crate::pricing::Pricer::from_rules(default_model_rules(), 0);
         let cut = pt_midnight_ms("2026-12-01").unwrap();
-        assert!(pricer.is_cut_day(cut - 3_600_000));
-        assert!(!pricer.is_cut_day(cut));
+        // In Pacific time the cut is midnight: it ends 2026-11-30 and precedes all of 2026-12-01.
+        let pt = chrono::FixedOffset::west_opt(8 * 3600).unwrap();
+        let day = |ms| crate::day::LocalDay::of_in(ms, &pt);
+        assert!(pricer.is_cut_day(&day(cut - 3_600_000)));
+        assert!(!pricer.is_cut_day(&day(cut)));
 
         let dir = std::env::temp_dir().join(format!("agy-cfg-corrupt-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

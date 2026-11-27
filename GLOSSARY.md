@@ -16,8 +16,12 @@ _Avoid_: request id, message id
 调用的产生端：桌面端 Antigravity 或 `agy CLI`。
 _Avoid_: origin, client
 
+**Local day（本地日）**:
+本机时区里的一个日历日，从当天第一个存在的时刻到次日第一个存在的时刻；夏令时切换日为 23 或 25 小时。用 `YYYY-MM-DD` 作键。
+_Avoid_: day window, 24h day
+
 **Daily aggregate（每日聚合）**:
-某一天按模型标识与来源汇总的调用数与 token，是 400 天用量历史的单位。
+某一本地日按模型标识与来源汇总的调用数与 token，是 400 天用量历史的单位。
 _Avoid_: day record, bucket
 
 ## 计价
@@ -35,11 +39,11 @@ _Avoid_: price rule, pattern
 _Avoid_: price period, tiered price
 
 **Price-cut day（降价日）**:
-当天内有任一价格档截止的自然日；这一天的花费按调用发生时间精确计价。
+当天内有任一价格档截止的本地日；这一天的花费按调用发生时间精确计价。
 _Avoid_: transition day, tier change day
 
 **Remainder（剩余用量）**:
-降价日里，每日聚合中多于能找到的精确调用的那部分用量；按当天中午的价格计价。
+降价日里，每日聚合中多于能找到的精确调用的那部分用量；按当天本地时间中午（墙钟 12:00）的价格计价。
 _Avoid_: leftover, residual
 
 **Other（未定价模型）**:

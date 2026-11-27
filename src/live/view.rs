@@ -96,7 +96,7 @@ impl<'a> ViewReq<'a> {
     }
 
     pub fn today(&self) -> TodayTotals {
-        *self.today.get_or_init(|| self.eng.today_totals(&self.pricer, self.clock.midnight))
+        *self.today.get_or_init(|| self.eng.today_totals(&self.pricer, &self.clock.today))
     }
 
     /// The status bar's payload for the conversations in `panes`.
@@ -250,7 +250,7 @@ impl<'a> ViewReq<'a> {
             for p in self.calls(cid).iter() {
                 let cost = p.cost.total();
                 cost_conv += cost;
-                if p.call.at_ms >= self.clock.midnight {
+                if p.call.at_ms >= self.clock.today.start_ms() {
                     cost_conv_today += cost;
                 } else if p.call.at_ms > 0 {
                     multi_day = true;

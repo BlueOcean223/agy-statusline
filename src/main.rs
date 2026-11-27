@@ -3,6 +3,7 @@ mod cdp;
 mod cli_usage;
 mod config;
 mod convdb;
+mod day;
 mod git;
 mod hook;
 mod http;
