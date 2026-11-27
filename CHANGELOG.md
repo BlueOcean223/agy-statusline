@@ -4,6 +4,9 @@
 
 ## [Unreleased]
 
+### 改进与修复 (Fixed & Improved)
+- **macOS 与 Windows 重启询问弹窗升级为双端统一 Rust 自绘 Material 3 对话框**：替换旧版 macOS `osascript` 与 Windows `TaskDialogIndirect` 系统弹窗，零外部 GUI 框架——共享同一套 Google Material 3 布局、明暗色板与交互状态机，底层分别由 macOS 原生 Cocoa/CoreGraphics（sRGB + Retina）与 Windows 原生 `WS_EX_LAYERED` + GDI+ `32bppPARGB`（28px 抗锯齿圆角 + Per-Monitor DPI v2，保留 `MessageBoxW` 回退）绘制；精简文案并新增左下「不再询问」复选框（勾选后自动将 `relaunch_mode` 设为 `never`），支持拖拽与 `Enter`/`Esc`/`Space` 快捷键。
+
 ## [v0.5.1] - 2026-11-26
 
 ### 改进与修复 (Fixed & Improved)

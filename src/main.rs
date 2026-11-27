@@ -9,13 +9,13 @@ mod live;
 mod ls;
 mod miss;
 mod panel;
+mod prompt_dialog;
 mod quota;
 mod relaunch;
 mod server;
 mod transcript;
 mod updater;
 mod usage;
-mod win_dialog;
 
 use clap::{Parser, Subcommand};
 use config::{find_app_data_dir, find_plugin_data_dir};
@@ -45,6 +45,13 @@ enum Commands {
     Status {
         #[arg(short, long, default_value = "")]
         conversation: String,
+    },
+    /// Show the native custom-drawn debug-port relaunch confirmation dialog (internal helper)
+    #[command(hide = true)]
+    RelaunchPrompt {
+        /// Optional theme override for testing (`light` or `dark`)
+        #[arg(long)]
+        theme: Option<String>,
     },
 }
 
@@ -149,6 +156,10 @@ fn main() {
         Some(Commands::Hook) => hook::run_hook(),
         Some(Commands::Live { ids }) => print_live(ids),
         Some(Commands::Status { conversation }) => print_status(&conversation),
+        Some(Commands::RelaunchPrompt { theme }) => {
+            let res = prompt_dialog::run_prompt_process(theme.as_deref());
+            std::process::exit(res.to_exit_code());
+        }
         None => {
             if std::env::var("ANTIGRAVITY_SIDECAR_WEB_PORT").is_ok() {
                 let _ = server::run_server(None);

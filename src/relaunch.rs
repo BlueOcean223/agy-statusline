@@ -10,7 +10,7 @@
 //! - Windows: two-stage PowerShell script escaping Antigravity's Job Object via Explorer COM
 //!   `ShellExecute` → WMI `Win32_Process.Create` → `Start-Process`, guarded by a named mutex.
 
-use crate::config::{ReadFile, load_config, read_json_keep, write_atomic};
+use crate::config::{ConfigPatch, ReadFile, apply_config_patch, load_config, read_json_keep, write_atomic};
 use crate::live::{SharedRef, now_ms};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -481,29 +481,13 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
     }
 }
 
-#[cfg(target_os = "macos")]
-const ASK_MESSAGE: &str = "这次 Antigravity 启动时未带调试端口参数（--remote-debugging-port=0），AGY Statusline 的状态栏和中文界面暂时无法注入。\n\n要现在重启 Antigravity 吗？对话记录会保留，正在运行的任务会被中断。\n\n（在侧边栏 Settings 中可修改该行为。）";
-
-fn ask_user_confirm() -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        let escaped = serde_json::to_string(ASK_MESSAGE).unwrap_or_else(|_| "\"Restart Antigravity?\"".into());
-        let script = format!(
-            "display dialog {escaped} with title \"AGY Statusline\" buttons {{\"稍后\", \"立即重启\"}} default button \"立即重启\" with icon caution"
-        );
-        let Ok(out) = Command::new("osascript").args(["-e", &script]).env_clear().envs(clean_env()).output() else {
-            return false;
-        };
-        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("立即重启")
+fn ask_user_confirm(plugin_data: &Path) -> bool {
+    let res = crate::prompt_dialog::ask_relaunch_confirm();
+    if res.dont_ask_again {
+        apply_config_patch(plugin_data, ConfigPatch { relaunch_mode: Some("never".into()), ..Default::default() });
+        append_log(plugin_data, "user checked dont-ask-again; updated relaunch_mode=never");
     }
-    #[cfg(target_os = "windows")]
-    {
-        crate::win_dialog::ask_relaunch_confirm()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        false
-    }
+    res.relaunch
 }
 
 /// Watches CDP connectivity; when unreachable for >= 20s and `relaunch_mode` is `ask` or `auto`,
@@ -607,7 +591,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
                 ),
             );
 
-            let should_go = if mode == "auto" && !recent { true } else { ask_user_confirm() };
+            let should_go = if mode == "auto" && !recent { true } else { ask_user_confirm(&plugin_data) };
             if should_go {
                 if let Err(e) = relaunch_now(&plugin_data) {
                     append_log(&plugin_data, &format!("relaunch failed: {e}"));
