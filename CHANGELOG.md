@@ -7,6 +7,7 @@
 ### 改进与修复 (Fixed & Improved)
 - **macOS 与 Windows 重启询问弹窗升级为双端统一 Rust 自绘 Material 3 对话框**：替换旧版 macOS `osascript` 与 Windows `TaskDialogIndirect` 系统弹窗，零外部 GUI 框架——共享同一套 Google Material 3 布局、明暗色板与交互状态机，底层分别由 macOS 原生 Cocoa/CoreGraphics（sRGB + Retina）与 Windows 原生 `WS_EX_LAYERED` + GDI+ `32bppPARGB`（28px 抗锯齿圆角 + Per-Monitor DPI v2，保留 `MessageBoxW` 回退）绘制；精简文案并新增左下「不再询问」复选框（勾选后自动将 `relaunch_mode` 设为 `never`），支持拖拽与 `Enter`/`Esc`/`Space` 快捷键。
 - **非调试模式启动时重启询问弹窗更快出现**：调试端口不可达的判定等待从 20 秒缩短为 3 秒，监视线程在 sidecar 启动后的前 60 秒内每 1 秒检查一次（此前固定 5 秒），弹窗由约 20–25 秒提前到约 3–4 秒；是否弹窗仍以 Antigravity 主进程命令行缺少 `--remote-debugging-port` 为准，不会因此误触发重启。
+- **修复 CLI 调试命令（`status` / `live`）在 Antigravity 2.35+ 上找不到 `language_server`**：新版 `language_server`（`--standalone --subclient_type hub`）改从 stdin 读取令牌，命令行不再带 `--csrf_token`，导致不经 sidecar 环境变量的发现逻辑总是失败。现在依次尝试：旧版 `--csrf_token` 参数；新版写入的 `~/.gemini/antigravity/daemon/hub_<port>.json` 发现文件（仅当其中 pid 为正在运行的 `language_server` 时采用）；最后读取正在运行的 agy-statusline sidecar 进程环境中的 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`。只连接回环地址，探测仅调用 `GetAllCascadeTrajectories`，不会让 `language_server` 加载新对话；sidecar 内的连接方式不变。
 
 ## [v0.5.1] - 2026-11-26
 
