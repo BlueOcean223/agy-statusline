@@ -1,0 +1,259 @@
+{
+  "account": {
+    "key": "1a2b3c4d",
+    "masked": "ab***12@example.com",
+    "tier": "Google AI Ultra"
+  },
+  "activity": "Running · Read callers",
+  "bar": {
+    "costlyThreshold": 0.2,
+    "error": null,
+    "opts": {
+      "enabled": true,
+      "look": {
+        "bars": "thin",
+        "density": "compact",
+        "icons": "solid",
+        "palette": "cometix",
+        "skin": "plain"
+      },
+      "seg": {
+        "cache": true,
+        "context": true,
+        "cost": true,
+        "git": true,
+        "model": true,
+        "quota_5h": true,
+        "quota_7d": true,
+        "running": true,
+        "speed": true,
+        "subagents": true,
+        "today": true,
+        "ttft": true
+      }
+    },
+    "priceSource": "bundled",
+    "quotaGroups": [
+      {
+        "buckets": [
+          {
+            "elapsed": 0.6,
+            "pace": -0.15,
+            "resetMs": 1795788000000,
+            "used": 0.44999999999999996,
+            "window": "5h"
+          },
+          {
+            "elapsed": 0.571,
+            "pace": 0.129,
+            "resetMs": 1796040000000,
+            "used": 0.7,
+            "window": "weekly"
+          }
+        ],
+        "models": "Gemini 4 Neon, Gemini 4 Flash",
+        "name": "Gemini Models"
+      },
+      {
+        "buckets": [
+          {
+            "elapsed": 0.3,
+            "pace": -0.2,
+            "resetMs": 1795793400000,
+            "used": 0.09999999999999998,
+            "window": "5h"
+          }
+        ],
+        "models": "Claude Opus 5.5, GPT-6",
+        "name": "Claude and GPT Models"
+      }
+    ],
+    "today": 0.62235,
+    "todayCli": 0.0,
+    "views": {
+      "00000000-0000-4000-8000-000000000002": {
+        "costConv": 0.12875,
+        "costConvToday": 0.12875,
+        "costLast": {
+          "cache": 0.008,
+          "cw": 0.00625,
+          "in": 0.002,
+          "out": 0.015
+        },
+        "git": {
+          "added": 40,
+          "ahead": 2,
+          "behind": 0,
+          "branch": "main",
+          "deleted": 12,
+          "dirty": true
+        },
+        "includesSubagents": false,
+        "isSub": true,
+        "lastCallCostly": false,
+        "lastCallKey": "00000000-0000-4000-8000-000000000002:2:1795780200000",
+        "lastCallMiss": null,
+        "main": {
+          "cacheHit": 0.975609756097561,
+          "cacheRead": 16000,
+          "cacheWrite": 1000,
+          "calls": 2,
+          "compactions": 0,
+          "cost": 0.12875,
+          "ctxMax": 200000,
+          "ctxUsed": 17400,
+          "currentStep": "Read panel.rs (step 3)",
+          "endedMs": 1795780260000,
+          "id": "00000000-0000-4000-8000-000000000002",
+          "lastAt": 1795780200000,
+          "model": "Claude Opus 5.5",
+          "outTokens": 600,
+          "respModel": "claude-opus-5-5",
+          "running": true,
+          "startedMs": 1795779540000,
+          "stepTotal": 3,
+          "subRole": "Find callers",
+          "subType": "explorer",
+          "timeline": [
+            "✓ #1 Search for callers",
+            "✓ #2 Read live.rs",
+            "● #3 Read panel.rs"
+          ],
+          "tps": 240.0,
+          "ttftMs": 500.0,
+          "waiting": false
+        },
+        "multiDay": false,
+        "priceName": "Claude Opus",
+        "quota": [
+          {
+            "elapsed": 0.3,
+            "pace": -0.2,
+            "resetMs": 1795793400000,
+            "used": 0.09999999999999998,
+            "window": "5h"
+          }
+        ],
+        "subs": [],
+        "workspace": "/work/agy"
+      }
+    }
+  },
+  "branch": null,
+  "cache": {
+    "lastHit": 0.975609756097561,
+    "missSummary": {
+      "by": {},
+      "count": 0,
+      "totalUsd": 0.12875,
+      "usd": 0.0
+    },
+    "misses": 0,
+    "savedUsd": 0.07200000000000001,
+    "sessionHit": 0.6557377049180327,
+    "ttlSec": 300,
+    "warmLeftSec": null
+  },
+  "ctx": {
+    "compactions": 0,
+    "delta": 1400,
+    "left": 182600,
+    "max": 200000,
+    "series": [
+      16000,
+      17400
+    ],
+    "turnsLeft": 130,
+    "used": 17400
+  },
+  "id": "00000000-0000-4000-8000-000000000002",
+  "isSub": true,
+  "quota": [
+    {
+      "elapsed": 0.3,
+      "pace": -0.2,
+      "resetMs": 1795793400000,
+      "used": 0.09999999999999998,
+      "window": "5h"
+    }
+  ],
+  "recent": [
+    {
+      "id": "00000000-0000-4000-8000-000000000002",
+      "title": "explorer · Find callers"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "title": "Refactor the panel"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "title": "Release notes"
+    }
+  ],
+  "root": "00000000-0000-4000-8000-000000000001",
+  "running": true,
+  "speed": {
+    "avgTps": 200.0,
+    "avgTtftMs": 550.0,
+    "lastTps": 240.0,
+    "lastTtftMs": 500.0,
+    "series": [
+      150.0,
+      240.0
+    ],
+    "wallSec": 600.0
+  },
+  "subCost": -0.0,
+  "subagents": [],
+  "title": "explorer · Find callers",
+  "tokens": {
+    "cache": 16000,
+    "cacheWrite": 9000,
+    "cost": 0.12875,
+    "costCache": 0.008,
+    "costCacheWrite": 0.05625,
+    "costIn": 0.042,
+    "costOut": 0.0225,
+    "fresh": 8400,
+    "includesSubagents": false,
+    "out": 900,
+    "ratePerHr": null,
+    "todayCliCost": 0.0,
+    "todayCost": 0.62235,
+    "todayTokens": 170300,
+    "total": 34300
+  },
+  "turns": [
+    {
+      "at": 1795779600000,
+      "cost": 0.0975,
+      "costly": false,
+      "ctx": 16000,
+      "hit": 0.0,
+      "label": "Search",
+      "miss": null,
+      "model": "Claude Opus 5.5",
+      "out": 300,
+      "step": 1,
+      "tps": 150.0,
+      "ttftMs": 600.0
+    },
+    {
+      "at": 1795780200000,
+      "cost": 0.03125,
+      "costly": false,
+      "ctx": 17400,
+      "hit": 0.975609756097561,
+      "label": "Read callers",
+      "miss": null,
+      "model": "Claude Opus 5.5",
+      "out": 600,
+      "step": 3,
+      "tps": 240.0,
+      "ttftMs": 500.0
+    }
+  ],
+  "turnsTotal": 2,
+  "workspace": null
+}

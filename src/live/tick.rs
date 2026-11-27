@@ -215,18 +215,17 @@ impl Engine {
     }
 
     /// Running or just-finished subagents of `root`, in the bar's order (see `view`).
-    pub(super) fn shown_subs(&self, root: &str) -> Vec<String> {
-        let now = now_ms();
+    pub(super) fn shown_subs(&self, root: &str, now: i64) -> Vec<String> {
         let mut ids: Vec<&String> = self
             .summaries
             .iter()
             .filter(|(sid, s)| *sid != root && s.root.as_deref() == Some(root))
             .filter(|(sid, _)| {
-                self.is_running(sid) || self.sub_done.get(*sid).is_some_and(|t| now - t < SUB_DONE_SHOW_MS)
+                self.is_running(sid, now) || self.sub_done.get(*sid).is_some_and(|t| now - t < SUB_DONE_SHOW_MS)
             })
             .map(|(sid, _)| sid)
             .collect();
-        ids.sort_by_key(|sid| (!self.is_running(sid), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms))));
+        ids.sort_by_key(|sid| (!self.is_running(sid, now), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms))));
         ids.into_iter().cloned().collect()
     }
 
@@ -260,7 +259,7 @@ impl Engine {
                     want.insert(id.clone());
                 }
             }
-            subs_shown.extend(self.shown_subs(root).into_iter().take(MAX_SUBS));
+            subs_shown.extend(self.shown_subs(root, now_ms()).into_iter().take(MAX_SUBS));
         }
         let mut visible: HashSet<String> = interest.clone();
         visible.extend(subs_shown.iter().cloned());
@@ -326,7 +325,7 @@ impl Engine {
             if !self.ls_loaded.contains(sid) {
                 continue;
             }
-            let running = self.is_running(sid);
+            let running = self.is_running(sid, now_ms());
             let step_count = self.summaries.get(sid).map_or(0, |s| s.step_count as usize);
             let cache = self.sub_steps.entry(sid.clone()).or_default();
             let due = if running {
@@ -558,25 +557,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn engine() -> Engine {
-        let mut e = Engine::new(LsClient::new("127.0.0.1:9", "", false));
-        // Never created: nothing in these tests may read the real Antigravity data.
-        e.app_data = std::env::temp_dir().join(format!("agy-engine-test-{}", std::process::id()));
-        e
-    }
-
-    fn uuid(n: usize) -> String {
-        format!("00000000-0000-4000-8000-{n:012}")
-    }
-
-    fn record(input: u64) -> Value {
-        json!({ "chatModel": { "responseModel": "m", "usage": { "inputTokens": input } }, "stepIndices": [1] })
-    }
-
-    fn ls_page(records: &[Value]) -> Result<ConvData, String> {
-        Ok(ConvData::Ls(json!({ "generatorMetadata": records })))
-    }
+    use crate::live::test_support::*;
 
     /// Merges fetched conversations, keeping every conversation so eviction stays out of the way.
     fn apply(e: &mut Engine, convs: Vec<(ConvReq, Result<ConvData, String>)>) {

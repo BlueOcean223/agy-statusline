@@ -1,6 +1,6 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
-use super::{Engine, LiveCall, now_ms};
+use super::{Clock, Engine, LiveCall};
 use crate::config::{Config, OnlinePrices};
 use crate::miss::MissSummary;
 use crate::pricing::Pricer;
@@ -43,10 +43,11 @@ impl Engine {
 
     /// The side panel for `id` from what is loaded; load it first (`load_for_panel`, or
     /// `live::panel_json` in the sidecar).
-    pub fn panel(&self, id: &str, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
+    pub fn panel(&self, id: &str, cfg: &Config, online: Option<&OnlinePrices>, clock: Clock) -> Value {
+        let now = clock.now;
         let recent_ids = self.top_level_recent();
         let id = id.to_string();
-        let pricer = Pricer::new(&cfg.models, online, now_ms());
+        let pricer = Pricer::new(&cfg.models, online, now);
         let root = self.root_of(&id);
         let is_sub = root != id;
         let summary = self.summaries.get(&id).cloned().unwrap_or_default();
@@ -89,7 +90,7 @@ impl Engine {
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer);
+        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer, clock);
 
         // Context
         let last = own.last().copied();
@@ -123,7 +124,7 @@ impl Engine {
         }
         miss_summary.round_fields();
         let misses = miss_summary.count;
-        let warm_left = last.map(|c| (c.at_ms + cfg.cache_ttl_sec as i64 * 1000 - now_ms()) / 1000).filter(|s| *s > 0);
+        let warm_left = last.map(|c| (c.at_ms + cfg.cache_ttl_sec as i64 * 1000 - now) / 1000).filter(|s| *s > 0);
 
         // Speed
         let (out_sum, stream_sum) = own
@@ -156,7 +157,7 @@ impl Engine {
                         "model": calls.last().map(|c| c.model.display.clone()),
                         "tokens": calls.iter().map(|c| c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output).sum::<u64>(),
                         "cost": calls.iter().map(|c| pricer.call_cost(c).total()).sum::<f64>(),
-                        "running": self.is_running(&sid),
+                        "running": self.is_running(&sid, now),
                         "lastAt": calls.last().map(|c| c.at_ms),
                     })
                 })
@@ -202,7 +203,7 @@ impl Engine {
             .map(|cid| json!({ "id": cid, "title": self.title(&cid) }))
             .collect();
 
-        let running = self.is_running(&id);
+        let running = self.is_running(&id, now);
         let panes: HashSet<String> = [id.clone()].into();
         json!({
             "id": id,
@@ -215,11 +216,11 @@ impl Engine {
             "branch": summary.branch,
             "account": self.account,
             "recent": recent,
-            "bar": self.build_payload(&panes, cfg, online),
+            "bar": self.build_payload(&panes, cfg, online, clock),
             "ctx": {
                 "used": ctx_used, "max": ctx_max, "left": ctx_left, "delta": last_delta,
                 "turnsLeft": turns_left, "series": ctx_series,
-                "compactions": self.view(&id, cfg, &pricer).main.compactions,
+                "compactions": self.view(&id, cfg, &pricer, clock).main.compactions,
             },
             "cache": {
                 "lastHit": last.map(hit), "sessionHit": session_hit, "misses": misses,
@@ -241,7 +242,7 @@ impl Engine {
                 "series": tps_series,
                 "wallSec": wall_sec,
             },
-            "quota": self.quota_for(last),
+            "quota": self.quota_for(last, now),
             "subagents": subagents,
             "subCost": sub_cost,
             "turns": turns,
@@ -262,5 +263,93 @@ impl Engine {
             }
             _ => id.chars().take(8).collect(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live::test_support::*;
+    use std::path::PathBuf;
+
+    fn snapshot_path(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/live/snapshots").join(format!("{name}.json"))
+    }
+
+    /// Finds where `actual` differs from `expected`. Numbers may differ by rounding, since a total
+    /// summed in another order can change in its last bits.
+    fn diff(path: &str, expected: &Value, actual: &Value) -> Option<String> {
+        match (expected, actual) {
+            (Value::Object(e), Value::Object(a)) => {
+                let mut keys: Vec<&String> = e.keys().chain(a.keys()).collect();
+                keys.sort();
+                keys.dedup();
+                keys.into_iter().find_map(|k| match (e.get(k), a.get(k)) {
+                    (Some(ev), Some(av)) => diff(&format!("{path}.{k}"), ev, av),
+                    (ev, av) => Some(format!("{path}.{k}: expected {ev:?}, got {av:?}")),
+                })
+            }
+            (Value::Array(e), Value::Array(a)) if e.len() == a.len() => {
+                e.iter().zip(a).enumerate().find_map(|(i, (ev, av))| diff(&format!("{path}[{i}]"), ev, av))
+            }
+            (Value::Number(e), Value::Number(a)) => {
+                let (e, a) = (e.as_f64().unwrap_or(f64::NAN), a.as_f64().unwrap_or(f64::NAN));
+                ((e - a).abs() > 1e-9 * e.abs().max(a.abs()).max(1e-3))
+                    .then(|| format!("{path}: expected {e}, got {a}"))
+            }
+            _ => (expected != actual).then(|| format!("{path}: expected {expected}, got {actual}")),
+        }
+    }
+
+    /// Compares `actual` with the stored snapshot `name`; `UPDATE_SNAPSHOTS=1` rewrites it instead.
+    fn assert_snapshot(name: &str, actual: &Value) {
+        let path = snapshot_path(name);
+        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, serde_json::to_string_pretty(actual).unwrap() + "\n").unwrap();
+            return;
+        }
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e} (run with UPDATE_SNAPSHOTS=1 to create it)", path.display()));
+        let expected: Value = serde_json::from_str(&text).unwrap();
+        if let Some(d) = diff("$", &expected, actual) {
+            panic!("{name} snapshot differs at {d}");
+        }
+    }
+
+    #[test]
+    fn panel_of_a_root_conversation_matches_its_snapshot() {
+        let (e, ids) = view_fixture();
+        assert_snapshot("panel_root", &e.panel(&ids.root, &view_config(), None, CLOCK));
+    }
+
+    #[test]
+    fn panel_of_a_root_without_subagent_totals_matches_its_snapshot() {
+        let (e, ids) = view_fixture();
+        let cfg = Config { include_subagents: false, ..view_config() };
+        assert_snapshot("panel_root_own", &e.panel(&ids.root, &cfg, None, CLOCK));
+    }
+
+    #[test]
+    fn panel_of_a_subagent_matches_its_snapshot() {
+        let (e, ids) = view_fixture();
+        assert_snapshot("panel_subagent", &e.panel(&ids.running, &view_config(), None, CLOCK));
+    }
+
+    #[test]
+    fn bar_payload_matches_its_snapshot() {
+        let (e, ids) = view_fixture();
+        let panes = HashSet::from([ids.root.clone(), ids.running.clone(), ids.other.clone()]);
+        assert_snapshot("bar", &e.build_payload(&panes, &view_config(), None, CLOCK));
+    }
+
+    #[test]
+    fn snapshot_diff_tolerates_rounding_but_not_changes() {
+        let e = json!({ "a": [1.0, { "b": 0.1 }], "c": "x" });
+        assert_eq!(diff("$", &e, &json!({ "a": [1.0, { "b": 0.1 + 1e-15 }], "c": "x" })), None);
+        assert!(diff("$", &e, &json!({ "a": [1.0, { "b": 0.2 }], "c": "x" })).unwrap().starts_with("$.a[1].b"));
+        assert!(diff("$", &e, &json!({ "a": [1.0], "c": "x" })).is_some());
+        assert!(diff("$", &e, &json!({ "a": [1.0, { "b": 0.1 }] })).unwrap().starts_with("$.c"));
+        assert!(diff("$", &json!({ "n": null }), &json!({ "n": 0 })).is_some());
     }
 }
