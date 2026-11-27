@@ -46,12 +46,15 @@ impl PromptResult {
         }
     }
 
-    pub fn from_exit_code(code: Option<i32>) -> Self {
-        match code {
-            Some(EXIT_RELAUNCH) => Self { relaunch: true, dont_ask_again: false },
-            Some(EXIT_RELAUNCH_DONT_ASK) => Self { relaunch: true, dont_ask_again: true },
-            Some(EXIT_LATER_DONT_ASK) => Self { relaunch: false, dont_ask_again: true },
-            _ => Self { relaunch: false, dont_ask_again: false },
+    /// The user's answer, or `None` when the dialog process ended any other way (crashed, was
+    /// killed, or is a binary without the `relaunch-prompt` command).
+    pub fn from_exit_code(code: Option<i32>) -> Option<Self> {
+        match code? {
+            EXIT_RELAUNCH => Some(Self { relaunch: true, dont_ask_again: false }),
+            EXIT_RELAUNCH_DONT_ASK => Some(Self { relaunch: true, dont_ask_again: true }),
+            EXIT_LATER => Some(Self { relaunch: false, dont_ask_again: false }),
+            EXIT_LATER_DONT_ASK => Some(Self { relaunch: false, dont_ask_again: true }),
+            _ => None,
         }
     }
 }
@@ -235,6 +238,11 @@ const LATER_BTN: Rect = Rect::new(224.0, 176.0, 68.0, 40.0);
 const RELAUNCH_BTN: Rect = Rect::new(300.0, 176.0, 108.0, 40.0);
 const TOOLTIP_RECT: Rect = Rect::new(24.0, 146.0, 250.0, 26.0);
 
+/// Return and Space are ignored this long after the dialog appears: it takes focus a few seconds
+/// after Antigravity starts, and keys typed into Antigravity (a message, its Return) must not
+/// relaunch it or tick "不再询问".
+pub const KEY_GRACE: std::time::Duration = std::time::Duration::from_millis(700);
+
 #[derive(Clone, Debug)]
 pub struct PromptState {
     pub theme: Theme,
@@ -242,11 +250,20 @@ pub struct PromptState {
     pub hovered: HitZone,
     pub pressed: HitZone,
     pub outcome: Option<PromptResult>,
+    /// When the state was created, right before the window is shown.
+    shown_at: std::time::Instant,
 }
 
 impl PromptState {
     pub fn new(theme: Theme) -> Self {
-        Self { theme, dont_ask_again: false, hovered: HitZone::None, pressed: HitZone::None, outcome: None }
+        Self {
+            theme,
+            dont_ask_again: false,
+            hovered: HitZone::None,
+            pressed: HitZone::None,
+            outcome: None,
+            shown_at: std::time::Instant::now(),
+        }
     }
 
     pub fn hit_test(x: f32, y: f32) -> HitZone {
@@ -322,12 +339,36 @@ impl PromptState {
         (None, true)
     }
 
-    pub fn on_confirm_key(&mut self) -> PromptResult {
-        self.finish(true)
+    /// Return: relaunch, unless the key is an auto-repeat or came within [`KEY_GRACE`].
+    pub fn on_confirm_key(&mut self, repeat: bool) -> Option<PromptResult> {
+        self.keys_ready(repeat).then(|| self.finish(true))
     }
 
+    /// Escape: later. Always accepted; answering "later" by accident costs nothing.
     pub fn on_cancel_key(&mut self) -> PromptResult {
         self.finish(false)
+    }
+
+    /// Space: toggles "不再询问" under the same conditions as Return. Returns whether it changed.
+    pub fn on_toggle_key(&mut self, repeat: bool) -> bool {
+        let ready = self.keys_ready(repeat);
+        if ready {
+            self.toggle_dont_ask();
+        }
+        ready
+    }
+
+    /// The window was closed without a button (Alt+F4): later, keeping "不再询问" as ticked.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn on_close(&mut self) -> PromptResult {
+        match self.outcome {
+            Some(res) => res,
+            None => self.finish(false),
+        }
+    }
+
+    fn keys_ready(&self, repeat: bool) -> bool {
+        !repeat && self.shown_at.elapsed() >= KEY_GRACE
     }
 
     /// Records and returns the dialog's result.
@@ -337,7 +378,7 @@ impl PromptState {
         res
     }
 
-    pub fn toggle_dont_ask(&mut self) {
+    fn toggle_dont_ask(&mut self) {
         self.dont_ask_again = !self.dont_ask_again;
     }
 
@@ -541,13 +582,12 @@ pub fn run_prompt_process(theme_override: Option<&str>) -> PromptResult {
 }
 
 /// Launches the custom-drawn confirmation dialog in a short-lived child process of the current
-/// binary so macOS AppKit executes on its main thread and the sidecar stays memory-lean.
-pub fn ask_relaunch_confirm() -> PromptResult {
+/// binary so macOS AppKit executes on its main thread. `Err` when no answer came back: the dialog
+/// could not be started, or its process ended without one.
+pub fn ask_relaunch_confirm() -> Result<PromptResult, String> {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        let Ok(exe) = std::env::current_exe() else {
-            return PromptResult::default();
-        };
+        let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
         let mut cmd = Command::new(exe);
         cmd.arg("relaunch-prompt");
         #[cfg(target_os = "windows")]
@@ -556,14 +596,12 @@ pub fn ask_relaunch_confirm() -> PromptResult {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
-        let Ok(status) = cmd.status() else {
-            return PromptResult::default();
-        };
-        PromptResult::from_exit_code(status.code())
+        let status = cmd.status().map_err(|e| format!("spawn relaunch-prompt: {e}"))?;
+        PromptResult::from_exit_code(status.code()).ok_or_else(|| format!("relaunch-prompt exited with {status}"))
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        PromptResult::default()
+        Err("no relaunch dialog on this platform".into())
     }
 }
 
@@ -576,11 +614,12 @@ mod tests {
         for relaunch in [false, true] {
             for dont_ask_again in [false, true] {
                 let res = PromptResult { relaunch, dont_ask_again };
-                assert_eq!(PromptResult::from_exit_code(Some(res.to_exit_code())), res);
+                assert_eq!(PromptResult::from_exit_code(Some(res.to_exit_code())), Some(res));
             }
         }
-        assert_eq!(PromptResult::from_exit_code(None), PromptResult::default());
-        assert_eq!(PromptResult::from_exit_code(Some(1)), PromptResult::default());
+        assert_eq!(PromptResult::from_exit_code(None), None, "killed");
+        assert_eq!(PromptResult::from_exit_code(Some(101)), None, "panicked");
+        assert_eq!(PromptResult::from_exit_code(Some(2)), None, "no such command");
     }
 
     #[test]
@@ -602,6 +641,29 @@ mod tests {
         // Press and release "立即重启"
         assert_eq!(st.on_mouse_down(354.0, 196.0), (false, true));
         assert_eq!(st.on_mouse_up(354.0, 196.0), (Some(PromptResult { relaunch: true, dont_ask_again: true }), true));
+    }
+
+    #[test]
+    fn return_and_space_wait_for_the_grace_period_and_ignore_repeats() {
+        let mut st = PromptState::new(Theme::Light);
+        assert_eq!(st.on_confirm_key(false), None, "typed before the dialog could be read");
+        assert!(!st.on_toggle_key(false));
+        // As if shown KEY_GRACE ago (skipped where the clock cannot go back that far).
+        let Some(earlier) = st.shown_at.checked_sub(KEY_GRACE) else { return };
+        st.shown_at = earlier;
+        assert!(!st.on_toggle_key(true), "auto-repeat");
+        assert_eq!(st.on_confirm_key(true), None, "auto-repeat");
+        assert!(st.on_toggle_key(false));
+        assert_eq!(st.on_confirm_key(false), Some(PromptResult { relaunch: true, dont_ask_again: true }));
+    }
+
+    #[test]
+    fn closing_the_window_answers_later_and_keeps_dont_ask() {
+        let mut st = PromptState::new(Theme::Light);
+        st.on_mouse_down(33.0, 196.0);
+        st.on_mouse_up(33.0, 196.0);
+        assert_eq!(st.on_close(), PromptResult { relaunch: false, dont_ask_again: true });
+        assert_eq!(st.outcome, Some(PromptResult { relaunch: false, dont_ask_again: true }));
     }
 
     #[test]

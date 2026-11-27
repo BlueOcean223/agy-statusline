@@ -488,14 +488,20 @@ pub fn relaunch_now(plugin_data: &Path) -> Result<String, String> {
     }
 }
 
-fn ask_user_confirm(plugin_data: &Path) -> bool {
-    let res = crate::prompt_dialog::ask_relaunch_confirm();
+/// Whether the user chose to relaunch; `Err` when the dialog gave no answer.
+fn ask_user_confirm(plugin_data: &Path) -> Result<bool, String> {
+    let res = crate::prompt_dialog::ask_relaunch_confirm()?;
     if res.dont_ask_again {
         apply_config_patch(plugin_data, ConfigPatch { relaunch_mode: Some("never".into()), ..Default::default() });
         append_log(plugin_data, "user checked dont-ask-again; updated relaunch_mode=never");
     }
-    res.relaunch
+    Ok(res.relaunch)
 }
+
+/// After the dialog fails to give an answer, wait this long before showing it again.
+const PROMPT_RETRY_AFTER: Duration = Duration::from_secs(300);
+/// Give up asking for this session after this many failed dialogs.
+const PROMPT_MAX_FAILURES: u32 = 3;
 
 /// Watches CDP connectivity; when unreachable for >= 3s and `relaunch_mode` is `ask` or `auto`,
 /// verifies the Antigravity main process truly lacks `--remote-debugging-port` before acting.
@@ -511,6 +517,11 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
         let mut last_check: Option<(Instant, LaunchFlag)> = None;
         let mut synced_ok = false;
         let started = Instant::now();
+        // The user answered this session's prompt. Kept here too, since the state file that
+        // records it (`prompted_for`) may be unreadable or unwritable.
+        let mut answered = false;
+        let mut failures = 0u32;
+        let mut failed_at: Option<Instant> = None;
 
         loop {
             thread::sleep(if started.elapsed() < FAST_TICK_WINDOW { FAST_TICK } else { SLOW_TICK });
@@ -539,6 +550,12 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
             }
             let mode = load_config(&plugin_data).relaunch_mode;
             if mode == "never" {
+                continue;
+            }
+            if answered
+                || failures >= PROMPT_MAX_FAILURES
+                || failed_at.is_some_and(|t| t.elapsed() < PROMPT_RETRY_AFTER)
+            {
                 continue;
             }
             let (st, _) = load_state(&plugin_data);
@@ -587,7 +604,7 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
 
             let now = now_ms();
             let recent = now - st.last_relaunch_at < COOLDOWN_MS;
-            st.prompted_for = session_key.clone();
+            let prompted_before = std::mem::replace(&mut st.prompted_for, session_key.clone());
             st.last_prompt_at = now;
             save_state(&plugin_data, &st, writable);
 
@@ -599,13 +616,29 @@ pub fn start_watch(shared: SharedRef, plugin_data: PathBuf) {
                 ),
             );
 
-            let should_go = if mode == "auto" && !recent { true } else { ask_user_confirm(&plugin_data) };
-            if should_go {
-                if let Err(e) = relaunch_now(&plugin_data) {
-                    append_log(&plugin_data, &format!("relaunch failed: {e}"));
+            let answer = if mode == "auto" && !recent { Ok(true) } else { ask_user_confirm(&plugin_data) };
+            match answer {
+                Ok(true) => {
+                    answered = true;
+                    if let Err(e) = relaunch_now(&plugin_data) {
+                        append_log(&plugin_data, &format!("relaunch failed: {e}"));
+                    }
                 }
-            } else {
-                append_log(&plugin_data, "relaunch declined by user");
+                Ok(false) => {
+                    answered = true;
+                    append_log(&plugin_data, "relaunch declined by user");
+                }
+                Err(e) => {
+                    // No answer: this session has not been asked yet.
+                    failures += 1;
+                    failed_at = Some(Instant::now());
+                    st.prompted_for = prompted_before;
+                    save_state(&plugin_data, &st, writable);
+                    append_log(
+                        &plugin_data,
+                        &format!("relaunch prompt failed ({failures}/{PROMPT_MAX_FAILURES}): {e}"),
+                    );
+                }
             }
         }
     });

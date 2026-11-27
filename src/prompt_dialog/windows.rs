@@ -779,14 +779,16 @@ unsafe extern "system" fn wnd_proc(hwnd: *mut c_void, msg: u32, w_param: usize, 
             0
         }
         WM_KEYDOWN => {
+            // Bit 30: the key was already down (auto-repeat).
+            let repeat = (l_param >> 30) & 1 == 1;
             match w_param {
                 VK_RETURN => {
-                    WIN_RT.with(|cell| {
-                        if let Some(rt) = cell.borrow_mut().as_mut() {
-                            rt.state.on_confirm_key();
-                        }
-                    });
-                    unsafe { DestroyWindow(hwnd) };
+                    let done = WIN_RT
+                        .with(|cell| cell.borrow_mut().as_mut().and_then(|rt| rt.state.on_confirm_key(repeat)))
+                        .is_some();
+                    if done {
+                        unsafe { DestroyWindow(hwnd) };
+                    }
                 }
                 VK_ESCAPE => {
                     WIN_RT.with(|cell| {
@@ -797,12 +799,11 @@ unsafe extern "system" fn wnd_proc(hwnd: *mut c_void, msg: u32, w_param: usize, 
                     unsafe { DestroyWindow(hwnd) };
                 }
                 VK_SPACE => {
-                    WIN_RT.with(|cell| {
-                        if let Some(rt) = cell.borrow_mut().as_mut() {
-                            rt.state.toggle_dont_ask();
-                        }
-                    });
-                    repaint_layered(hwnd, None);
+                    let changed =
+                        WIN_RT.with(|cell| cell.borrow_mut().as_mut().is_some_and(|rt| rt.state.on_toggle_key(repeat)));
+                    if changed {
+                        repaint_layered(hwnd, None);
+                    }
                 }
                 _ => {}
             }
@@ -825,6 +826,12 @@ unsafe extern "system" fn wnd_proc(hwnd: *mut c_void, msg: u32, w_param: usize, 
             0
         }
         WM_CLOSE => {
+            // Alt+F4: "later", keeping "不再询问" as ticked.
+            WIN_RT.with(|cell| {
+                if let Some(rt) = cell.borrow_mut().as_mut() {
+                    rt.state.on_close();
+                }
+            });
             unsafe { DestroyWindow(hwnd) };
             0
         }

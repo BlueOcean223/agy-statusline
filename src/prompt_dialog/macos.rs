@@ -124,6 +124,11 @@ unsafe fn msg0_void(obj: Id, s: Sel) {
     unsafe { f(obj, s) }
 }
 
+unsafe fn msg0_bool(obj: Id, s: Sel) -> bool {
+    let f: unsafe extern "C" fn(Id, Sel) -> i8 = unsafe { transmute(objc_msgSend as *const ()) };
+    unsafe { f(obj, s) != 0 }
+}
+
 unsafe fn msg0_u16(obj: Id, s: Sel) -> u16 {
     let f: unsafe extern "C" fn(Id, Sel) -> u16 = unsafe { transmute(objc_msgSend as *const ()) };
     unsafe { f(obj, s) }
@@ -496,10 +501,11 @@ extern "C" fn view_mouse_up(this: Id, _cmd: Sel, event: Id) {
 extern "C" fn view_key_down(this: Id, _cmd: Sel, event: Id) {
     let _pool = AutoreleasePool::push();
     let keycode = unsafe { msg0_u16(event, sel(c"keyCode")) };
+    let repeat = unsafe { msg0_bool(event, sel(c"isARepeat")) };
     match keycode {
         36 | 76 => {
             // Return / Numpad Enter
-            let res = RT.with(|cell| cell.borrow_mut().as_mut().map(|rt| rt.state.on_confirm_key()));
+            let res = RT.with(|cell| cell.borrow_mut().as_mut().and_then(|rt| rt.state.on_confirm_key(repeat)));
             if res.is_some() {
                 finish_and_stop();
             }
@@ -513,12 +519,10 @@ extern "C" fn view_key_down(this: Id, _cmd: Sel, event: Id) {
         }
         49 => {
             // Space toggles "不再询问"
-            RT.with(|cell| {
-                if let Some(rt) = cell.borrow_mut().as_mut() {
-                    rt.state.toggle_dont_ask();
-                }
-            });
-            unsafe { msg1_void_bool(this, sel(c"setNeedsDisplay:"), YES) };
+            let changed = RT.with(|cell| cell.borrow_mut().as_mut().is_some_and(|rt| rt.state.on_toggle_key(repeat)));
+            if changed {
+                unsafe { msg1_void_bool(this, sel(c"setNeedsDisplay:"), YES) };
+            }
         }
         _ => {}
     }
