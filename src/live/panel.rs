@@ -7,6 +7,7 @@ use crate::miss::{MissInfo, MissSummary};
 use crate::usage::AccountInfo;
 use serde::Serialize;
 use std::collections::HashSet;
+use std::rc::Rc;
 
 const SERIES_LEN: usize = 40;
 const RECENT_LEN: usize = 15;
@@ -58,14 +59,17 @@ impl Engine {
         if !is_sub && cfg.include_subagents {
             ids.extend(self.tree(&root).into_iter().filter(|x| *x != id));
         }
+        let bar = req.bar(&HashSet::from([id.clone()]));
+        // What the bar shows of this conversation; the panel adds the details.
+        let view = &bar.views[&id];
         let own = req.calls(&id);
-        let all: Vec<Priced> = ids.iter().flat_map(|cid| req.calls(cid).to_vec()).collect();
+        let convs: Vec<Rc<[Priced]>> = ids.iter().map(|cid| req.calls(cid)).collect();
 
         // Tokens and cost
         let (mut fresh, mut cache, mut cache_write, mut out) = (0u64, 0u64, 0u64, 0u64);
         let (mut c_in, mut c_cache, mut c_cw, mut c_out) = (0.0, 0.0, 0.0, 0.0);
         let mut saved = 0.0;
-        for &Priced { call: c, cost: k } in &all {
+        for &Priced { call: c, cost: k } in convs.iter().flat_map(|c| c.iter()) {
             fresh += c.tokens.input;
             cache += c.tokens.cache_read;
             cache_write += c.tokens.cache_write;
@@ -79,19 +83,14 @@ impl Engine {
                 saved += c.tokens.cache_read as f64 * (k.input / c.tokens.input as f64) - k.cache;
             }
         }
-        let cost = c_in + c_cache + c_cw + c_out;
         let first_at = own.iter().map(|p| p.call.at_ms).min().unwrap_or(0);
         let last_at = own.iter().map(|p| p.call.at_ms).max().unwrap_or(0);
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
-        let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
+        let rate_per_hr = (wall_sec > 600.0).then(|| view.cost_conv / (wall_sec / 3600.0));
 
         // Context
         let last = own.last().map(|p| p.call);
-        let ctx_max = if cfg.context_limit_override > 0 {
-            cfg.context_limit_override
-        } else {
-            last.map(|c| c.ctx_max).unwrap_or(0)
-        };
+        let ctx_max = view.main.ctx_max;
         let ctx_used = last.map(|c| c.ctx_used).unwrap_or(0);
         let ctx_series: Vec<u64> = own.iter().rev().take(SERIES_LEN).rev().map(|p| p.call.ctx_used).collect();
         let deltas: Vec<i64> = ctx_series.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
@@ -191,8 +190,7 @@ impl Engine {
             .map(|cid| Recent { title: self.title(&cid), id: cid })
             .collect();
 
-        let bar = req.bar(&HashSet::from([id.clone()]));
-        let running = bar.views[&id].main.running;
+        let running = view.main.running;
         PanelView {
             title: self.title(&id),
             activity: if running {
@@ -225,7 +223,7 @@ impl Engine {
                 cost_cache_write: c_cw,
                 cost_out: c_out,
                 rate_per_hr,
-                today_tokens: req.today().1,
+                today_tokens: req.today().tokens,
             },
             speed: PanelSpeed {
                 avg_tps: (stream_sum > 0.0).then(|| out_sum / stream_sum),
@@ -317,7 +315,8 @@ pub struct PanelCache {
     pub ttl_sec: u64,
 }
 
-/// Totals over the conversation, with its subagents when `bar.views[id].includesSubagents`.
+/// Totals over the conversation, with its subagents when `bar.views[id].includesSubagents`, and
+/// today's tokens across all conversations.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PanelTokens {
@@ -384,7 +383,8 @@ mod tests {
     use std::path::PathBuf;
 
     /// The panel with what the side panel reads from `bar.views[id]` and `bar` put where the panel
-    /// itself carried it before (as `web/app.js` reads it), so one snapshot covers what it shows.
+    /// itself carried it before, so one snapshot covers what it shows. Mirrors how `web/app.js`
+    /// reads them (`barView` and `renderOverview`): change both together.
     fn as_shown(p: &PanelView) -> Value {
         let mut out = serde_json::to_value(p).unwrap();
         let bar = out["bar"].clone();

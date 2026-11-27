@@ -424,7 +424,8 @@
   }
 
   // What the panel shows that the status bar shows too (context, last call, cost, quota, running)
-  // comes from the bar's view of the conversation.
+  // comes from the bar's view of the conversation. The panel snapshot tests mirror these reads
+  // (`as_shown` in src/live/panel.rs): change both together.
   const barView = (p) => p.bar?.views?.[p.id] || { main: {}, quota: [] };
 
   // ---------------------------------------------------------------- Overview tab
@@ -491,9 +492,11 @@
         </div>`
       : '';
 
-    const todayVal = p.bar.todayCli > 0
-      ? `<b>${fmtUsd(p.bar.today)}</b> <span style="color:var(--fg-muted);font-size:10.5px">(含 CLI ${fmtUsd(p.bar.todayCli)})</span>`
-      : `<b>${fmtUsd(p.bar.today)}</b>`;
+    const today = p.bar?.today || 0;
+    const todayCli = p.bar?.todayCli || 0;
+    const todayVal = todayCli > 0
+      ? `<b>${fmtUsd(today)}</b> <span style="color:var(--fg-muted);font-size:10.5px">(含 CLI ${fmtUsd(todayCli)})</span>`
+      : `<b>${fmtUsd(today)}</b>`;
 
     // Quota windows (dual track: used + elapsed) + embedded weekly forecasts
     const quotaRows = (v.quota || []).map((q) => {

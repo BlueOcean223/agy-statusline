@@ -1,5 +1,7 @@
-//! The status bar's view of conversations, shared with the side panel: one [`ViewReq`] per request
-//! prices each call and analyses each conversation's cache misses at most once.
+//! The status bar's view of conversations, shared with the side panel. The views built for one
+//! request share a [`ViewReq`], which prices each conversation's calls, analyses its cache misses
+//! and adds up today's totals once. (Today's totals keep their own per-conversation cache across
+//! requests; see `Engine::today_totals`.)
 
 use super::{Clock, Engine, LiveCall, MAX_SUBS, parse_ts};
 use crate::config::{BarLook, BarSegments, Config, OnlinePrices};
@@ -19,19 +21,24 @@ pub(super) struct Priced<'a> {
     pub cost: Cost,
 }
 
-/// Today's totals: `(usd, tokens, agy CLI usd)`.
-pub(super) type Today = (f64, u64, f64);
+/// Today's cost and tokens across conversations, including the `agy CLI`'s.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TodayTotals {
+    pub usd: f64,
+    pub tokens: u64,
+    pub cli_usd: f64,
+}
 
 /// What the views built for one request share: the configuration, one clock reading, the prices,
 /// and each conversation's priced calls, cache misses and today's totals, each computed once.
 pub(super) struct ViewReq<'a> {
-    pub eng: &'a Engine,
-    pub cfg: &'a Config,
-    pub pricer: Pricer,
-    pub clock: Clock,
+    eng: &'a Engine,
+    cfg: &'a Config,
+    pricer: Pricer,
+    clock: Clock,
     calls: RefCell<HashMap<String, Rc<[Priced<'a>]>>>,
     misses: RefCell<HashMap<String, Rc<[Option<MissInfo>]>>>,
-    today: OnceCell<Today>,
+    today: OnceCell<TodayTotals>,
 }
 
 impl<'a> ViewReq<'a> {
@@ -81,13 +88,16 @@ impl<'a> ViewReq<'a> {
         misses
     }
 
-    pub fn today(&self) -> Today {
-        *self.today.get_or_init(|| self.eng.today_totals(&self.pricer, self.clock.midnight))
+    pub fn today(&self) -> TodayTotals {
+        *self.today.get_or_init(|| {
+            let (usd, tokens, cli_usd) = self.eng.today_totals(&self.pricer, self.clock.midnight);
+            TodayTotals { usd, tokens, cli_usd }
+        })
     }
 
     /// The status bar's payload for the conversations in `panes`.
     pub fn bar(&self, panes: &HashSet<String>) -> BarPayload {
-        let (today, _, today_cli) = self.today();
+        let today = self.today();
         let quota_groups = self.eng.quota["groups"]
             .as_array()
             .map(|gs| {
@@ -101,8 +111,8 @@ impl<'a> ViewReq<'a> {
             })
             .unwrap_or_default();
         BarPayload {
-            today,
-            today_cli,
+            today: today.usd,
+            today_cli: today.cli_usd,
             costly_threshold: self.cfg.costly_call_usd,
             price_source: self.pricer.source().to_string(),
             quota_groups,
@@ -286,7 +296,7 @@ impl<'a> ViewReq<'a> {
     }
 
     /// The quota windows of the group `call`'s model counts against.
-    pub fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
+    fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
         let groups = self.eng.quota["groups"].as_array().cloned().unwrap_or_default();
         if groups.is_empty() {
             return Vec::new();
