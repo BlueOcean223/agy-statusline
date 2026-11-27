@@ -73,11 +73,13 @@ fn print_status(conv: &str) {
     let cfg = config::load_config(&find_plugin_data_dir(&find_app_data_dir()));
     let mut eng = live::Engine::new(ls);
     eng.tick(&Default::default());
-    let p = eng.panel(Some(conv).filter(|c| !c.is_empty()), &cfg, None);
-    let Some(id) = p["id"].as_str() else {
+    let Some(id) = eng.panel_target(Some(conv)) else {
         println!("no conversations");
         return;
     };
+    eng.load_for_panel(&id);
+    let p = eng.panel(&id, &cfg, None);
+    let id = id.as_str();
     let v = &p["bar"]["views"][id];
     let m = &v["main"];
     let c = |rgb: (u8, u8, u8), s: String| format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2);

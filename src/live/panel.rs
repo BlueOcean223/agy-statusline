@@ -34,32 +34,19 @@ impl Engine {
         scored.into_iter().map(|(_, id)| id).collect()
     }
 
-    /// Makes sure `id` and its subagents are loaded, for a panel request between engine ticks.
-    /// Conversations the language_server hasn't loaded are read from their databases.
-    fn ensure_loaded(&mut self, id: &str) {
-        if !self.convs.contains_key(id) {
-            let _ = self.refresh_conv(id);
+    /// The conversation the side panel shows: `requested`, or else the most recent top-level one.
+    pub fn panel_target(&self, requested: Option<&str>) -> Option<String> {
+        match requested.filter(|s| !s.is_empty()) {
+            Some(id) => Some(id.to_string()),
+            None => self.top_level_recent().into_iter().next(),
         }
-        // Reading `id` may have revealed its root (a subagent opened from the list).
-        let root = self.root_of(id);
-        for cid in self.tree(&root) {
-            if !self.convs.contains_key(&cid) {
-                let _ = self.refresh_conv(&cid);
-            }
-        }
-        self.load_subagent_hints(&[id.to_string(), root]);
     }
 
-    pub fn panel(&mut self, requested: Option<&str>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
+    /// The side panel for `id` from what is loaded; load it first (`load_for_panel`, or
+    /// `live::panel_json` in the sidecar).
+    pub fn panel(&self, id: &str, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
         let recent_ids = self.top_level_recent();
-        let id = match requested.filter(|s| !s.is_empty()) {
-            Some(id) => id.to_string(),
-            None => match recent_ids.first() {
-                Some(id) => id.clone(),
-                None => return json!({ "id": null }),
-            },
-        };
-        self.ensure_loaded(&id);
+        let id = id.to_string();
         let pricer = Pricer::new(&cfg.models, online, now_ms());
         let root = self.root_of(&id);
         let is_sub = root != id;
