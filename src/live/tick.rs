@@ -74,8 +74,8 @@ pub(super) struct ConvPlan {
     app_data: PathBuf,
     convs: Vec<ConvReq>,
     subs: Vec<SubReq>,
-    /// Transcripts to read, each from the offset its conversation has read up to.
-    transcripts: Vec<(String, u64)>,
+    /// Transcripts to read, each from where its conversation has read up to.
+    transcripts: Vec<(String, ReadPos)>,
     git: Vec<String>,
     /// Kept for `apply_convs`: what the bar/panel shows and what today's cost needs. `None` for a
     /// side-panel load, which only adds conversations: it neither evicts nor reports errors.
@@ -92,7 +92,7 @@ pub(super) struct ConvFetched {
 
 impl ConvPlan {
     pub(super) fn fetch(self) -> ConvFetched {
-        let convs = self
+        let convs: Vec<(ConvReq, Result<ConvData, String>)> = self
             .convs
             .into_iter()
             .map(|req| {
@@ -100,6 +100,9 @@ impl ConvPlan {
                 (req, res)
             })
             .collect();
+        // A conversation read for the first time whose records failed is not merged, nor is its
+        // transcript: don't read the whole file for nothing.
+        let unread: HashSet<&str> = convs.iter().filter(|(_, res)| res.is_err()).map(|(req, _)| req.id()).collect();
         let subs = self
             .subs
             .into_iter()
@@ -112,8 +115,9 @@ impl ConvPlan {
         let transcripts = self
             .transcripts
             .into_iter()
-            .map(|(id, from)| {
-                let chunk = crate::transcript::read_since(&self.app_data, &id, from);
+            .filter(|(id, at)| !(at.offset() == 0 && unread.contains(id.as_str())))
+            .map(|(id, at)| {
+                let chunk = crate::transcript::read_since(&self.app_data, &id, at);
                 (id, chunk)
             })
             .collect();
@@ -412,7 +416,7 @@ impl Engine {
     /// transcript.jsonl entries are picked up that way without an LS RPC, only for a while: some
     /// records never get a label, and re-reading every transcript every second is costly with
     /// many subagents.
-    fn plan_transcripts(&self, convs: &[ConvReq], resync: bool) -> Vec<(String, u64)> {
+    fn plan_transcripts(&self, convs: &[ConvReq], resync: bool) -> Vec<(String, ReadPos)> {
         let mut ids: Vec<&str> = convs.iter().map(ConvReq::id).collect();
         if resync {
             let mut late: Vec<&str> = self
@@ -428,8 +432,8 @@ impl Engine {
         }
         ids.into_iter()
             .map(|id| {
-                let from = self.convs.get(id).and_then(|c| c.transcript.as_ref()).map_or(0, Transcript::offset);
-                (id.to_string(), from)
+                let at = self.convs.get(id).and_then(|c| c.transcript.as_ref()).map(Transcript::position);
+                (id.to_string(), at.unwrap_or_default())
             })
             .collect()
     }
@@ -833,57 +837,164 @@ mod tests {
     #[test]
     fn transcripts_are_read_with_their_conversations_and_late_ones_resynced() {
         let mut e = engine();
-        let (fetched, late, settled) = (uuid(1), uuid(2), uuid(3));
-        e.ls_loaded.insert(fetched.clone());
-        let undated = LiveCall {
-            call: Call { tokens: Tokens { input: 1, ..Default::default() }, ..Default::default() },
+        let call = |input: u64, dated: bool, label: Option<&str>| LiveCall {
+            call: Call { tokens: Tokens { input, ..Default::default() }, ..Default::default() },
+            dated,
+            label: label.map(str::to_string),
             ..Default::default()
         };
-        for id in [&late, &settled] {
-            let calls = if id == &late { vec![undated.clone()] } else { Vec::new() };
+        let now = Some(Instant::now());
+        let (fetched, late, labeled, no_usage, old, undated) = (uuid(1), uuid(2), uuid(3), uuid(4), uuid(5), uuid(6));
+        // Fetched (not loaded yet) and late at once: read once.
+        e.ls_loaded.insert(fetched.clone());
+        e.convs
+            .insert(fetched.clone(), Conv { changed_at: now, calls: vec![call(1, false, None)], ..Default::default() });
+        e.convs.insert(
+            late.clone(),
+            Conv { loaded_once: true, changed_at: now, calls: vec![call(1, true, None)], ..Default::default() },
+        );
+        e.convs.insert(
+            undated.clone(),
+            Conv {
+                loaded_once: true,
+                changed_at: now,
+                calls: vec![call(1, false, Some("Read"))],
+                ..Default::default()
+            },
+        );
+        let settled = [(&labeled, call(1, true, Some("Read"))), (&no_usage, call(0, false, None))];
+        for (id, c) in settled {
+            e.convs
+                .insert(id.clone(), Conv { loaded_once: true, changed_at: now, calls: vec![c], ..Default::default() });
+        }
+        // Changed longer ago than RESYNC_WINDOW (not representable on Windows shortly after boot).
+        if let Some(t) = Instant::now().checked_sub(RESYNC_WINDOW + Duration::from_secs(1)) {
             e.convs.insert(
-                id.clone(),
-                Conv { loaded_once: true, changed_at: Some(Instant::now()), calls, ..Default::default() },
+                old.clone(),
+                Conv {
+                    loaded_once: true,
+                    changed_at: Some(t),
+                    calls: vec![call(1, false, None)],
+                    ..Default::default()
+                },
             );
         }
         let plan = e.plan_convs(&HashSet::from([fetched.clone()]));
         let ids: Vec<&str> = plan.transcripts.iter().map(|(id, _)| id.as_str()).collect();
-        assert_eq!(ids, vec![fetched.as_str(), late.as_str()], "fetched first, then late; settled ones not at all");
+        assert_eq!(ids, vec![fetched.as_str(), late.as_str(), undated.as_str()]);
 
         let mut tried = HashSet::new();
-        let panel = e.plan_load(&fetched, &mut tried).expect("planned");
+        let panel = e.plan_load(&uuid(9), &mut tried).expect("planned");
         assert_eq!(panel.transcripts.len(), 1, "a panel load reads only what it loads");
+    }
+
+    /// A throwaway app-data directory for tests that read real transcript files.
+    struct TempData(PathBuf);
+
+    impl TempData {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("agy-engine-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            Self(dir)
+        }
+
+        fn write(&self, id: &str, steps: &[u64]) {
+            let path = crate::transcript::transcript_path(&self.0, id);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text: String = steps
+                .iter()
+                .map(|n| {
+                    format!("{}\n", json!({ "step_index": n, "type": "PLANNER_RESPONSE", "created_at": step_at(*n) }))
+                })
+                .collect();
+            std::fs::write(path, text).unwrap();
+        }
+    }
+
+    impl Drop for TempData {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn step_at(n: u64) -> String {
+        format!("2026-11-27T0{n}:00:00Z")
+    }
+
+    fn record_for(step: u64) -> Value {
+        json!({ "chatModel": { "responseModel": "m", "usage": { "inputTokens": 1 } }, "stepIndices": [step] })
+    }
+
+    /// One engine-loop round for `id` as `plan_convs` builds it: records, then the planned transcript read.
+    fn round(e: &mut Engine, id: &str, records: &[Value]) {
+        let req = e.conv_req(id);
+        let transcripts = e
+            .plan_transcripts(std::slice::from_ref(&req), false)
+            .into_iter()
+            .map(|(id, at)| {
+                let chunk = crate::transcript::read_since(&e.app_data, &id, at);
+                (id, chunk)
+            })
+            .collect();
+        let keep = Some(HashSet::from([id.to_string()]));
+        e.apply_convs(ConvFetched {
+            convs: vec![(req, ls_page(records))],
+            subs: Vec::new(),
+            transcripts,
+            git: Vec::new(),
+            keep,
+        });
     }
 
     #[test]
     fn a_changed_conversation_is_dated_from_its_transcript() {
+        let data = TempData::new("dating");
         let mut e = engine();
-        e.app_data = std::env::temp_dir().join(format!("agy-engine-dating-{}", std::process::id()));
+        e.app_data = data.0.clone();
         let a = uuid(1);
-        let path = crate::transcript::transcript_path(&e.app_data, &a);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let at = "2026-11-27T01:00:00Z";
-        std::fs::write(
-            &path,
-            format!("{}\n", json!({ "step_index": 1, "type": "PLANNER_RESPONSE", "created_at": at })),
-        )
-        .unwrap();
-
         e.ls_loaded.insert(a.clone());
-        let req = e.conv_req(&a);
-        let chunk = crate::transcript::read_since(&e.app_data, &a, 0);
-        let keep = HashSet::from([a.clone()]);
-        e.apply_convs(ConvFetched {
-            convs: vec![(req, ls_page(&[record(10)]))],
+        let dated_at = |e: &Engine, i: usize| {
+            let c = &e.convs[&a].calls[i];
+            (c.dated, c.at_ms, c.label.clone())
+        };
+        let expect = |n: u64| (true, parse_ts(&step_at(n)).unwrap(), Some("Final reply".to_string()));
+
+        data.write(&a, &[1, 2]);
+        round(&mut e, &a, &[record_for(1)]);
+        assert_eq!(dated_at(&e, 0), expect(1));
+
+        // A new record for a step already read: nothing new in the transcript, still dated.
+        round(&mut e, &a, &[record_for(1), record_for(2)]);
+        assert_eq!(dated_at(&e, 1), expect(2));
+
+        // New lines are read from where the last read ended.
+        data.write(&a, &[1, 2, 3]);
+        round(&mut e, &a, &[record_for(2), record_for(3)]);
+        assert_eq!(dated_at(&e, 2), expect(3));
+    }
+
+    #[test]
+    fn fetch_reads_planned_transcripts_but_not_for_records_that_failed_first() {
+        let data = TempData::new("fetch");
+        let (a, b) = (uuid(1), uuid(2));
+        data.write(&a, &[1]);
+        data.write(&b, &[1]);
+        let plan = ConvPlan {
+            ls: LsClient::new("127.0.0.1:9", "", false),
+            app_data: data.0.clone(),
+            // No database for `b`: its records fail without any RPC.
+            convs: vec![ConvReq::Db { id: b.clone(), have: None }],
             subs: Vec::new(),
-            transcripts: vec![(a.clone(), chunk)],
+            transcripts: vec![(a.clone(), ReadPos::default()), (b.clone(), ReadPos::default())],
             git: Vec::new(),
-            keep: Some(keep),
-        });
-        let _ = std::fs::remove_dir_all(&e.app_data);
-        let c = &e.convs[&a].calls[0];
-        assert!(c.dated);
-        assert_eq!(c.at_ms, parse_ts(at).unwrap());
-        assert_eq!(c.label.as_deref(), Some("Final reply"));
+            keep: None,
+        };
+        let fetched = plan.fetch();
+        let ids: Vec<&str> = fetched.transcripts.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec![a.as_str()]);
+        let (_, chunk) = fetched.transcripts.into_iter().next().unwrap();
+        let mut t = Transcript::default();
+        assert_eq!(t.apply(chunk), Some(true));
+        assert!(t.steps.contains_key(&1));
     }
 }
