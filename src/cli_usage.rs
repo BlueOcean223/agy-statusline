@@ -5,11 +5,11 @@
 //! `agy CLI` shares the same Antigravity account quota as the desktop app, so including its SQLite
 //! call records keeps today's spend, daily history, weekly `cap ≈`, and call breakdowns accurate.
 
+use crate::call::{CLI, Call, DedupSet};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
-use crate::convdb::{DbSig, signature};
+use crate::convdb::{DbSig, is_uuid_db, signature};
 use crate::usage::{
-    CallRecord, DbCache, HISTORY_KEEP_DAYS, ModelAgg, UsageHistory, day_start_ms, is_uuid_db, local_day_str,
-    read_conv_db, today_str,
+    DbCache, HISTORY_KEEP_DAYS, ModelAgg, UsageHistory, day_start_ms, local_day_str, read_usage_calls, today_str,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,7 @@ const CLI_OLD_MAX_RECORDS: usize = 50_000;
 /// One CLI DB's calls with each call's local day computed once at read time, so day lookups
 /// and aggregation never format a date per call.
 pub(crate) struct CliDbCalls {
-    calls: Vec<CallRecord>,
+    calls: Vec<Call>,
     /// Sorted, unique local days (`YYYY-MM-DD`) that have calls.
     days: Vec<String>,
     /// Per call: index into `days`.
@@ -38,7 +38,7 @@ pub(crate) struct CliDbCalls {
 }
 
 impl CliDbCalls {
-    fn new(calls: Vec<CallRecord>) -> Self {
+    fn new(calls: Vec<Call>) -> Self {
         let keys: Vec<String> = calls.iter().map(|c| local_day_str(c.at_ms)).collect();
         let mut days = keys.clone();
         days.sort();
@@ -54,7 +54,7 @@ impl CliDbCalls {
     }
 
     /// Calls on `date`, in row order.
-    fn on_day<'a>(&'a self, date: &str) -> impl Iterator<Item = &'a CallRecord> + 'a {
+    fn on_day<'a>(&'a self, date: &str) -> impl Iterator<Item = &'a Call> + 'a {
         let idx = self.days.binary_search_by(|d| d.as_str().cmp(date)).ok();
         idx.into_iter().flat_map(move |d| self.by_day[d].iter().map(move |&i| &self.calls[i as usize]))
     }
@@ -137,14 +137,14 @@ impl CliSnapshot {
         if hit.is_some() {
             return hit;
         }
-        let db = Arc::new(CliDbCalls::new(read_conv_db(&path, cid, "cli").ok()?));
+        let db = Arc::new(CliDbCalls::new(read_usage_calls(&path, cid, CLI).ok()?));
         let records = db.calls.len();
         lock_old(&self.old).insert(path, sig, Arc::clone(&db), records);
         Some(db)
     }
 
     /// Returns all deduplicated CLI calls occurring on `date` (`YYYY-MM-DD`).
-    pub fn calls_for_day(&mut self, cli_dir: &Path, plugin_data: &Path, date: &str) -> Vec<CallRecord> {
+    pub fn calls_for_day(&mut self, cli_dir: &Path, plugin_data: &Path, date: &str) -> Vec<Call> {
         self.ensure_index_readonly(plugin_data);
         let mut dbs: Vec<Arc<CliDbCalls>> = self.cache.values().map(|e| Arc::clone(&e.db)).collect();
 
@@ -159,10 +159,10 @@ impl CliSnapshot {
         }
 
         let mut out = Vec::new();
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen = DedupSet::default();
         for db in &dbs {
             for c in db.on_day(date) {
-                if seen.insert(c.dedup_key.as_str()) {
+                if seen.insert(c) {
                     out.push(c.clone());
                 }
             }
@@ -291,7 +291,7 @@ impl CliScanner {
             // Full re-read on change: rows are updated in place after insertion (usage arrives when
             // streaming ends, step timestamps can land after the generator row), so reading only
             // new `idx` rows would need its own invalidation rules. A 9 MB DB reads in ~20 ms.
-            match read_conv_db(&conv_dir.join(fname), cid, "cli") {
+            match read_usage_calls(&conv_dir.join(fname), cid, CLI) {
                 Ok(calls) => {
                     let db = Arc::new(CliDbCalls::new(calls));
                     Arc::make_mut(&mut self.index)
@@ -316,7 +316,7 @@ impl CliScanner {
 
         // Aggregate all readable/cached DBs from `from_ms` through today.
         let mut raw_agg: BTreeMap<String, (HashMap<String, ModelAgg>, HashSet<String>)> = BTreeMap::new();
-        let mut seen: HashSet<&str> = HashSet::new();
+        let mut seen = DedupSet::default();
         for e in self.cache.values() {
             if e.sig.mtime_ms < from_ms {
                 continue;
@@ -326,26 +326,20 @@ impl CliScanner {
                 if c.at_ms < from_ms {
                     continue;
                 }
-                if !seen.insert(c.dedup_key.as_str()) {
+                if !seen.insert(c) {
                     continue;
                 }
                 let day = &db.days[d as usize];
-                let model_key = if !c.model_raw.is_empty() {
-                    c.model_raw.as_str()
-                } else if !c.model_display.is_empty() {
-                    c.model_display.as_str()
-                } else {
-                    "unknown"
-                };
+                let model_key = c.model.bucket_key();
                 if !raw_agg.contains_key(day) {
                     raw_agg.insert(day.clone(), Default::default());
                 }
                 let Some((raw, convs)) = raw_agg.get_mut(day) else { continue };
-                if !raw.contains_key(model_key) {
-                    raw.insert(model_key.to_string(), ModelAgg::default());
+                if !raw.contains_key(&model_key) {
+                    raw.insert(model_key.clone(), ModelAgg::default());
                 }
-                if let Some(agg) = raw.get_mut(model_key) {
-                    agg.add(c.input, c.cache_read, c.cache_write, c.output);
+                if let Some(agg) = raw.get_mut(&model_key) {
+                    agg.add_tokens(&c.tokens);
                 }
                 if !convs.contains(&c.conv_id) {
                     convs.insert(c.conv_id.clone());
@@ -480,26 +474,11 @@ pub fn read_cli_titles(cli_dir: &Path) -> HashMap<String, String> {
 mod tests {
     use super::*;
 
-    fn varint(mut n: u64) -> Vec<u8> {
-        let mut b = Vec::new();
-        loop {
-            let mut c = (n & 0x7f) as u8;
-            n >>= 7;
-            if n != 0 {
-                c |= 0x80;
-            }
-            b.push(c);
-            if n == 0 {
-                break;
-            }
-        }
-        b
-    }
-    fn fv(f: u64, n: u64) -> Vec<u8> {
-        [varint(f << 3), varint(n)].concat()
-    }
-    fn fb(f: u64, data: &[u8]) -> Vec<u8> {
-        [varint((f << 3) | 2), varint(data.len() as u64), data.to_vec()].concat()
+    use crate::call::{ModelId, Tokens};
+    use crate::convdb::fixture::{Gen, Step, write_db};
+
+    fn neon(response_id: &'static str, steps: Vec<u64>, exec: &'static str) -> Gen {
+        Gen { input: 1000, output: 200, response_id, raw: "gemini-4-neon", steps, exec, ..Default::default() }
     }
 
     #[test]
@@ -524,16 +503,12 @@ mod tests {
 
         let now_ms = crate::live::now_ms();
         let now_s = (now_ms / 1000) as u64;
-        let conn = Connection::open(conv_dir.join(format!("{good_id}.db"))).unwrap();
-        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
-        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
-        let meta = [fb(1, &fv(1, now_s)), fb(12, b"exec-1")].concat();
-        conn.execute("INSERT INTO steps VALUES (1, ?1)", [&meta]).unwrap();
-        let usage = [fv(2, 1000), fv(3, 200), fb(11, b"cli-req-1")].concat();
-        let cm = [fb(4, &usage), fb(19, b"gemini-4-neon")].concat();
-        let row = [fb(1, &cm), fb(2, &varint(1)), fb(4, b"exec-1")].concat();
-        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&row]).unwrap();
-        drop(conn);
+        write_db(
+            &conv_dir.join(format!("{good_id}.db")),
+            &[Step { idx: 1, at_s: now_s, exec: "exec-1" }],
+            &[neon("cli-req-1", vec![1], "exec-1")],
+            None,
+        );
 
         let mut scanner = CliScanner::default();
         let mut h = UsageHistory { v: 2, live_from: today_str(), writable: true, ..Default::default() };
@@ -547,31 +522,19 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    fn write_cli_db(path: &Path, at_ms: i64, req: &str) {
-        let conn = Connection::open(path).unwrap();
-        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
-        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
-        conn.execute("INSERT INTO steps VALUES (1, ?1)", [&fb(1, &fv(1, (at_ms / 1000) as u64))]).unwrap();
-        let usage = [fv(2, 1000), fv(3, 200), fb(11, req.as_bytes())].concat();
-        let cm = [fb(4, &usage), fb(19, b"gemini-4-neon")].concat();
-        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&[fb(1, &cm), fb(2, &varint(1))].concat()]).unwrap();
+    fn write_cli_db(path: &Path, at_ms: i64, req: &'static str) {
+        write_db(path, &[Step { idx: 1, at_s: (at_ms / 1000) as u64, exec: "" }], &[neon(req, vec![1], "")], None);
     }
 
-    fn call_at(at_ms: i64, key: &str) -> CallRecord {
-        CallRecord {
+    fn call_at(at_ms: i64, key: &str) -> Call {
+        Call {
             conv_id: "c".into(),
+            source: CLI,
             at_ms,
-            step: None,
-            model_raw: String::new(),
-            model_display: String::new(),
-            input: 1,
-            cache_read: 0,
-            cache_write: 0,
-            output: 0,
-            ttft_ms: None,
-            stream_ms: None,
-            dedup_key: key.into(),
-            source: "cli",
+            model: ModelId::default(),
+            tokens: Tokens { input: 1, ..Default::default() },
+            response_id: Some(key.into()),
+            ..Default::default()
         }
     }
 
@@ -581,7 +544,7 @@ mod tests {
         let d2 = day_start_ms("2026-11-21").unwrap() + 3_600_000;
         let db = CliDbCalls::new(vec![call_at(d2, "a"), call_at(d1, "b"), call_at(d2 + 60_000, "c")]);
         assert_eq!(db.days, vec!["2026-11-20".to_string(), "2026-11-21".to_string()]);
-        let keys = |date| db.on_day(date).map(|c| c.dedup_key.clone()).collect::<Vec<_>>();
+        let keys = |date| db.on_day(date).filter_map(|c| c.response_id.clone()).collect::<Vec<_>>();
         assert_eq!(keys("2026-11-21"), vec!["a", "c"]);
         assert_eq!(keys("2026-11-20"), vec!["b"]);
         assert!(keys("2026-11-22").is_empty());
@@ -619,7 +582,7 @@ mod tests {
         // Day lookups still find it through `cli-index.json`, and keep it in the shared old-DB cache.
         let mut snap = delta.snapshot.clone();
         let calls = snap.calls_for_day(&cli_dir, &pd, &old_day);
-        assert_eq!(calls.iter().map(|c| c.dedup_key.as_str()).collect::<Vec<_>>(), vec!["req-old"]);
+        assert_eq!(calls.iter().filter_map(|c| c.response_id.as_deref()).collect::<Vec<_>>(), vec!["req-old"]);
         assert!(lock_old(&scanner.old).contains(&conv_dir.join(old_fname)));
         assert_eq!(snap.calls_for_day(&cli_dir, &pd, &today_str()).len(), 1);
 

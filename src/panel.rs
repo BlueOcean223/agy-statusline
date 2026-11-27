@@ -1,7 +1,7 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
 use crate::config::{Config, OnlinePrices, effective_model_rules};
-use crate::live::{Call, Engine, call_cost, now_ms};
+use crate::live::{Engine, LiveCall, call_cost, now_ms};
 use crate::miss::MissSummary;
 use crate::transcript::read_annotation;
 use serde_json::{Value, json};
@@ -69,12 +69,12 @@ impl Engine {
         if !is_sub && cfg.include_subagents {
             ids.extend(self.tree(&root).into_iter().filter(|x| *x != id));
         }
-        let own: Vec<&Call> =
-            self.convs.get(&id).map(|c| c.calls.iter().filter(|c| c.has_usage).collect()).unwrap_or_default();
-        let all: Vec<&Call> = ids
+        let own: Vec<&LiveCall> =
+            self.convs.get(&id).map(|c| c.calls.iter().filter(|c| c.has_usage()).collect()).unwrap_or_default();
+        let all: Vec<&LiveCall> = ids
             .iter()
             .filter_map(|cid| self.convs.get(cid))
-            .flat_map(|c| c.calls.iter().filter(|c| c.has_usage))
+            .flat_map(|c| c.calls.iter().filter(|c| c.has_usage()))
             .collect();
 
         // Tokens and cost
@@ -82,18 +82,18 @@ impl Engine {
         let (mut c_in, mut c_cache, mut c_cw, mut c_out) = (0.0, 0.0, 0.0, 0.0);
         let mut saved = 0.0;
         for c in &all {
-            fresh += c.input;
-            cache += c.cache;
-            cache_write += c.cache_write;
-            out += c.output;
+            fresh += c.tokens.input;
+            cache += c.tokens.cache_read;
+            cache_write += c.tokens.cache_write;
+            out += c.tokens.output;
             let k = call_cost(&rules, c);
             c_in += k.input;
             c_cache += k.cache;
             c_cw += k.cw;
             c_out += k.out;
             // What the cached tokens would have cost as fresh input.
-            if c.cache > 0 && c.input > 0 && k.input > 0.0 {
-                saved += c.cache as f64 * (k.input / c.input as f64) - k.cache;
+            if c.tokens.cache_read > 0 && c.tokens.input > 0 && k.input > 0.0 {
+                saved += c.tokens.cache_read as f64 * (k.input / c.tokens.input as f64) - k.cache;
             }
         }
         let cost = c_in + c_cache + c_cw + c_out;
@@ -121,9 +121,9 @@ impl Engine {
         let turns_left = (avg_growth > 0 && ctx_max > 0).then(|| ctx_left as i64 / avg_growth);
 
         // Cache & 6-cause miss analysis
-        let hit = |c: &Call| {
-            let d = c.cache + c.input;
-            if d == 0 { 0.0 } else { c.cache as f64 / d as f64 }
+        let hit = |c: &LiveCall| {
+            let d = c.tokens.cache_read + c.tokens.input;
+            if d == 0 { 0.0 } else { c.tokens.cache_read as f64 / d as f64 }
         };
         let session_hit = if fresh + cache > 0 { cache as f64 / (fresh + cache) as f64 } else { 0.0 };
         let own_misses = self.conv_misses(&id, &rules);
@@ -141,7 +141,7 @@ impl Engine {
         // Speed
         let (out_sum, stream_sum) = own
             .iter()
-            .filter_map(|c| c.stream_ms.filter(|ms| *ms > 50.0).map(|ms| (c.output as f64, ms / 1000.0)))
+            .filter_map(|c| c.stream_ms.filter(|ms| *ms > 50.0).map(|ms| (c.tokens.output as f64, ms / 1000.0)))
             .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
         let ttfts: Vec<f64> = own.iter().filter_map(|c| c.ttft_ms).collect();
         let tps_series: Vec<f64> = own.iter().rev().take(SERIES_LEN).rev().filter_map(|c| c.tps()).collect();
@@ -155,10 +155,10 @@ impl Engine {
                 .filter(|x| *x != root)
                 .map(|sid| {
                     let s = self.summaries.get(&sid).cloned().unwrap_or_default();
-                    let calls: Vec<&Call> = self
+                    let calls: Vec<&LiveCall> = self
                         .convs
                         .get(&sid)
-                        .map(|c| c.calls.iter().filter(|c| c.has_usage).collect())
+                        .map(|c| c.calls.iter().filter(|c| c.has_usage()).collect())
                         .unwrap_or_default();
                     json!({
                         "id": sid,
@@ -166,8 +166,8 @@ impl Engine {
                         "inLs": self.ls_loaded.contains(&sid),
                         "type": s.sub_type,
                         "role": s.sub_role,
-                        "model": calls.last().map(|c| c.display.clone()),
-                        "tokens": calls.iter().map(|c| c.input + c.cache + c.cache_write + c.output).sum::<u64>(),
+                        "model": calls.last().map(|c| c.model.display.clone()),
+                        "tokens": calls.iter().map(|c| c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output).sum::<u64>(),
                         "cost": calls.iter().map(|c| call_cost(&rules, c).total()).sum::<f64>(),
                         "running": self.is_running(&sid),
                         "lastAt": calls.last().map(|c| c.at_ms),
@@ -193,10 +193,10 @@ impl Engine {
                 json!({
                     "step": c.steps.first(),
                     "at": c.at_ms,
-                    "model": c.display,
+                    "model": c.model.display,
                     "ctx": c.ctx_used,
                     "hit": hit(c),
-                    "out": c.output,
+                    "out": c.tokens.output,
                     "cost": c_usd,
                     "costly": costly,
                     "miss": miss,
@@ -247,7 +247,7 @@ impl Engine {
                 "includesSubagents": !is_sub && cfg.include_subagents,
             },
             "speed": {
-                "lastTps": last.and_then(Call::tps),
+                "lastTps": last.and_then(|c| c.tps()),
                 "avgTps": (stream_sum > 0.0).then(|| out_sum / stream_sum),
                 "lastTtftMs": last.and_then(|c| c.ttft_ms),
                 "avgTtftMs": (!ttfts.is_empty()).then(|| ttfts.iter().sum::<f64>() / ttfts.len() as f64),

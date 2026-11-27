@@ -13,20 +13,21 @@
 //! Hooks only tell the engine *when* to look (UDP datagram, see `hook.rs`), so a turn's numbers
 //! show up right after the call ends instead of on the next poll.
 
+use crate::call::{Call, ModelId, Tokens};
 use crate::cli_usage::{CliScanner, CliSnapshot, apply_cli_delta};
 use crate::config::{
     Config, ModelRule, OnlinePrices, effective_model_rules, find_app_data_dir, find_cli_data_dir, find_plugin_data_dir,
     load_config, write_atomic,
 };
-use crate::convdb::{self, DbSig};
+use crate::convdb::{self, ConvMeta, DbSig};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::miss::{MissCallInput, MissInfo, miss_scan};
 use crate::transcript::{Annotation, Transcript};
 use crate::usage::{
-    AccountInfo, CallRecord, ModelAgg, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status,
-    load_history, load_samples, maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history,
-    today_str, update_today,
+    AccountInfo, ModelAgg, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history,
+    load_samples, maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str,
+    update_today,
 };
 use chrono::{DateTime, Local};
 use serde::Serialize;
@@ -82,88 +83,72 @@ fn file_base(p: &str) -> String {
 
 // ---------------------------------------------------------------- model calls
 
+/// A call in a conversation the engine tracks, with what the engine learned about it.
 #[derive(Clone, Debug, Default)]
-pub struct Call {
-    pub display: String,
-    pub resp_model: String,
-    pub input: u64,
-    pub cache: u64,
-    pub cache_write: u64,
-    pub output: u64,
-    pub ctx_used: u64,
-    pub ctx_max: u64,
-    pub checkpoint: i64,
-    pub ttft_ms: Option<f64>,
-    pub stream_ms: Option<f64>,
-    pub steps: Vec<u64>,
-    pub has_usage: bool,
-    pub at_ms: i64,
+pub struct LiveCall {
+    pub call: Call,
     /// True once `at_ms` has been resolved from `transcript.jsonl`'s `created_at`.
     pub dated: bool,
     /// True when this call first appeared incrementally after the conversation was already loaded.
     pub live_seen: bool,
     /// From transcript.jsonl: what the model did with this response.
     pub label: Option<String>,
-    /// Optional requestId for cross-source deduplication in day-call breakdowns.
-    pub request_id: Option<String>,
 }
 
-impl Call {
-    pub(crate) fn from_json(g: &Value, seen_at: i64, live_seen: bool) -> Self {
+impl std::ops::Deref for LiveCall {
+    type Target = Call;
+    fn deref(&self) -> &Call {
+        &self.call
+    }
+}
+
+impl std::ops::DerefMut for LiveCall {
+    fn deref_mut(&mut self) -> &mut Call {
+        &mut self.call
+    }
+}
+
+impl From<Call> for LiveCall {
+    fn from(call: Call) -> Self {
+        Self { call, ..Default::default() }
+    }
+}
+
+impl LiveCall {
+    pub(crate) fn from_json(g: &Value, conv_id: &str, seen_at: i64, live_seen: bool) -> Self {
         let cm = &g["chatModel"];
         let usage = &cm["usage"];
         let ctx = &cm["chatStartMetadata"]["contextWindowMetadata"];
-        let input = num(&usage["inputTokens"]);
-        let cache = num(&usage["cacheReadTokens"]);
-        let cache_write = num(&usage["cacheWriteTokens"]);
         let raw_out = num(&usage["outputTokens"]);
         let split_out = num(&usage["thinkingOutputTokens"]).saturating_add(num(&usage["responseOutputTokens"]));
-        let output = raw_out.max(split_out);
-        Call {
-            display: cm["modelDisplayName"].as_str().unwrap_or("").to_string(),
-            resp_model: cm["responseModel"].as_str().unwrap_or("").to_string(),
-            input,
-            cache,
-            cache_write,
-            output,
+        let call = Call {
+            conv_id: conv_id.to_string(),
+            source: crate::call::DESKTOP,
+            model: ModelId::new(
+                cm["responseModel"].as_str().unwrap_or(""),
+                cm["modelDisplayName"].as_str().unwrap_or(""),
+            ),
+            tokens: Tokens {
+                input: num(&usage["inputTokens"]),
+                cache_read: num(&usage["cacheReadTokens"]),
+                cache_write: num(&usage["cacheWriteTokens"]),
+                output: raw_out.max(split_out),
+            },
             ctx_used: num(&ctx["estimatedTokensUsed"]),
             ctx_max: num(&ctx["maxContextTokens"]),
             checkpoint: cm["chatStartMetadata"]["checkpointIndex"].as_i64().unwrap_or(-1),
             ttft_ms: dur_ms(&cm["timeToFirstToken"]),
             stream_ms: dur_ms(&cm["streamingDuration"]),
             steps: g["stepIndices"].as_array().map(|a| a.iter().map(num).collect()).unwrap_or_default(),
-            // Aborted/placeholder records can carry an empty `usage: {}` object with all-zero tokens.
-            has_usage: usage.is_object() && (input > 0 || cache > 0 || cache_write > 0 || output > 0),
             at_ms: if live_seen { seen_at } else { 0 },
-            dated: false,
-            live_seen,
-            label: None,
-            request_id: usage["requestId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
-        }
-    }
-
-    pub(crate) fn price_key(&self) -> String {
-        format!("{} {}", self.resp_model, self.display).to_lowercase()
-    }
-
-    pub(crate) fn model_bucket_key(&self) -> String {
-        if !self.resp_model.is_empty() {
-            self.resp_model.clone()
-        } else if !self.display.is_empty() {
-            self.display.clone()
-        } else {
-            "unknown".to_string()
-        }
-    }
-
-    pub fn tps(&self) -> Option<f64> {
-        let ms = self.stream_ms?;
-        (ms > 50.0 && self.output > 0).then(|| self.output as f64 / (ms / 1000.0))
+            response_id: usage["responseId"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+        };
+        Self { call, live_seen, ..Default::default() }
     }
 }
 
 pub fn price_for<'a>(rules: &'a [ModelRule], call: &Call) -> Option<&'a ModelRule> {
-    let key = call.price_key();
+    let key = call.model.price_key();
     rules.iter().find(|r| !r.pattern.is_empty() && contains_lowercased(&key, &r.pattern))
 }
 
@@ -207,10 +192,10 @@ pub fn call_cost(rules: &[ModelRule], c: &Call) -> Cost {
     let Some(r) = price_for(rules, c) else { return Cost::default() };
     let (p_in, p_cr, p_cw, p_out) = r.rates_at(c.at_ms, now_ms());
     Cost {
-        input: c.input as f64 * p_in / 1e6,
-        cache: c.cache as f64 * p_cr / 1e6,
-        cw: c.cache_write as f64 * p_cw / 1e6,
-        out: c.output as f64 * p_out / 1e6,
+        input: c.tokens.input as f64 * p_in / 1e6,
+        cache: c.tokens.cache_read as f64 * p_cr / 1e6,
+        cw: c.tokens.cache_write as f64 * p_cw / 1e6,
+        out: c.tokens.output as f64 * p_out / 1e6,
     }
 }
 
@@ -231,6 +216,23 @@ pub struct Summary {
     pub workspace_path: Option<String>,
 }
 
+impl From<ConvMeta> for Summary {
+    fn from(m: ConvMeta) -> Self {
+        Self {
+            step_count: m.step_count,
+            created_ms: m.created_ms,
+            modified_ms: m.modified_ms,
+            root: m.root,
+            sub_type: m.sub_type,
+            sub_role: m.sub_role,
+            workspace: m.workspace,
+            branch: m.branch,
+            workspace_path: m.workspace_path,
+            ..Default::default()
+        }
+    }
+}
+
 impl Summary {
     pub fn active(&self) -> bool {
         ["RUNNING", "BUSY", "CANCELING"].iter().any(|s| self.status.contains(s))
@@ -239,7 +241,7 @@ impl Summary {
 
 #[derive(Default)]
 pub struct Conv {
-    pub calls: Vec<Call>,
+    pub calls: Vec<LiveCall>,
     loaded_steps: u64,
     loaded_once: bool,
     last_conv_mod: i64,
@@ -285,7 +287,7 @@ impl ConvReq {
 pub(crate) enum ConvData {
     Ls(Value),
     /// `None` when the database is unchanged since `have`.
-    Db(Option<(DbSig, Vec<Call>, Box<Summary>)>),
+    Db(Option<(DbSig, Vec<LiveCall>, Box<Summary>)>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -311,7 +313,11 @@ pub(crate) fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Resul
             if *have == Some(sig) {
                 return Ok(ConvData::Db(None));
             }
-            convdb::read(app_data, id, sig).map(|(calls, summary)| ConvData::Db(Some((sig, calls, Box::new(summary)))))
+            convdb::read(app_data, id, sig).map(|(calls, meta)| {
+                // The transcript dates these calls, as it does for the language_server's records.
+                let calls = calls.into_iter().map(|c| LiveCall::from(Call { at_ms: 0, ..c })).collect();
+                ConvData::Db(Some((sig, calls, Box::new(Summary::from(meta)))))
+            })
         }
     }
 }
@@ -838,7 +844,7 @@ impl Engine {
                 conv.fetched_at = Some(now);
                 let was_loaded = conv.loaded_once;
                 let prev_last = conv.calls.get(offset).map(|c| (c.at_ms, c.dated, c.live_seen));
-                let fresh: Vec<Call> = j["generatorMetadata"]
+                let fresh: Vec<LiveCall> = j["generatorMetadata"]
                     .as_array()
                     .map(|a| {
                         a.iter()
@@ -848,7 +854,7 @@ impl Engine {
                                     Some((_, _, ls)) if i == 0 => ls,
                                     _ => was_loaded,
                                 };
-                                Call::from_json(g, seen_at, live_seen)
+                                LiveCall::from_json(g, id, seen_at, live_seen)
                             })
                             .collect()
                     })
@@ -1009,12 +1015,12 @@ impl Engine {
         let today = today_str();
         let mut live_by_conv: HashMap<String, HashMap<String, ModelAgg>> = HashMap::new();
         for (cid, conv) in &self.convs {
-            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
-                live_by_conv.entry(cid.clone()).or_default().entry(c.model_bucket_key()).or_default().add(
-                    c.input,
-                    c.cache,
-                    c.cache_write,
-                    c.output,
+            for c in conv.calls.iter().filter(|c| c.has_usage() && c.at_ms >= midnight) {
+                live_by_conv.entry(cid.clone()).or_default().entry(c.model.bucket_key()).or_default().add(
+                    c.tokens.input,
+                    c.tokens.cache_read,
+                    c.tokens.cache_write,
+                    c.tokens.output,
                 );
             }
         }
@@ -1068,32 +1074,13 @@ impl Engine {
     }
 
     /// Exports live in-memory calls for the `/api/usage/day` call-breakdown view.
-    pub fn live_call_records(&self) -> Vec<CallRecord> {
-        let mut out = Vec::new();
-        for (cid, conv) in &self.convs {
-            for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms > 0) {
-                let dedup_key = c
-                    .request_id
-                    .clone()
-                    .unwrap_or_else(|| format!("{}:{}:{}:{}", cid, c.at_ms / 1000, c.input, c.output));
-                out.push(CallRecord {
-                    conv_id: cid.clone(),
-                    at_ms: c.at_ms,
-                    step: c.steps.first().copied(),
-                    model_raw: c.resp_model.clone(),
-                    model_display: c.display.clone(),
-                    input: c.input,
-                    cache_read: c.cache,
-                    cache_write: c.cache_write,
-                    output: c.output,
-                    ttft_ms: c.ttft_ms,
-                    stream_ms: c.stream_ms,
-                    dedup_key,
-                    source: "desktop",
-                });
-            }
-        }
-        out
+    pub fn live_call_records(&self) -> Vec<Call> {
+        self.convs
+            .values()
+            .flat_map(|conv| conv.calls.iter())
+            .filter(|c| c.has_usage() && c.at_ms > 0)
+            .map(|c| c.call.clone())
+            .collect()
     }
 
     pub fn root_of(&self, id: &str) -> String {
@@ -1125,23 +1112,23 @@ impl Engine {
         ids
     }
 
-    pub(crate) fn last_call(&self, id: &str) -> Option<&Call> {
-        self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage)
+    pub(crate) fn last_call(&self, id: &str) -> Option<&LiveCall> {
+        self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage())
     }
 
-    pub(crate) fn quota_for(&self, call: Option<&Call>) -> Vec<QuotaView> {
+    pub(crate) fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
         let groups = self.quota["groups"].as_array().cloned().unwrap_or_default();
         if groups.is_empty() {
             return Vec::new();
         }
-        let name = call.map(|c| model_family(&c.display)).unwrap_or_default();
+        let name = call.map(|c| model_family(&c.model.display)).unwrap_or_default();
         let group = groups
             .iter()
             .find(|g| !name.is_empty() && g["description"].as_str().unwrap_or("").contains(&name))
             .or_else(|| {
                 // Claude/GPT models live in the third-party group.
                 let third = call.is_some_and(|c| {
-                    let k = c.price_key();
+                    let k = c.model.price_key();
                     k.contains("claude") || k.contains("gpt")
                 });
                 groups.iter().find(|g| {
@@ -1164,9 +1151,9 @@ impl Engine {
                 Some(t) if t.rev == conv.rev && t.midnight == midnight && t.rules == fp => (t.cost, t.tokens),
                 _ => {
                     let (mut cost, mut tok) = (0.0, 0u64);
-                    for c in conv.calls.iter().filter(|c| c.has_usage && c.at_ms >= midnight) {
+                    for c in conv.calls.iter().filter(|c| c.has_usage() && c.at_ms >= midnight) {
                         cost += call_cost(rules, c).total();
-                        tok += c.input + c.cache + c.cache_write + c.output;
+                        tok += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
                     }
                     conv.today_cost.set(Some(TodayCost { rev: conv.rev, midnight, rules: fp, cost, tokens: tok }));
                     (cost, tok)
@@ -1210,19 +1197,19 @@ impl Engine {
                 // On price-transition days, price CLI calls at their exact timestamps outside USAGE lock.
                 if crate::config::any_price_cut_in(rules, midnight, midnight + 86_400_000) {
                     for c in cli_snap.calls_for_day(&cd, &pd, &today) {
-                        let key = format!("{} {}", c.model_raw, c.model_display);
+                        let key = c.model.price_key();
                         let (_, u) = crate::usage::price_tokens(
                             rules,
                             &key,
-                            c.input,
-                            c.cache_read,
-                            c.cache_write,
-                            c.output,
+                            c.tokens.input,
+                            c.tokens.cache_read,
+                            c.tokens.cache_write,
+                            c.tokens.output,
                             c.at_ms,
                             now,
                         );
                         cli_usd += u;
-                        cli_tok += c.input + c.cache_read + c.cache_write + c.output;
+                        cli_tok += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
                     }
                 } else {
                     for (model, agg) in &cli_raw {
@@ -1260,7 +1247,7 @@ impl Engine {
         let inputs: Vec<MissCallInput> = conv
             .calls
             .iter()
-            .filter(|c| c.has_usage)
+            .filter(|c| c.has_usage())
             .map(|c| {
                 if let Some(r) = price_for(rules, c) {
                     let (p_in, p_cr, p_cw, _) = r.rates_at(c.at_ms, now);
@@ -1270,9 +1257,9 @@ impl Engine {
                         stream_ms: c.stream_ms,
                         step: c.steps.first().copied(),
                         model_name: Some(r.short_name.clone()),
-                        input: c.input,
-                        cache_read: c.cache,
-                        cache_write: c.cache_write,
+                        input: c.tokens.input,
+                        cache_read: c.tokens.cache_read,
+                        cache_write: c.tokens.cache_write,
                         p_in,
                         p_cache: p_cr,
                         p_cw,
@@ -1284,9 +1271,9 @@ impl Engine {
                         stream_ms: c.stream_ms,
                         step: c.steps.first().copied(),
                         model_name: None,
-                        input: c.input,
-                        cache_read: c.cache,
-                        cache_write: c.cache_write,
+                        input: c.tokens.input,
+                        cache_read: c.tokens.cache_read,
+                        cache_write: c.tokens.cache_write,
                         p_in: 0.0,
                         p_cache: 0.0,
                         p_cw: 0.0,
@@ -1355,7 +1342,7 @@ impl Engine {
         let mut prev_used = 0u64;
         let mut own_cost = 0.0;
         let mut first_call_at = 0i64;
-        for c in calls.iter().filter(|c| c.has_usage) {
+        for c in calls.iter().filter(|c| c.has_usage()) {
             own_cost += call_cost(rules, c).total();
             if c.at_ms > 0 && (first_call_at == 0 || c.at_ms < first_call_at) {
                 first_call_at = c.at_ms;
@@ -1424,20 +1411,20 @@ impl Engine {
             sub_role: s.and_then(|s| s.sub_role.clone()),
             running: self.is_running(id),
             waiting,
-            model: last.map(|c| c.display.clone()),
-            resp_model: last.map(|c| c.resp_model.clone()),
+            model: last.map(|c| c.model.display.clone()),
+            resp_model: last.map(|c| c.model.raw.clone()),
             ctx_used: last.map(|c| c.ctx_used),
             ctx_max,
             compactions,
-            cache_read: last.map(|c| c.cache),
-            cache_write: last.map(|c| c.cache_write),
+            cache_read: last.map(|c| c.tokens.cache_read),
+            cache_write: last.map(|c| c.tokens.cache_write),
             cache_hit: last.and_then(|c| {
-                let denom = c.cache + c.input;
-                (denom > 0).then(|| c.cache as f64 / denom as f64)
+                let denom = c.tokens.cache_read + c.tokens.input;
+                (denom > 0).then(|| c.tokens.cache_read as f64 / denom as f64)
             }),
             ttft_ms: last.and_then(|c| c.ttft_ms),
-            tps: last.and_then(Call::tps),
-            out_tokens: last.map(|c| c.output),
+            tps: last.and_then(|c| c.tps()),
+            out_tokens: last.map(|c| c.tokens.output),
             cost: own_cost,
             started_ms,
             ended_ms,
@@ -1445,7 +1432,7 @@ impl Engine {
             current_step,
             timeline,
             last_at: last.map(|c| c.at_ms),
-            calls: calls.iter().filter(|c| c.has_usage).count(),
+            calls: calls.iter().filter(|c| c.has_usage()).count(),
         }
     }
 
@@ -1461,7 +1448,7 @@ impl Engine {
         let mut multi_day = false;
         for cid in &ids {
             if let Some(conv) = self.convs.get(cid) {
-                for c in conv.calls.iter().filter(|c| c.has_usage) {
+                for c in conv.calls.iter().filter(|c| c.has_usage()) {
                     let cost = call_cost(rules, c).total();
                     cost_conv += cost;
                     if c.at_ms >= midnight {
@@ -1527,7 +1514,7 @@ impl Engine {
     }
 }
 
-pub(crate) fn date_calls(calls: &mut [Call], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
+pub(crate) fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
     for c in calls.iter_mut() {
         let infos: Vec<_> = c.steps.iter().filter_map(|s| steps.get(s)).collect();
         if let Some(at) = infos.iter().map(|i| i.at_ms).filter(|&t| t > 0).min() {
@@ -1849,8 +1836,8 @@ mod tests {
             },
             "stepIndices": []
         });
-        let c = Call::from_json(&empty, 9_999, false);
-        assert!(!c.has_usage);
+        let c = LiveCall::from_json(&empty, "c", 9_999, false);
+        assert!(!c.has_usage());
         assert_eq!(c.at_ms, 0);
 
         let real = json!({
@@ -1862,15 +1849,18 @@ mod tests {
                     "cacheReadTokens": "900",
                     "cacheWriteTokens": "500",
                     "thinkingOutputTokens": "80",
-                    "responseOutputTokens": "40"
+                    "responseOutputTokens": "40",
+                    "responseId": "resp-9"
                 }
             },
             "stepIndices": [1]
         });
-        let c2 = Call::from_json(&real, 9_999, true);
-        assert!(c2.has_usage);
-        assert_eq!(c2.cache_write, 500);
-        assert_eq!(c2.output, 120);
+        let c2 = LiveCall::from_json(&real, "c", 9_999, true);
+        assert!(c2.has_usage());
+        assert_eq!(c2.tokens.cache_write, 500);
+        assert_eq!(c2.tokens.output, 120);
+        assert_eq!(c2.response_id.as_deref(), Some("resp-9"));
+        assert_eq!((c2.conv_id.as_str(), c2.at_ms), ("c", 9_999));
         let rules = crate::config::default_model_rules();
         let cost = call_cost(&rules, &c2);
         // 500 tokens * $5.0/M = $0.0025
@@ -1889,8 +1879,8 @@ mod tests {
         steps.insert(10, StepInfo { at_ms: day2, label: Some("step 10".into()) });
 
         let mut old_calls = vec![
-            Call { steps: vec![1], has_usage: true, ..Default::default() },
-            Call { steps: vec![], has_usage: true, ..Default::default() },
+            LiveCall::from(Call { steps: vec![1], ..Default::default() }),
+            LiveCall::from(Call { steps: vec![], ..Default::default() }),
         ];
         date_calls(&mut old_calls, &steps, day1_end);
         assert_eq!(old_calls[0].at_ms, day1);
@@ -1899,12 +1889,16 @@ mod tests {
         assert!(!old_calls[1].dated);
 
         let mut cross = vec![
-            Call { steps: vec![], has_usage: true, ..Default::default() },
-            Call { steps: vec![1], has_usage: true, ..Default::default() },
-            Call { steps: vec![], has_usage: true, ..Default::default() },
-            Call { steps: vec![5], has_usage: true, ..Default::default() },
-            Call { steps: vec![10], has_usage: true, ..Default::default() },
-            Call { steps: vec![12], has_usage: true, at_ms: day2 + 5_000, live_seen: true, ..Default::default() },
+            LiveCall::from(Call { steps: vec![], ..Default::default() }),
+            LiveCall::from(Call { steps: vec![1], ..Default::default() }),
+            LiveCall::from(Call { steps: vec![], ..Default::default() }),
+            LiveCall::from(Call { steps: vec![5], ..Default::default() }),
+            LiveCall::from(Call { steps: vec![10], ..Default::default() }),
+            LiveCall {
+                call: Call { steps: vec![12], at_ms: day2 + 5_000, ..Default::default() },
+                live_seen: true,
+                ..Default::default()
+            },
         ];
         date_calls(&mut cross, &steps, day2);
         assert_eq!(cross[0].at_ms, day1);
