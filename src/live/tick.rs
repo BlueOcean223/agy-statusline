@@ -181,7 +181,9 @@ impl Engine {
         let mut tried = HashSet::new();
         for _ in 0..LOAD_ROUNDS {
             let Some(plan) = self.plan_load(id, &mut tried) else { break };
-            self.apply_convs(plan.fetch());
+            for stale in self.apply_convs(plan.fetch()) {
+                tried.remove(&stale);
+            }
         }
     }
 
@@ -384,7 +386,9 @@ impl Engine {
 
     /// Plans reading what the side panel needs for `id` and does not have yet: the conversation,
     /// its root's subagent tree, and subagents named in their transcripts. `tried` holds what
-    /// earlier rounds of the same request asked for, so a failing read is tried once per request.
+    /// earlier rounds of the same request asked for, so a failing read is tried once per request;
+    /// remove from it what [`Engine::apply_convs`] dropped as stale, so it is planned again (e.g. from
+    /// the language_server, which loaded it during a database read).
     /// `None` when nothing is missing; keeping loaded conversations current is left to the engine
     /// loop.
     pub(super) fn plan_load(&mut self, id: &str, tried: &mut HashSet<String>) -> Option<ConvPlan> {
@@ -477,9 +481,12 @@ impl Engine {
         }
     }
 
-    pub(super) fn apply_convs(&mut self, f: ConvFetched) {
+    /// Merges a fetched plan. Returns the conversations whose read was dropped as stale (something
+    /// changed while it was fetched), so a side-panel request can plan them again.
+    pub(super) fn apply_convs(&mut self, f: ConvFetched) -> Vec<String> {
         let now = Instant::now();
         let mut changed: HashSet<String> = HashSet::new();
+        let mut stale = Vec::new();
         for (req, res) in f.convs {
             let id = req.id().to_string();
             match res {
@@ -491,7 +498,7 @@ impl Engine {
                     Applied::Unchanged => {
                         self.dirty.remove(&id);
                     }
-                    Applied::Stale => {}
+                    Applied::Stale => stale.push(id),
                 },
                 Err(e) => {
                     if matches!(req, ConvReq::Db { .. }) {
@@ -519,13 +526,14 @@ impl Engine {
         for (path, info) in f.git {
             self.git.insert(path, (now, info));
         }
-        let Some(keep) = f.keep else { return };
+        let Some(keep) = f.keep else { return stale };
         self.last_error = self.tick_errors.first().cloned();
 
         if self.evict_at.is_none_or(|t| t.elapsed() >= EVICT_EVERY) {
             self.evict(&keep, now);
             self.evict_at = Some(now);
         }
+        stale
     }
 
     /// Drops state for conversations that are neither on screen nor touched today and have not
@@ -684,13 +692,16 @@ mod tests {
         let Some(plan) = e.plan_load(id, tried) else { return Vec::new() };
         let ids: Vec<String> = plan.convs.iter().map(|r| r.id().to_string()).collect();
         let convs = plan.convs.into_iter().map(|r| (r.clone(), data(r.id()))).collect();
-        e.apply_convs(ConvFetched {
+        let stale = e.apply_convs(ConvFetched {
             convs,
             subs: Vec::new(),
             transcripts: Vec::new(),
             git: Vec::new(),
             keep: plan.keep,
         });
+        for id in stale {
+            tried.remove(&id);
+        }
         ids
     }
 
@@ -744,6 +755,32 @@ mod tests {
         assert_eq!(panel_round(&mut e, &a, &mut tried, fail), vec![a.clone()]);
         assert!(e.plan_load(&a, &mut tried).is_none(), "the same request does not ask again");
         assert!(e.plan_load(&a, &mut HashSet::new()).is_some(), "the next request does");
+    }
+
+    #[test]
+    fn panel_load_rereads_from_the_language_server_a_database_read_it_loaded_meanwhile() {
+        let mut e = engine();
+        let a = uuid(1);
+        let mut tried = HashSet::new();
+        let plan = e.plan_load(&a, &mut tried).expect("planned");
+        assert!(matches!(plan.convs.as_slice(), [ConvReq::Db { .. }]));
+        // While the database is read, the engine loop's summaries say the language_server has it.
+        e.ls_loaded.insert(a.clone());
+        let convs = plan.convs.into_iter().map(|r| (r, db_conv(None))).collect();
+        let stale = e.apply_convs(ConvFetched {
+            convs,
+            subs: Vec::new(),
+            transcripts: Vec::new(),
+            git: Vec::new(),
+            keep: plan.keep,
+        });
+        assert_eq!(stale, vec![a.clone()]);
+        assert!(!e.convs.contains_key(&a));
+        for id in stale {
+            tried.remove(&id);
+        }
+        let plan = e.plan_load(&a, &mut tried).expect("planned again in the same request");
+        assert!(matches!(plan.convs.as_slice(), [ConvReq::Ls { .. }]));
     }
 
     #[test]

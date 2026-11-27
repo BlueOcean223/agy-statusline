@@ -1256,7 +1256,9 @@ pub fn panel_json(
         let Some(plan) = lock_engine().as_mut().and_then(|eng| eng.plan_load(&id, &mut tried)) else { break };
         let fetched = plan.fetch();
         if let Some(eng) = lock_engine().as_mut() {
-            eng.apply_convs(fetched);
+            for stale in eng.apply_convs(fetched) {
+                tried.remove(&stale);
+            }
         }
     }
     // Keeps the engine loop refreshing this conversation while the panel shows it. Registered
