@@ -1,9 +1,11 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
 use super::view::{BarPayload, Priced, ViewReq};
-use super::{Clock, Engine, LiveCall};
+use super::{Clock, Engine};
+use crate::call::Tokens;
 use crate::config::{Config, OnlinePrices};
 use crate::miss::{MissInfo, MissSummary};
+use crate::pricing::Cost;
 use crate::usage::AccountInfo;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -54,30 +56,19 @@ impl Engine {
         let is_sub = root != id;
         let summary = self.summaries.get(&id).cloned().unwrap_or_default();
 
-        // Calls counted in totals: this conversation, plus its subagents when configured (roots only).
-        let mut ids = vec![id.clone()];
-        if !is_sub && cfg.include_subagents {
-            ids.extend(self.tree(&root).into_iter().filter(|x| *x != id));
-        }
         let bar = req.bar(&HashSet::from([id.clone()]));
         // What the bar shows of this conversation; the panel adds the details.
         let view = &bar.views[&id];
         let own = req.calls(&id);
-        let convs: Vec<Rc<[Priced]>> = ids.iter().map(|cid| req.calls(cid)).collect();
+        // Calls counted in totals, the same as the bar's `view.cost_conv`.
+        let convs: Vec<Rc<[Priced]>> = req.counted_ids(&id).iter().map(|cid| req.calls(cid)).collect();
 
         // Tokens and cost
-        let (mut fresh, mut cache, mut cache_write, mut out) = (0u64, 0u64, 0u64, 0u64);
-        let (mut c_in, mut c_cache, mut c_cw, mut c_out) = (0.0, 0.0, 0.0, 0.0);
+        let (mut tokens, mut cost) = (Tokens::default(), Cost::default());
         let mut saved = 0.0;
         for &Priced { call: c, cost: k } in convs.iter().flat_map(|c| c.iter()) {
-            fresh += c.tokens.input;
-            cache += c.tokens.cache_read;
-            cache_write += c.tokens.cache_write;
-            out += c.tokens.output;
-            c_in += k.input;
-            c_cache += k.cache;
-            c_cw += k.cw;
-            c_out += k.out;
+            tokens += &c.tokens;
+            cost += &k;
             // What the cached tokens would have cost as fresh input.
             if c.tokens.cache_read > 0 && c.tokens.input > 0 && k.input > 0.0 {
                 saved += c.tokens.cache_read as f64 * (k.input / c.tokens.input as f64) - k.cache;
@@ -101,11 +92,7 @@ impl Engine {
         let turns_left = (avg_growth > 0 && ctx_max > 0).then(|| ctx_left as i64 / avg_growth);
 
         // Cache & 6-cause miss analysis
-        let hit = |c: &LiveCall| {
-            let d = c.tokens.cache_read + c.tokens.input;
-            if d == 0 { 0.0 } else { c.tokens.cache_read as f64 / d as f64 }
-        };
-        let session_hit = if fresh + cache > 0 { cache as f64 / (fresh + cache) as f64 } else { 0.0 };
+        let session_hit = tokens.cache_hit().unwrap_or(0.0);
         let own_misses = req.misses(&id);
         let mut miss_summary = MissSummary::default();
         for (p, m) in own.iter().zip(own_misses.iter()) {
@@ -166,11 +153,11 @@ impl Engine {
             .map(|(idx, &Priced { call: c, cost })| {
                 let c_usd = cost.total();
                 Turn {
-                    step: c.steps.first().copied(),
+                    step: c.step(),
                     at: c.at_ms,
                     model: c.model.display.clone(),
                     ctx: c.ctx_used,
-                    hit: hit(c),
+                    hit: c.tokens.cache_hit().unwrap_or(0.0),
                     out: c.tokens.output,
                     cost: c_usd,
                     costly: cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd,
@@ -213,15 +200,15 @@ impl Engine {
                 ttl_sec: cfg.cache_ttl_sec,
             },
             tokens: PanelTokens {
-                fresh,
-                cache,
-                cache_write,
-                out,
-                total: fresh + cache + cache_write + out,
-                cost_in: c_in,
-                cost_cache: c_cache,
-                cost_cache_write: c_cw,
-                cost_out: c_out,
+                fresh: tokens.input,
+                cache: tokens.cache_read,
+                cache_write: tokens.cache_write,
+                out: tokens.output,
+                total: tokens.total(),
+                cost_in: cost.input,
+                cost_cache: cost.cache,
+                cost_cache_write: cost.cw,
+                cost_out: cost.out,
                 rate_per_hr,
                 today_tokens: req.today().tokens,
             },

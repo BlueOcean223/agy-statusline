@@ -16,7 +16,7 @@ pub const CLI: &str = "cli";
 const MODEL_NAME_MAX_CHARS: usize = 64;
 
 /// Backend model name (`raw`, e.g. `gemini-4-neon`) plus the name shown to the user.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct ModelId {
     pub raw: String,
     pub display: String,
@@ -67,6 +67,38 @@ impl Tokens {
     pub fn any(&self) -> bool {
         self.total() > 0
     }
+
+    /// Share of prompt tokens read from cache: `cache_read / (cache_read + input)`, `None` when the
+    /// prompt was empty.
+    pub fn cache_hit(&self) -> Option<f64> {
+        let prompt = self.cache_read + self.input;
+        (prompt > 0).then(|| self.cache_read as f64 / prompt as f64)
+    }
+
+    pub fn saturating_sub(&self, o: &Tokens) -> Tokens {
+        Tokens {
+            input: self.input.saturating_sub(o.input),
+            cache_read: self.cache_read.saturating_sub(o.cache_read),
+            cache_write: self.cache_write.saturating_sub(o.cache_write),
+            output: self.output.saturating_sub(o.output),
+        }
+    }
+}
+
+impl std::ops::AddAssign<&Tokens> for Tokens {
+    fn add_assign(&mut self, o: &Tokens) {
+        self.input += o.input;
+        self.cache_read += o.cache_read;
+        self.cache_write += o.cache_write;
+        self.output += o.output;
+    }
+}
+
+impl From<Tokens> for ModelAgg {
+    /// Totals with no calls counted.
+    fn from(t: Tokens) -> Self {
+        Self { calls: 0, input: t.input, cache_read: t.cache_read, cache_write: t.cache_write, output: t.output }
+    }
 }
 
 /// Calls and tokens summed per model for one day; the unit of usage history.
@@ -80,16 +112,13 @@ pub struct ModelAgg {
 }
 
 impl ModelAgg {
-    pub fn add(&mut self, input: u64, cr: u64, cw: u64, out: u64) {
-        self.calls += 1;
-        self.input += input;
-        self.cache_read += cr;
-        self.cache_write += cw;
-        self.output += out;
-    }
-
+    /// Adds one call.
     pub fn add_tokens(&mut self, t: &Tokens) {
-        self.add(t.input, t.cache_read, t.cache_write, t.output);
+        self.calls += 1;
+        self.input += t.input;
+        self.cache_read += t.cache_read;
+        self.cache_write += t.cache_write;
+        self.output += t.output;
     }
 
     pub fn merge_from(&mut self, other: &ModelAgg) {
@@ -105,7 +134,7 @@ impl ModelAgg {
     }
 
     pub fn total_tokens(&self) -> u64 {
-        self.input + self.cache_read + self.cache_write + self.output
+        self.tokens().total()
     }
 }
 

@@ -58,17 +58,21 @@ impl Default for ModelRule {
 }
 
 impl ModelRule {
-    /// Returns `(input, cache_read, cache_write, output)` USD/1M rates active at `at_ms`.
-    pub fn rates_at(&self, at_ms: i64, now_ms: i64) -> (f64, f64, f64, f64) {
+    /// The rates active at `at_ms` (or `now_ms`, when `at_ms` is unknown). Cache writes cost the
+    /// input rate unless a rule sets them.
+    pub fn rates_at(&self, at_ms: i64, now_ms: i64) -> crate::pricing::Rates {
         if !self.tiers.is_empty() {
             let when = if at_ms > 0 { at_ms } else { now_ms };
             let tier =
                 self.tiers.iter().find(|t| t.until_ms.is_none_or(|u| when < u)).or_else(|| self.tiers.last()).unwrap();
-            let cw = if tier.cache_write_per_m > 0.0 { tier.cache_write_per_m } else { tier.input_per_m };
-            return (tier.input_per_m, tier.cache_read_per_m, cw, tier.output_per_m);
+            return crate::pricing::Rates::new(
+                tier.input_per_m,
+                tier.cache_read_per_m,
+                tier.cache_write_per_m,
+                tier.output_per_m,
+            );
         }
-        let cw = if self.cache_write_per_m > 0.0 { self.cache_write_per_m } else { self.input_per_m };
-        (self.input_per_m, self.cache_read_per_m, cw, self.output_per_m)
+        crate::pricing::Rates::new(self.input_per_m, self.cache_read_per_m, self.cache_write_per_m, self.output_per_m)
     }
 }
 
@@ -819,10 +823,9 @@ mod tests {
         let carbon = rules.iter().find(|r| r.pattern == "carbon").unwrap();
         let before = pt_midnight_ms("2026-12-01").unwrap() - 1000;
         let after = pt_midnight_ms("2026-12-01").unwrap() + 1000;
-        let (in_b, cr_b, _, out_b) = carbon.rates_at(before, after);
-        let (in_a, cr_a, _, out_a) = carbon.rates_at(after, after);
-        assert_eq!((in_b, cr_b, out_b), (2.0, 0.10, 10.0));
-        assert_eq!((in_a, cr_a, out_a), (4.0, 0.20, 20.0));
+        let (b, a) = (carbon.rates_at(before, after), carbon.rates_at(after, after));
+        assert_eq!((b.input, b.cache_read, b.output), (2.0, 0.10, 10.0));
+        assert_eq!((a.input, a.cache_read, a.output), (4.0, 0.20, 20.0));
     }
 
     #[test]
@@ -830,11 +833,11 @@ mod tests {
         let rules = default_model_rules();
         let m55 = rules.iter().find(|r| "claude-opus-5-5".contains(&r.pattern)).unwrap();
         assert_eq!(m55.display_name, "Claude Opus 5.5");
-        assert_eq!(m55.rates_at(0, 0), (4.0, 0.20, 5.0, 20.0));
+        assert_eq!(m55.rates_at(0, 0), crate::pricing::Rates::new(4.0, 0.20, 5.0, 20.0));
 
         let m5 = rules.iter().find(|r| "claude-opus-5".contains(&r.pattern)).unwrap();
         assert_eq!(m5.display_name, "Claude Opus 5");
-        assert_eq!(m5.rates_at(0, 0), (5.0, 0.50, 6.25, 25.0));
+        assert_eq!(m5.rates_at(0, 0), crate::pricing::Rates::new(5.0, 0.50, 6.25, 25.0));
     }
 
     #[test]
@@ -849,10 +852,10 @@ mod tests {
         let online: OnlinePrices = serde_json::from_str(json).unwrap();
         let eff = effective_model_rules(&default_model_rules(), Some(&online));
         let neon = eff.iter().find(|r| r.pattern == "neon").unwrap();
-        assert_eq!(neon.rates_at(0, 0).0, 3.5);
+        assert_eq!(neon.rates_at(0, 0).input, 3.5);
         let alpha = eff.iter().find(|r| r.pattern == "gemini-5-alpha").unwrap();
         assert_eq!(alpha.short_name, "5 Alpha");
-        assert_eq!(alpha.rates_at(0, 0).3, 30.0);
+        assert_eq!(alpha.rates_at(0, 0).output, 30.0);
     }
 
     #[test]

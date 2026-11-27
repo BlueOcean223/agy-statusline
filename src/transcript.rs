@@ -3,6 +3,7 @@
 //!   and the tool calls each planner step made (to label a turn). Read incrementally from a byte offset.
 //! - `annotations/<id>.pbtxt`: the conversation title and when the user last looked at it.
 
+use crate::convdb::mtime_ms;
 use regex::Regex;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -68,8 +69,13 @@ pub struct TranscriptChunk {
     mtime_ms: i64,
 }
 
+/// `brain/<id>/.system_generated/logs`: the conversation's transcripts.
+fn logs_dir(app_data: &Path, id: &str) -> PathBuf {
+    app_data.join("brain").join(id).join(".system_generated").join("logs")
+}
+
 pub fn transcript_path(app_data: &Path, id: &str) -> PathBuf {
-    app_data.join("brain").join(id).join(".system_generated/logs/transcript.jsonl")
+    logs_dir(app_data, id).join("transcript.jsonl")
 }
 
 /// Reads the complete lines appended to `id`'s transcript after `at` (a partially written last
@@ -79,12 +85,7 @@ pub fn read_since(app_data: &Path, id: &str, at: ReadPos) -> TranscriptChunk {
     let mut chunk = TranscriptChunk { at, end: from, ..Default::default() };
     let Ok(mut f) = File::open(transcript_path(app_data, id)) else { return chunk };
     let Ok(md) = f.metadata() else { return chunk };
-    chunk.mtime_ms = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    chunk.mtime_ms = mtime_ms(&md);
     let len = md.len();
     let start = if len < from {
         chunk.reset = true;
@@ -169,8 +170,7 @@ pub fn scan_step_markers(app_data: &Path, id: &str) -> Option<StepMarkers> {
     if !is_uuid(id) {
         return None;
     }
-    let path = app_data.join("brain").join(id).join(".system_generated/logs/transcript.jsonl");
-    let f = File::open(&path).ok()?;
+    let f = File::open(transcript_path(app_data, id)).ok()?;
     let mut out = StepMarkers::default();
     for line in BufReader::new(f).lines().map_while(Result::ok) {
         if !line.contains("USER_INPUT") && !line.contains("CHECKPOINT") {
@@ -197,7 +197,7 @@ pub fn read_checkpoint(app_data: &Path, conv_id: &str) -> Value {
     if !is_uuid(conv_id) {
         return json!({ "conv": conv_id, "err": "无效的对话 ID" });
     }
-    let dir = app_data.join("brain").join(conv_id).join(".system_generated").join("logs");
+    let dir = logs_dir(app_data, conv_id);
     let mut chosen: Option<PathBuf> = None;
     let mut text = String::new();
     for name in ["transcript_full.jsonl", "transcript.jsonl"] {
@@ -301,15 +301,6 @@ fn extract_subagent_hints(v: &Value, out: &mut HashSet<String>) {
     }
 }
 
-fn file_mtime_ms(path: &Path) -> i64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 fn unquote(s: &str) -> String {
     let t = s.trim();
     if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
@@ -345,7 +336,7 @@ fn describe_tool_call(tc: &Value) -> String {
     name.to_string()
 }
 
-fn is_uuid(s: &str) -> bool {
+pub(crate) fn is_uuid(s: &str) -> bool {
     s.len() == 36 && s.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
 
@@ -360,7 +351,7 @@ pub fn scan_brain(app_data: &Path) -> HashMap<String, i64> {
         if !is_uuid(&name) {
             continue;
         }
-        let mtime = file_mtime_ms(&e.path().join(".system_generated/logs/transcript.jsonl"));
+        let mtime = fs::metadata(transcript_path(app_data, &name)).map(|m| mtime_ms(&m)).unwrap_or(0);
         out.insert(name, mtime);
     }
     out
@@ -377,13 +368,7 @@ pub fn scan_annotations(
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(id) = name.strip_suffix(".pbtxt").filter(|n| is_uuid(n)) else { continue };
-        let mtime = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
+        let mtime = e.metadata().map(|m| mtime_ms(&m)).unwrap_or(0);
         let ann = match prev.remove(id) {
             Some((m, a)) if m == mtime => a,
             _ => read_annotation(app_data, id).unwrap_or_default(),

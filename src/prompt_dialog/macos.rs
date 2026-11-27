@@ -234,10 +234,10 @@ thread_local! {
     static RT: RefCell<Option<Runtime>> = const { RefCell::new(None) };
 }
 
-fn finish_and_stop(res: PromptResult) {
+/// Closes the dialog once a `PromptState` handler has stored its outcome.
+fn finish_and_stop() {
     RT.with(|cell| {
         if let Some(rt) = cell.borrow_mut().as_mut() {
-            rt.state.outcome = Some(res);
             let app = rt.app;
             let win = rt.window;
             unsafe {
@@ -486,8 +486,8 @@ extern "C" fn view_mouse_up(this: Id, _cmd: Sel, event: Id) {
         }
     });
     set_cursor(interactive);
-    if let Some(res) = outcome {
-        finish_and_stop(res);
+    if outcome.is_some() {
+        finish_and_stop();
     } else if dirty {
         unsafe { msg1_void_bool(this, sel(c"setNeedsDisplay:"), YES) };
     }
@@ -500,15 +500,15 @@ extern "C" fn view_key_down(this: Id, _cmd: Sel, event: Id) {
         36 | 76 => {
             // Return / Numpad Enter
             let res = RT.with(|cell| cell.borrow_mut().as_mut().map(|rt| rt.state.on_confirm_key()));
-            if let Some(res) = res {
-                finish_and_stop(res);
+            if res.is_some() {
+                finish_and_stop();
             }
         }
         53 => {
             // Escape
             let res = RT.with(|cell| cell.borrow_mut().as_mut().map(|rt| rt.state.on_cancel_key()));
-            if let Some(res) = res {
-                finish_and_stop(res);
+            if res.is_some() {
+                finish_and_stop();
             }
         }
         49 => {

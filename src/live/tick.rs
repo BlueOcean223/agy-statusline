@@ -20,7 +20,7 @@ const QUOTA_AFTER_STOP_GAP: Duration = Duration::from_secs(30);
 const OFFSCREEN_GAP: Duration = Duration::from_secs(5);
 /// Database reads per tick, so a restart or opening a large agent tree doesn't stall one tick.
 const DB_LOADS_PER_TICK: usize = 24;
-/// Rounds of [`Engine::plan_load`] per side-panel request; each round can reveal subagents one
+/// Rounds of loading per side-panel request (and per CLI tick); each round can reveal subagents one
 /// level deeper (named in transcripts read by the previous round). The engine loop finds the rest.
 pub(super) const LOAD_ROUNDS: usize = 4;
 const FAIL_BACKOFF: Duration = Duration::from_secs(60);
@@ -30,7 +30,32 @@ const ANNOTATIONS_EVERY: Duration = Duration::from_secs(10);
 const EVICT_EVERY: Duration = Duration::from_secs(60);
 /// Conversations not needed for today's cost or on screen are dropped after this long unused.
 const EVICT_IDLE: Duration = Duration::from_secs(600);
-const EVICT_IDLE_MS: i64 = 600_000;
+const EVICT_IDLE_MS: i64 = EVICT_IDLE.as_millis() as i64;
+
+/// The conversation reads planned for one round, with at most [`DB_LOADS_PER_TICK`] database reads.
+struct ReadQueue {
+    db_budget: usize,
+    queued: HashSet<String>,
+    reqs: Vec<ConvReq>,
+}
+
+impl ReadQueue {
+    fn new() -> Self {
+        Self { db_budget: DB_LOADS_PER_TICK, queued: HashSet::new(), reqs: Vec::new() }
+    }
+
+    /// Queues `req` unless it is a database read and the budget is spent.
+    fn push(&mut self, req: ConvReq) {
+        if matches!(req, ConvReq::Db { .. }) {
+            if self.db_budget == 0 {
+                return;
+            }
+            self.db_budget -= 1;
+        }
+        self.queued.insert(req.id().to_string());
+        self.reqs.push(req);
+    }
+}
 
 pub(super) struct StatusPlan {
     ls: LsClient,
@@ -140,7 +165,7 @@ impl Engine {
     pub fn tick(&mut self, interest: &HashSet<String>) {
         let f = self.plan_status().fetch();
         self.apply_status(f);
-        for _ in 0..4 {
+        for _ in 0..LOAD_ROUNDS {
             let plan = self.plan_convs(interest);
             let more = plan.convs.iter().any(|r| !self.convs.contains_key(r.id()));
             self.apply_convs(plan.fetch());
@@ -232,8 +257,7 @@ impl Engine {
     /// Decides what to (re)load. `interest` holds the conversations on screen (chat panes and the
     /// side panel); everything touched today is also kept current for today's cost.
     pub(super) fn plan_convs(&mut self, interest: &HashSet<String>) -> ConvPlan {
-        let now = now_ms();
-        let midnight = local_midnight_ms();
+        let Clock { now, midnight } = Clock::read();
         let mut want: HashSet<String> = HashSet::new();
         for (id, s) in &self.summaries {
             if s.modified_ms >= midnight {
@@ -293,19 +317,9 @@ impl Engine {
             .collect();
         todo.sort();
 
-        let mut db_budget = DB_LOADS_PER_TICK;
-        let mut convs: Vec<ConvReq> = Vec::new();
-        let mut queued: HashSet<String> = HashSet::new();
+        let mut q = ReadQueue::new();
         for (_, id) in todo {
-            let req = self.conv_req(id);
-            if matches!(req, ConvReq::Db { .. }) {
-                if db_budget == 0 {
-                    continue;
-                }
-                db_budget -= 1;
-            }
-            queued.insert(id.clone());
-            convs.push(req);
+            q.push(self.conv_req(id));
         }
 
         // Historical subagents of conversations on screen, found in their transcripts, so a
@@ -315,7 +329,8 @@ impl Engine {
         for root in &roots {
             seeds.extend(self.tree(root));
         }
-        self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
+        self.plan_hints(&seeds, &mut q);
+        let convs = q.reqs;
 
         // Steps for the subagents the bar shows. The first page starts near the end: only the
         // last SUB_STEPS_KEEP steps are kept, and early pages can carry large tool outputs.
@@ -375,26 +390,21 @@ impl Engine {
         let root = self.root_of(id);
         let mut seeds = vec![id.to_string()];
         seeds.extend(self.tree(&root).into_iter().filter(|cid| cid != id));
-        let mut db_budget = DB_LOADS_PER_TICK;
-        let mut convs: Vec<ConvReq> = Vec::new();
-        let mut queued: HashSet<String> = HashSet::new();
+        let mut q = ReadQueue::new();
         for cid in &seeds {
             if self.convs.contains_key(cid) || tried.contains(cid) {
                 continue;
             }
             let req = self.conv_req(cid);
-            if matches!(req, ConvReq::Db { .. }) {
-                // Failed reads are database reads (see `apply_summaries`).
-                if db_budget == 0 || self.failed.get(cid).is_some_and(|t| t.elapsed() < FAIL_BACKOFF) {
-                    continue;
-                }
-                db_budget -= 1;
+            // Failed reads are database reads (see `apply_summaries`).
+            if matches!(req, ConvReq::Db { .. }) && self.failed.get(cid).is_some_and(|t| t.elapsed() < FAIL_BACKOFF) {
+                continue;
             }
-            queued.insert(cid.clone());
-            convs.push(req);
+            q.push(req);
         }
-        queued.extend(tried.iter().cloned());
-        self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
+        q.queued.extend(tried.iter().cloned());
+        self.plan_hints(&seeds, &mut q);
+        let convs = q.reqs;
         tried.extend(convs.iter().map(|r| r.id().to_string()));
         if convs.is_empty() {
             return None;
@@ -440,13 +450,7 @@ impl Engine {
 
     /// Queues historical subagents named in the transcripts of `seeds`, each probed once (see
     /// `probed_hints`), within the remaining database budget.
-    fn plan_hints(
-        &mut self,
-        seeds: &[String],
-        queued: &mut HashSet<String>,
-        db_budget: &mut usize,
-        convs: &mut Vec<ConvReq>,
-    ) {
+    fn plan_hints(&mut self, seeds: &[String], q: &mut ReadQueue) {
         let mut hints: Vec<String> = Vec::new();
         for cid in seeds {
             if let Some(t) = self.convs.get(cid).and_then(|c| c.transcript.as_ref()) {
@@ -456,24 +460,19 @@ impl Engine {
         hints.sort();
         hints.dedup();
         for sid in hints {
-            if *db_budget == 0 {
+            if q.db_budget == 0 {
                 break;
             }
             // Not on disk (as of the last `brain/` scan): nothing to read yet, ask again later.
             if self.convs.contains_key(&sid)
-                || queued.contains(&sid)
+                || q.queued.contains(&sid)
                 || self.probed_hints.contains(&sid)
                 || !self.disk.contains_key(&sid)
             {
                 continue;
             }
             self.probed_hints.insert(sid.clone());
-            let req = self.conv_req(&sid);
-            if matches!(req, ConvReq::Db { .. }) {
-                *db_budget -= 1;
-            }
-            queued.insert(sid);
-            convs.push(req);
+            q.push(self.conv_req(&sid));
         }
     }
 

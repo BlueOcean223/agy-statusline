@@ -21,7 +21,7 @@ use crate::config::{
 use crate::convdb::{self, ConvMeta, DbSig};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
-use crate::pricing::{DayCost, Pricer};
+use crate::pricing::{Pricer, day_sum};
 use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
@@ -44,6 +44,7 @@ mod panel;
 mod test_support;
 mod tick;
 mod view;
+use view::TodayTotals;
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -106,6 +107,26 @@ impl std::ops::Deref for LiveCall {
 impl std::ops::DerefMut for LiveCall {
     fn deref_mut(&mut self) -> &mut Call {
         &mut self.call
+    }
+}
+
+/// What the engine learned about a call's time and how it was seen, kept when the call is re-read.
+#[derive(Clone, Copy)]
+struct Dating {
+    at_ms: i64,
+    dated: bool,
+    live_seen: bool,
+}
+
+impl LiveCall {
+    fn dating(&self) -> Dating {
+        Dating { at_ms: self.at_ms, dated: self.dated, live_seen: self.live_seen }
+    }
+
+    fn set_dating(&mut self, d: Dating) {
+        self.at_ms = d.at_ms;
+        self.dated = d.dated;
+        self.live_seen = d.live_seen;
     }
 }
 
@@ -205,6 +226,18 @@ pub struct Conv {
     today_cost: std::cell::Cell<Option<TodayCost>>,
 }
 
+impl Conv {
+    /// Calls with usage, in order.
+    fn usage_calls(&self) -> impl Iterator<Item = &LiveCall> {
+        self.calls.iter().filter(|c| c.has_usage())
+    }
+
+    /// Calls with usage made at or after `since_ms`.
+    fn calls_since(&self, since_ms: i64) -> impl Iterator<Item = &LiveCall> {
+        self.usage_calls().filter(move |c| c.at_ms >= since_ms)
+    }
+}
+
 /// A conversation's cost and tokens today, valid while `rev`, local midnight and the pricing
 /// rules' fingerprint are unchanged.
 #[derive(Clone, Copy, Debug)]
@@ -265,8 +298,7 @@ fn fetch_conv(ls: &LsClient, app_data: &Path, req: &ConvReq) -> Result<ConvData,
                 return Ok(ConvData::Db(None));
             }
             convdb::read(app_data, id, sig).map(|(calls, meta)| {
-                // The transcript dates these calls, as it does for the language_server's records.
-                let calls = calls.into_iter().map(|c| LiveCall::from(Call { at_ms: 0, ..c })).collect();
+                let calls = calls.into_iter().map(LiveCall::from).collect();
                 ConvData::Db(Some((sig, calls, Box::new(Summary::from(meta)))))
             })
         }
@@ -790,7 +822,7 @@ impl Engine {
                 conv.db_sig = None;
                 conv.fetched_at = Some(now);
                 let was_loaded = conv.loaded_once;
-                let prev_last = conv.calls.get(offset).map(|c| (c.at_ms, c.dated, c.live_seen));
+                let prev_last = conv.calls.get(offset).map(LiveCall::dating);
                 let fresh: Vec<LiveCall> = j["generatorMetadata"]
                     .as_array()
                     .map(|a| {
@@ -798,7 +830,7 @@ impl Engine {
                             .enumerate()
                             .map(|(i, g)| {
                                 let live_seen = match prev_last {
-                                    Some((_, _, ls)) if i == 0 => ls,
+                                    Some(d) if i == 0 => d.live_seen,
                                     _ => was_loaded,
                                 };
                                 LiveCall::from_json(g, id, seen_at, live_seen)
@@ -811,10 +843,8 @@ impl Engine {
                 }
                 conv.calls.truncate(offset);
                 conv.calls.extend(fresh);
-                if let (Some((t, dated, live_seen)), Some(c)) = (prev_last, conv.calls.get_mut(offset)) {
-                    c.at_ms = t;
-                    c.dated = dated;
-                    c.live_seen = live_seen;
+                if let (Some(d), Some(c)) = (prev_last, conv.calls.get_mut(offset)) {
+                    c.set_dating(d);
                 }
                 conv.loaded_once = true;
                 conv.changed_at = Some(now);
@@ -845,9 +875,7 @@ impl Engine {
                     return Applied::Unchanged;
                 }
                 for (new, old) in calls.iter_mut().zip(&conv.calls) {
-                    new.at_ms = old.at_ms;
-                    new.dated = old.dated;
-                    new.live_seen = old.live_seen;
+                    new.set_dating(old.dating());
                 }
                 conv.calls = calls;
                 conv.loaded_once = true;
@@ -929,17 +957,17 @@ impl Engine {
     /// Merges today's live usage into the usage store. Returns the files to write; call
     /// `PendingWrites::write` after releasing the ENGINE lock.
     pub fn sync_usage_store(&self) -> PendingWrites {
-        let midnight = local_midnight_ms();
-        let today = today_str();
+        let midnight = Clock::read().midnight;
+        let today = crate::usage::local_day_str(midnight);
         let mut live_by_conv: HashMap<String, HashMap<String, ModelAgg>> = HashMap::new();
         for (cid, conv) in &self.convs {
-            for c in conv.calls.iter().filter(|c| c.has_usage() && c.at_ms >= midnight) {
-                live_by_conv.entry(cid.clone()).or_default().entry(c.model.bucket_key()).or_default().add(
-                    c.tokens.input,
-                    c.tokens.cache_read,
-                    c.tokens.cache_write,
-                    c.tokens.output,
-                );
+            for c in conv.calls_since(midnight) {
+                live_by_conv
+                    .entry(cid.clone())
+                    .or_default()
+                    .entry(c.model.bucket_key())
+                    .or_default()
+                    .add_tokens(&c.tokens);
             }
         }
         let buckets = self.quota_bucket_samples();
@@ -1034,9 +1062,8 @@ impl Engine {
         self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage())
     }
 
-    /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
-    /// returning `(total_usd, total_tokens, cli_usd)`.
-    fn today_totals(&self, pricer: &Pricer, midnight: i64) -> (f64, u64, f64) {
+    /// Today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`).
+    fn today_totals(&self, pricer: &Pricer, midnight: i64) -> TodayTotals {
         let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
@@ -1044,9 +1071,9 @@ impl Engine {
                 Some(t) if t.rev == conv.rev && t.midnight == midnight && t.rules == fp => (t.cost, t.tokens),
                 _ => {
                     let (mut cost, mut tok) = (0.0, 0u64);
-                    for c in conv.calls.iter().filter(|c| c.has_usage() && c.at_ms >= midnight) {
+                    for c in conv.calls_since(midnight) {
                         cost += pricer.call_cost(c).total();
-                        tok += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
+                        tok += c.tokens.total();
                     }
                     conv.today_cost.set(Some(TodayCost { rev: conv.rev, midnight, rules: fp, cost, tokens: tok }));
                     (cost, tok)
@@ -1073,23 +1100,25 @@ impl Engine {
             // own time, and the rest of today's aggregates at noon.
             let cut = pricer.is_cut_day(midnight);
             let desk_exact: Vec<Call> = if cut {
-                let today_calls = self.convs.values().flat_map(|conv| conv.calls.iter());
-                today_calls.filter(|c| c.has_usage() && c.at_ms >= midnight).map(|c| c.call.clone()).collect()
+                self.convs.values().flat_map(|conv| conv.calls_since(midnight)).map(|c| c.call.clone()).collect()
             } else {
                 Vec::new()
             };
             let cli_exact =
                 if cut && !cli_raw.is_empty() { cli_snap.calls_for_day(&cd, &pd, &today) } else { Vec::new() };
-            let sum = |d: DayCost| d.values().fold((0.0, 0u64), |(u, t), (usd, agg)| (u + usd, t + agg.total_tokens()));
-            let (desk_usd, desk_tok) = sum(pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), midnight));
-            let (cli_usd, cli_tok) = sum(pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), midnight));
+            let (desk_usd, desk_tok) =
+                day_sum(&pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), midnight));
+            let (cli_usd, cli_tok) =
+                day_sum(&pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), midnight));
             (desk_usd, desk_tok, cli_usd, cli_tok)
         });
         match persisted {
-            Some((p_desk_cost, p_desk_tok, cli_cost, cli_tok)) => {
-                (live_cost.max(p_desk_cost) + cli_cost, live_tok.max(p_desk_tok) + cli_tok, cli_cost)
-            }
-            None => (live_cost, live_tok, 0.0),
+            Some((p_desk_cost, p_desk_tok, cli_cost, cli_tok)) => TodayTotals {
+                usd: live_cost.max(p_desk_cost) + cli_cost,
+                tokens: live_tok.max(p_desk_tok) + cli_tok,
+                cli_usd: cli_cost,
+            },
+            None => TodayTotals { usd: live_cost, tokens: live_tok, cli_usd: 0.0 },
         }
     }
 
@@ -1100,13 +1129,21 @@ impl Engine {
 
 fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::StepInfo>, conv_mod_ms: i64) {
     for c in calls.iter_mut() {
-        let infos: Vec<_> = c.steps.iter().filter_map(|s| steps.get(s)).collect();
-        if let Some(at) = infos.iter().map(|i| i.at_ms).filter(|&t| t > 0).min() {
+        let (mut at, mut label) = (None::<i64>, None::<&String>);
+        for i in c.steps.iter().filter_map(|s| steps.get(s)) {
+            if i.at_ms > 0 {
+                at = Some(at.map_or(i.at_ms, |a| a.min(i.at_ms)));
+            }
+            label = label.or(i.label.as_ref());
+        }
+        if let Some(at) = at {
             c.at_ms = at;
             c.dated = true;
         }
-        if let Some(l) = infos.iter().find_map(|i| i.label.clone()) {
-            c.label = Some(l);
+        if let Some(l) = label
+            && c.label.as_ref() != Some(l)
+        {
+            c.label = Some(l.clone());
         }
     }
     let last_dated_idx = calls.iter().rposition(|c| c.dated);
@@ -1145,11 +1182,6 @@ impl Clock {
     }
 }
 
-/// Start of today in local time (see `day_start_in` for days whose 00:00 does not exist).
-fn local_midnight_ms() -> i64 {
-    local_midnight_at(now_ms())
-}
-
 /// Local midnight of the day containing `now_ms`.
 fn local_midnight_at(now_ms: i64) -> i64 {
     let Some(now) = Local.timestamp_millis_opt(now_ms).single() else { return now_ms };
@@ -1168,6 +1200,11 @@ pub fn port_file(plugin_data: &Path) -> PathBuf {
 /// The engine is shared with the side panel's HTTP handlers, which read details from it directly.
 pub static ENGINE: Mutex<Option<Engine>> = Mutex::new(None);
 
+/// The ENGINE lock, recovered if a holder panicked.
+pub fn lock_engine() -> std::sync::MutexGuard<'static, Option<Engine>> {
+    ENGINE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The side panel's JSON for `requested` (default: the most recent conversation). What it needs
 /// and is not loaded yet is read with the ENGINE lock released, as in the engine loop, so a panel
 /// request never holds the lock across an RPC or a database read. If the engine loop reads the
@@ -1179,17 +1216,16 @@ pub fn panel_json(
     cfg: &Config,
     online: Option<&OnlinePrices>,
 ) -> Value {
-    let engine = || ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-    let target = match engine().as_ref() {
+    let target = match lock_engine().as_ref() {
         Some(eng) => eng.panel_target(requested),
         None => return json!({ "id": null, "error": "language_server not connected" }),
     };
     let Some(id) = target else { return json!({ "id": null }) };
     let mut tried = HashSet::new();
     for _ in 0..tick::LOAD_ROUNDS {
-        let Some(plan) = engine().as_mut().and_then(|eng| eng.plan_load(&id, &mut tried)) else { break };
+        let Some(plan) = lock_engine().as_mut().and_then(|eng| eng.plan_load(&id, &mut tried)) else { break };
         let fetched = plan.fetch();
-        if let Some(eng) = engine().as_mut() {
+        if let Some(eng) = lock_engine().as_mut() {
             eng.apply_convs(fetched);
         }
     }
@@ -1200,8 +1236,10 @@ pub fn panel_json(
     {
         s.panel.insert(id.clone(), Instant::now());
     }
-    match engine().as_ref() {
-        Some(eng) => serde_json::to_value(eng.panel(&id, cfg, online, Clock::read())).unwrap_or(Value::Null),
+    // Built under the lock, serialized after releasing it.
+    let panel = lock_engine().as_ref().map(|eng| eng.panel(&id, cfg, online, Clock::read()));
+    match panel {
+        Some(p) => serde_json::to_value(p).unwrap_or(Value::Null),
         None => json!({ "id": null, "error": "language_server not connected" }),
     }
 }
@@ -1237,7 +1275,7 @@ pub fn run(shared: SharedRef) {
         // directory scans and git run unlocked so side-panel requests are never stuck behind them.
         // Finding the language_server spawns processes and probes ports, so it runs before the
         // ENGINE lock is taken; nothing else installs an engine meanwhile.
-        let connected = if ENGINE.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+        let connected = if lock_engine().is_none() {
             match LsClient::connect() {
                 Some(ls) => {
                     let addr = ls.addr.clone();
@@ -1253,7 +1291,7 @@ pub fn run(shared: SharedRef) {
             None
         };
         let status_plan = {
-            let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut engine = lock_engine();
             if engine.is_none() {
                 *engine = connected;
             }
@@ -1266,7 +1304,7 @@ pub fn run(shared: SharedRef) {
         };
         if let Some(plan) = status_plan {
             let fetched = plan.fetch();
-            let conv_plan = ENGINE.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|eng| {
+            let conv_plan = lock_engine().as_mut().map(|eng| {
                 eng.apply_status(fetched);
                 eng.plan_convs(&interest)
             });
@@ -1274,7 +1312,7 @@ pub fn run(shared: SharedRef) {
             let cfg = load_config(&plugin_data);
 
             let mut writes = PendingWrites::default();
-            let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            let mut engine = lock_engine();
             if let (Some(eng), Some(fetched)) = (engine.as_mut(), fetched) {
                 eng.apply_convs(fetched);
                 if last_usage_sync.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {

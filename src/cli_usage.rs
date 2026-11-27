@@ -7,9 +7,9 @@
 
 use crate::call::{CLI, Call, DedupSet, ModelAgg};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
-use crate::convdb::{DbSig, is_uuid_db, signature};
+use crate::convdb::{DbSig, db_path, is_uuid_db, signature};
 use crate::usage::{
-    DbCache, HISTORY_KEEP_DAYS, UsageHistory, day_start_ms, local_day_str, read_usage_calls, today_str,
+    DbCache, HISTORY_KEEP_DAYS, UsageHistory, conv_calls, day_start_ms, local_day_str, read_usage_calls, today_str,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -132,7 +132,7 @@ impl CliSnapshot {
         if sig.mtime_ms <= 0 {
             return None;
         }
-        let path = cli_dir.join("conversations").join(fname);
+        let path = db_path(cli_dir, cid);
         let hit = lock_old(&self.old).get(&path, sig);
         if hit.is_some() {
             return hit;
@@ -291,7 +291,7 @@ impl CliScanner {
             // Full re-read on change: rows are updated in place after insertion (usage arrives when
             // streaming ends, step timestamps can land after the generator row), so reading only
             // new `idx` rows would need its own invalidation rules. A 9 MB DB reads in ~20 ms.
-            match read_usage_calls(&conv_dir.join(fname), cid, CLI) {
+            match read_usage_calls(&db_path(cli_dir, cid), cid, CLI) {
                 Ok(calls) => {
                     let db = Arc::new(CliDbCalls::new(calls));
                     Arc::make_mut(&mut self.index)
@@ -330,17 +330,12 @@ impl CliScanner {
                     continue;
                 }
                 let day = &db.days[d as usize];
-                let model_key = c.model.bucket_key();
+                // Look the day up before cloning its key: most calls land on a day already seen.
                 if !raw_agg.contains_key(day) {
                     raw_agg.insert(day.clone(), Default::default());
                 }
                 let Some((raw, convs)) = raw_agg.get_mut(day) else { continue };
-                if !raw.contains_key(&model_key) {
-                    raw.insert(model_key.clone(), ModelAgg::default());
-                }
-                if let Some(agg) = raw.get_mut(&model_key) {
-                    agg.add_tokens(&c.tokens);
-                }
+                raw.entry(c.model.bucket_key()).or_default().add_tokens(&c.tokens);
                 if !convs.contains(&c.conv_id) {
                     convs.insert(c.conv_id.clone());
                 }
@@ -370,8 +365,7 @@ pub fn apply_cli_delta(h: &mut UsageHistory, mut delta: CliScanDelta) -> bool {
         match delta.agg.remove(&d) {
             Some((cli_raw, next_convs)) => {
                 let entry = h.days.entry(d.clone()).or_default();
-                let old_calls: u64 = entry.cli_raw.values().map(|a| a.calls).sum();
-                let new_calls: u64 = cli_raw.values().map(|a| a.calls).sum();
+                let (old_calls, new_calls) = (conv_calls(&entry.cli_raw), conv_calls(&cli_raw));
                 // If some DB failed to read this tick, never shrink already-persisted day totals,
                 // while still allowing healthy DBs to populate or advance totals.
                 let allow = !delta.partial_errors || new_calls >= old_calls;

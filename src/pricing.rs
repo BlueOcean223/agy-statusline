@@ -7,7 +7,8 @@
 use crate::call::{Call, ModelAgg, ModelId, Tokens};
 use crate::config::{ModelRule, OnlinePrices, effective_model_rules};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
 
 /// Label for usage of models no rule matches; it costs nothing.
 pub const OTHER: &str = "Other";
@@ -21,6 +22,14 @@ pub struct Rates {
     pub cache_read: f64,
     pub cache_write: f64,
     pub output: f64,
+}
+
+impl Rates {
+    /// A `cache_write` of 0 means "not set": cache writes then cost the input rate.
+    pub fn new(input: f64, cache_read: f64, cache_write: f64, output: f64) -> Self {
+        let cache_write = if cache_write > 0.0 { cache_write } else { input };
+        Self { input, cache_read, cache_write, output }
+    }
 }
 
 /// USD, split by token kind.
@@ -39,14 +48,31 @@ impl Cost {
     }
 }
 
+impl std::ops::AddAssign<&Cost> for Cost {
+    fn add_assign(&mut self, o: &Cost) {
+        self.input += o.input;
+        self.cache += o.cache;
+        self.cw += o.cw;
+        self.out += o.out;
+    }
+}
+
 /// One day's usage by label (the matched rule's short name, or [`OTHER`]): USD and totals.
 pub type DayCost = BTreeMap<String, (f64, ModelAgg)>;
+
+/// USD and tokens of a priced day.
+pub fn day_sum(day: &DayCost) -> (f64, u64) {
+    day.values().fold((0.0, 0), |(u, t), (usd, agg)| (u + usd, t + agg.total_tokens()))
+}
 
 pub struct Pricer {
     rules: Vec<ModelRule>,
     now_ms: i64,
     source: String,
     fingerprint: u64,
+    /// Index of the rule each model seen so far matched. A request prices every call of the
+    /// conversations on screen, made by only a handful of models.
+    matched: RefCell<HashMap<ModelId, Option<usize>>>,
 }
 
 impl Pricer {
@@ -65,7 +91,7 @@ impl Pricer {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         format!("{rules:?}").hash(&mut h);
-        Self { rules, now_ms, source, fingerprint: h.finish() }
+        Self { rules, now_ms, source, fingerprint: h.finish(), matched: RefCell::default() }
     }
 
     #[cfg(test)]
@@ -85,8 +111,14 @@ impl Pricer {
 
     /// The first rule whose pattern occurs in `"raw display"`, case-insensitively.
     pub fn rule(&self, model: &ModelId) -> Option<&ModelRule> {
-        let key = model.price_key();
-        self.rules.iter().find(|r| !r.pattern.is_empty() && contains_lowercased(&key, &r.pattern))
+        let cached = self.matched.borrow().get(model).copied();
+        let idx = cached.unwrap_or_else(|| {
+            let key = model.price_key();
+            let idx = self.rules.iter().position(|r| !r.pattern.is_empty() && contains_lowercased(&key, &r.pattern));
+            self.matched.borrow_mut().insert(model.clone(), idx);
+            idx
+        });
+        idx.map(|i| &self.rules[i])
     }
 
     /// The matched rule's short name, or [`OTHER`].
@@ -97,8 +129,7 @@ impl Pricer {
     /// The matched rule and its rates at `at_ms` (or now, when `at_ms` is unknown).
     pub fn rates(&self, model: &ModelId, at_ms: i64) -> Option<(&ModelRule, Rates)> {
         let r = self.rule(model)?;
-        let (input, cache_read, cache_write, output) = r.rates_at(at_ms, self.now_ms);
-        Some((r, Rates { input, cache_read, cache_write, output }))
+        Some((r, r.rates_at(at_ms, self.now_ms)))
     }
 
     pub fn cost(&self, model: &ModelId, t: &Tokens, at_ms: i64) -> Cost {
@@ -160,22 +191,16 @@ impl Pricer {
         }
         for (label, (model, p)) in persisted {
             let e = out.entry(label).or_default();
-            let rem = ModelAgg {
-                calls: p.calls.saturating_sub(e.1.calls),
-                input: p.input.saturating_sub(e.1.input),
-                cache_read: p.cache_read.saturating_sub(e.1.cache_read),
-                cache_write: p.cache_write.saturating_sub(e.1.cache_write),
-                output: p.output.saturating_sub(e.1.output),
-            };
-            e.0 += self.cost(&model, &rem.tokens(), noon).total();
-            e.1.merge_from(&rem);
+            let rem = p.tokens().saturating_sub(&e.1.tokens());
+            e.0 += self.cost(&model, &rem, noon).total();
+            e.1.merge_from(&ModelAgg { calls: p.calls.saturating_sub(e.1.calls), ..ModelAgg::from(rem) });
         }
         out
     }
 }
 
 /// `hay` is already lowercase. Same as `hay.contains(&pat.to_lowercase())`, without allocating
-/// for ASCII patterns (this runs for every call and rule on every tick).
+/// for ASCII patterns.
 fn contains_lowercased(hay: &str, pat: &str) -> bool {
     if !pat.is_ascii() {
         return hay.contains(&pat.to_lowercase());
@@ -253,8 +278,8 @@ mod tests {
         assert!(p.is_cut_day(day));
         let m = ModelId::new("hydrogen", "Gemini 4 Hydrogen");
         let mut agg = ModelAgg::default();
-        agg.add(300_000, 0, 0, 0);
-        agg.add(100_000, 0, 0, 0);
+        agg.add_tokens(&Tokens { input: 300_000, ..Default::default() });
+        agg.add_tokens(&Tokens { input: 100_000, ..Default::default() });
         let aggs = [(m.bucket_key(), agg)];
         let aggs = aggs.iter().map(|(k, a)| (k, a));
 
@@ -271,7 +296,7 @@ mod tests {
         let day = CUT - 10 * 3_600_000;
         let m = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
         let mut agg = ModelAgg::default();
-        agg.add(50_000, 0, 0, 0);
+        agg.add_tokens(&Tokens { input: 50_000, ..Default::default() });
         let aggs = [(m.bucket_key(), agg)];
         let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[call(&m, 50_000, CUT + 1)]), day);
         assert_eq!(day_cost.keys().collect::<Vec<_>>(), vec!["Hydrogen"]);
@@ -284,7 +309,7 @@ mod tests {
         let day = CUT + 5 * DAY_MS;
         assert!(!p.is_cut_day(day));
         let mut agg = ModelAgg::default();
-        agg.add(1_000_000, 0, 0, 0);
+        agg.add_tokens(&Tokens { input: 1_000_000, ..Default::default() });
         let aggs = [("hydrogen".to_string(), agg)]; // a key written before ADR 0001
         let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[]), day);
         assert_eq!(day_cost["Hydrogen"].0, 4.0);

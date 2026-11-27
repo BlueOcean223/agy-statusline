@@ -106,7 +106,7 @@ fn append_log(plugin_data: &Path, msg: &str) {
 }
 
 /// Environment for child processes without Electron/Antigravity sidecar variables.
-#[allow(dead_code)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 fn clean_env() -> HashMap<String, String> {
     const DROP: &[&str] = &["ELECTRON_", "NODE_", "ANTIGRAVITY_", "AGY_", "VSCODE_"];
     env::vars()

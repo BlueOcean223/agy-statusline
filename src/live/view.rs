@@ -63,9 +63,8 @@ impl<'a> ViewReq<'a> {
         let priced: Rc<[Priced<'a>]> = eng
             .convs
             .get(id)
-            .map(|conv| conv.calls.iter().filter(|c| c.has_usage()))
             .into_iter()
-            .flatten()
+            .flat_map(|conv| conv.usage_calls())
             .map(|call| Priced { call, cost: self.pricer.call_cost(call) })
             .collect();
         self.calls.borrow_mut().insert(id.to_string(), priced.clone());
@@ -77,22 +76,26 @@ impl<'a> ViewReq<'a> {
         if let Some(m) = self.misses.borrow().get(id) {
             return m.clone();
         }
-        let misses: Rc<[Option<MissInfo>]> = match self.eng.convs.get(id) {
-            Some(conv) => {
-                let markers = conv.transcript.as_ref().map(|t| &t.markers);
-                miss_scan(conv.calls.iter().filter(|c| c.has_usage()).map(|c| &c.call), &self.pricer, markers).into()
-            }
-            None => Rc::from([]),
-        };
+        let markers = self.eng.convs.get(id).and_then(|conv| conv.transcript.as_ref()).map(|t| &t.markers);
+        // One entry per `self.calls(id)`, in the same order.
+        let misses: Rc<[Option<MissInfo>]> =
+            miss_scan(self.calls(id).iter().map(|p| &p.call.call), &self.pricer, markers).into();
         self.misses.borrow_mut().insert(id.to_string(), misses.clone());
         misses
     }
 
+    /// The conversations whose calls count in `id`'s totals: `id`, then its subagents when it is a
+    /// root and subagents are included.
+    pub fn counted_ids(&self, id: &str) -> Vec<String> {
+        if self.includes_subagents(id) { self.eng.tree(id) } else { vec![id.to_string()] }
+    }
+
+    fn includes_subagents(&self, id: &str) -> bool {
+        self.cfg.include_subagents && self.eng.root_of(id) == id
+    }
+
     pub fn today(&self) -> TodayTotals {
-        *self.today.get_or_init(|| {
-            let (usd, tokens, cli_usd) = self.eng.today_totals(&self.pricer, self.clock.midnight);
-            TodayTotals { usd, tokens, cli_usd }
-        })
+        *self.today.get_or_init(|| self.eng.today_totals(&self.pricer, self.clock.midnight))
     }
 
     /// The status bar's payload for the conversations in `panes`.
@@ -217,10 +220,7 @@ impl<'a> ViewReq<'a> {
             compactions,
             cache_read: last.map(|c| c.tokens.cache_read),
             cache_write: last.map(|c| c.tokens.cache_write),
-            cache_hit: last.and_then(|c| {
-                let denom = c.tokens.cache_read + c.tokens.input;
-                (denom > 0).then(|| c.tokens.cache_read as f64 / denom as f64)
-            }),
+            cache_hit: last.and_then(|c| c.tokens.cache_hit()),
             ttft_ms: last.and_then(|c| c.ttft_ms),
             tps: last.and_then(|c| c.tps()),
             out_tokens: last.map(|c| c.tokens.output),
@@ -240,8 +240,8 @@ impl<'a> ViewReq<'a> {
         let root = eng.root_of(id);
         let is_sub = root != id;
         let main = self.agent_line(id);
-        let includes_subagents = !is_sub && cfg.include_subagents;
-        let ids = if includes_subagents { eng.tree(&root) } else { vec![id.to_string()] };
+        let includes_subagents = self.includes_subagents(id);
+        let ids = self.counted_ids(id);
         let mut cost_conv = 0.0;
         let mut cost_conv_today = 0.0;
         let mut multi_day = false;
@@ -297,10 +297,9 @@ impl<'a> ViewReq<'a> {
 
     /// The quota windows of the group `call`'s model counts against.
     fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
-        let groups = self.eng.quota["groups"].as_array().cloned().unwrap_or_default();
-        if groups.is_empty() {
+        let Some(groups) = self.eng.quota["groups"].as_array().filter(|g| !g.is_empty()) else {
             return Vec::new();
-        }
+        };
         let name = call.map(|c| model_family(&c.model.display)).unwrap_or_default();
         let group = groups
             .iter()

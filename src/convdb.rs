@@ -45,14 +45,14 @@ pub fn signature(app_data: &Path, id: &str) -> Option<DbSig> {
     Some(sig)
 }
 
-fn mtime_ms(m: &fs::Metadata) -> i64 {
+/// A file's modification time in Unix ms, 0 when unknown.
+pub(crate) fn mtime_ms(m: &fs::Metadata) -> i64 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
 /// `<id>.db` names with a UUID stem; returns the stem.
 pub fn is_uuid_db(name: &str) -> Option<&str> {
-    let stem = name.strip_suffix(".db")?;
-    (stem.len() == 36 && stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(stem)
+    name.strip_suffix(".db").filter(|stem| crate::transcript::is_uuid(stem))
 }
 
 /// What a conversation database says about the conversation itself.
@@ -72,9 +72,11 @@ pub struct ConvMeta {
 }
 
 /// All calls of desktop conversation `id`, plus what the database says about the conversation.
+/// The calls are undated (`at_ms == 0`): the live engine dates them from the transcript, as it does
+/// the language_server's records.
 pub fn read(app_data: &Path, id: &str, sig: DbSig) -> Result<(Vec<Call>, ConvMeta), String> {
     let conn = open(&db_path(app_data, id)).map_err(|e| format!("{id}.db: {e}"))?;
-    let calls = calls_from(&conn, id, crate::call::DESKTOP).map_err(|e| format!("{id}.db: {e}"))?;
+    let calls = calls_from(&conn, id, crate::call::DESKTOP, None).map_err(|e| format!("{id}.db: {e}"))?;
     let step_count = conn.query_row("SELECT COUNT(*) FROM steps", [], |r| r.get::<_, i64>(0)).unwrap_or(0).max(0);
     let meta: Option<Vec<u8>> =
         conn.query_row("SELECT data FROM trajectory_metadata_blob LIMIT 1", [], |r| r.get(0)).ok().flatten();
@@ -89,7 +91,8 @@ pub fn read(app_data: &Path, id: &str, sig: DbSig) -> Result<(Vec<Call>, ConvMet
 /// no time have `at_ms == 0`.
 pub fn read_calls(path: &Path, conv_id: &str, source: &'static str) -> Result<Vec<Call>, String> {
     let conn = open(path).map_err(|e| e.to_string())?;
-    calls_from(&conn, conv_id, source).map_err(|e| e.to_string())
+    let times = StepTimes::read(&conn);
+    calls_from(&conn, conv_id, source, Some(&times)).map_err(|e| e.to_string())
 }
 
 fn open(path: &Path) -> rusqlite::Result<Connection> {
@@ -99,8 +102,13 @@ fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-fn calls_from(conn: &Connection, conv_id: &str, source: &'static str) -> rusqlite::Result<Vec<Call>> {
-    let times = StepTimes::read(conn);
+/// The calls in `conn`, dated from `times` (left at 0 without).
+fn calls_from(
+    conn: &Connection,
+    conv_id: &str,
+    source: &'static str,
+    times: Option<&StepTimes>,
+) -> rusqlite::Result<Vec<Call>> {
     // Fall back to storage order for a schema without `idx` (only the live engine needs the order).
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata ORDER BY idx")
@@ -112,8 +120,10 @@ fn calls_from(conn: &Connection, conv_id: &str, source: &'static str) -> rusqlit
         let mut c = call_from_pb(&data);
         c.conv_id = conv_id.to_string();
         c.source = source;
-        let exec = pb_bytes(&data, 4).and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
-        c.at_ms = times.of(&c.steps, exec);
+        if let Some(times) = times {
+            let exec = pb_bytes(&data, 4).and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
+            c.at_ms = times.of(&c.steps, exec);
+        }
         out.push(c);
     }
     Ok(out)

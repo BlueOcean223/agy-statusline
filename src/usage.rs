@@ -7,12 +7,12 @@
 //! - `quota-samples.json`: up to 8 days of periodic weekly quota snapshots for forecasting & replay.
 //! - `cli-index.json`: day index of `~/.gemini/antigravity-cli/conversations/*.db` files.
 
-use crate::call::{Call, DESKTOP, DedupSet, ModelAgg, ModelId};
+use crate::call::{CLI, Call, DESKTOP, DedupSet, ModelAgg, ModelId, Tokens};
 use crate::cli_usage::{CliBackfillMeta, CliSnapshot, read_cli_titles};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, is_uuid_db, read_calls, signature};
 use crate::miss::{MissInfo, MissSummary, miss_scan};
-use crate::pricing::{DayCost, Pricer};
+use crate::pricing::{DayCost, Pricer, day_sum};
 pub use crate::quota::{
     CycleRecord, DayQuotaRec, QuotaBucketSample, QuotaSamplePoint, QuotaSamples, ResetEvent, note_cycle_end,
     note_quota, note_reset_event, r4, replay_from_samples, same_period,
@@ -326,7 +326,8 @@ fn prev_quota_of(h: &UsageHistory, today: &str, acct_key: &str, bucket_id: &str)
         .find_map(|(_, d)| d.qa.get(acct_key).and_then(|m| m.get(bucket_id)).cloned())
 }
 
-fn conv_calls(m: &HashMap<String, ModelAgg>) -> u64 {
+/// Calls summed over a map of per-model aggregates.
+pub(crate) fn conv_calls(m: &HashMap<String, ModelAgg>) -> u64 {
     m.values().map(|a| a.calls).sum()
 }
 
@@ -382,8 +383,7 @@ pub fn update_today(
                 rebuilt.entry(model.clone()).or_default().merge_from(agg);
             }
         }
-        let prev_calls: u64 = day.raw.values().map(|a| a.calls).sum();
-        let next_calls: u64 = rebuilt.values().map(|a| a.calls).sum();
+        let (prev_calls, next_calls) = (conv_calls(&day.raw), conv_calls(&rebuilt));
         if next_calls >= prev_calls {
             if next_calls != prev_calls || day.convs != active_convs {
                 hist_dirty = true;
@@ -532,8 +532,7 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
     for (day, (raw, convs)) in acc {
         let entry = h.days.entry(day.clone()).or_default();
         // Check desktop records only (`entry.raw`), so days that only had CLI records still get desktop backfill.
-        let existing_calls: u64 = entry.raw.values().map(|a| a.calls).sum();
-        let db_calls: u64 = raw.values().map(|a| a.calls).sum();
+        let (existing_calls, db_calls) = (conv_calls(&entry.raw), conv_calls(&raw));
         let is_pre_live = day < h.live_from;
         if is_pre_live || entry.bf || existing_calls == 0 || db_calls as f64 > existing_calls as f64 * 1.02 + 1.0 {
             entry.raw = raw;
@@ -816,7 +815,7 @@ fn analyze_day_calls_with_miss(
 
     for ((src, cid), mut list) in by_conv {
         list.sort_by_key(|c| (c.at_ms, c.step().unwrap_or(0)));
-        let markers = if src == "desktop" { scan_step_markers(app_data, &cid) } else { None };
+        let markers = if src == DESKTOP { scan_step_markers(app_data, &cid) } else { None };
         let misses = miss_scan(&list, pricer, markers.as_ref());
         let priced: Vec<(Option<String>, f64)> = list
             .iter()
@@ -920,11 +919,6 @@ fn group_aggregates<'a>(drec: &'a DayRecord, bucket_id: &'a str) -> impl Iterato
         .filter(move |(key, _)| model_belongs_to_group(&ModelId::from_bucket_key(key).price_key(), bucket_id))
 }
 
-/// USD and tokens of a priced day.
-fn day_sum(day: &DayCost) -> (f64, u64) {
-    day.values().fold((0.0, 0), |(u, t), (usd, agg)| (u + usd, t + agg.total_tokens()))
-}
-
 // ---------------------------------------------------------------- API views
 
 /// Builds the `/api/usage?days=7|30|all` JSON payload for the Usage tab.
@@ -995,28 +989,20 @@ pub fn build_usage_view(
 
         let mut by_model = DayCost::new();
         let mut day_usd = 0.0;
-        let mut day_in = 0u64;
-        let mut day_cr = 0u64;
-        let mut day_cw = 0u64;
-        let mut day_out = 0u64;
-        let mut day_calls = 0u64;
+        let mut day = ModelAgg::default();
         let mut day_cli_calls = 0u64;
 
         if let Some(r) = rec {
-            let persisted_cli_calls: u64 = r.cli_raw.values().map(|a| a.calls).sum();
+            let persisted_cli_calls = conv_calls(&r.cli_raw);
             // On price-cut days, the calls still on disk are priced at their own time.
             let exact: Option<Vec<Call>> = pricer
                 .is_cut_day(d_start)
                 .then(|| day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, dk, live_calls).to_vec());
-            let exact_cli_calls = exact.iter().flatten().filter(|c| c.source == crate::call::CLI).count() as u64;
+            let exact_cli_calls = exact.iter().flatten().filter(|c| c.source == CLI).count() as u64;
             by_model = pricer.price_day(r.raw.iter().chain(r.cli_raw.iter()), exact.as_deref(), d_start);
             for (usd, agg) in by_model.values() {
                 day_usd += usd;
-                day_in += agg.input;
-                day_cr += agg.cache_read;
-                day_cw += agg.cache_write;
-                day_out += agg.output;
-                day_calls += agg.calls;
+                day.merge_from(agg);
             }
             day_cli_calls = exact_cli_calls.max(persisted_cli_calls);
             if day_cli_calls > 0 {
@@ -1031,14 +1017,13 @@ pub fn build_usage_view(
             e.2 += agg.total_tokens();
         }
 
-        let day_tokens = day_in + day_cr + day_cw + day_out;
-        let hit = if day_cr + day_in > 0 { Some(day_cr as f64 / (day_cr + day_in) as f64) } else { None };
-        if day_calls > 0 {
+        let day_tokens = day.total_tokens();
+        if day.calls > 0 {
             active_days += 1;
         }
         total_usd += day_usd;
         total_tokens += day_tokens;
-        total_calls += day_calls;
+        total_calls += day.calls;
 
         let (mut q_gemini, mut q_claude) = (None::<f64>, None::<f64>);
         if let (Some(r), Some(ak)) = (rec, acct_key)
@@ -1061,11 +1046,6 @@ pub fn build_usage_view(
             v.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap_or(std::cmp::Ordering::Equal));
             v.into_iter()
                 .map(|(name, (usd, agg))| {
-                    let mh = if agg.cache_read + agg.input > 0 {
-                        Some(agg.cache_read as f64 / (agg.cache_read + agg.input) as f64)
-                    } else {
-                        None
-                    };
                     json!({
                         "name": name,
                         "usd": r6(usd),
@@ -1075,7 +1055,7 @@ pub fn build_usage_view(
                         "cw": agg.cache_write,
                         "out": agg.output,
                         "tokens": agg.total_tokens(),
-                        "hit": mh,
+                        "hit": agg.tokens().cache_hit(),
                     })
                 })
                 .collect()
@@ -1089,13 +1069,13 @@ pub fn build_usage_view(
             "convs": rec.map(|r| r.convs + r.cli_convs).unwrap_or(0),
             "cliCalls": day_cli_calls,
             "usd": r6(day_usd),
-            "calls": day_calls,
-            "in": day_in,
-            "cr": day_cr,
-            "cw": day_cw,
-            "out": day_out,
+            "calls": day.calls,
+            "in": day.input,
+            "cr": day.cache_read,
+            "cw": day.cache_write,
+            "out": day.output,
             "tokens": day_tokens,
-            "hit": hit,
+            "hit": day.tokens().cache_hit(),
             "qGemini": q_gemini,
             "qClaude": q_claude,
             "resets": day_resets,
@@ -1320,10 +1300,7 @@ pub fn build_day_calls_view(
 
     let mut titles: HashMap<(&'static str, String), String> = HashMap::new();
     let mut tot_usd = 0.0;
-    let mut tot_in = 0u64;
-    let mut tot_cr = 0u64;
-    let mut tot_cw = 0u64;
-    let mut tot_out = 0u64;
+    let mut tot = Tokens::default();
     let mut cli_count = 0usize;
     let mut desktop_count = 0usize;
     let total_calls = analyzed.len();
@@ -1334,10 +1311,7 @@ pub fn build_day_calls_view(
         source: &'static str,
         calls: usize,
         usd: f64,
-        inp: u64,
-        cr: u64,
-        cw: u64,
-        out: u64,
+        tokens: Tokens,
         miss_n: usize,
         miss_usd: f64,
         first_at: i64,
@@ -1352,11 +1326,8 @@ pub fn build_day_calls_view(
 
     for (idx, (c, short_opt, usd, miss_opt)) in analyzed.into_iter().enumerate() {
         tot_usd += usd;
-        tot_in += c.tokens.input;
-        tot_cr += c.tokens.cache_read;
-        tot_cw += c.tokens.cache_write;
-        tot_out += c.tokens.output;
-        if c.source == "cli" {
+        tot += &c.tokens;
+        if c.source == CLI {
             cli_count += 1;
         } else {
             desktop_count += 1;
@@ -1365,7 +1336,7 @@ pub fn build_day_calls_view(
         let title = titles
             .entry((c.source, c.conv_id.clone()))
             .or_insert_with(|| {
-                if c.source == "cli" {
+                if c.source == CLI {
                     cli_titles.get(&c.conv_id).cloned().unwrap_or_else(|| c.conv_id.chars().take(8).collect())
                 } else {
                     read_annotation(app_data, &c.conv_id)
@@ -1391,10 +1362,7 @@ pub fn build_day_calls_view(
         });
         ce.calls += 1;
         ce.usd += usd;
-        ce.inp += c.tokens.input;
-        ce.cr += c.tokens.cache_read;
-        ce.cw += c.tokens.cache_write;
-        ce.out += c.tokens.output;
+        ce.tokens += &c.tokens;
         ce.first_at = ce.first_at.min(c.at_ms);
         ce.last_at = ce.last_at.max(c.at_ms);
         *ce.models.entry(model_label.clone()).or_default() += usd;
@@ -1407,13 +1375,6 @@ pub fn build_day_calls_view(
             continue;
         }
 
-        let hit = if c.tokens.cache_read + c.tokens.input > 0 {
-            Some(c.tokens.cache_read as f64 / (c.tokens.cache_read + c.tokens.input) as f64)
-        } else {
-            None
-        };
-        let tps =
-            c.stream_ms.filter(|&ms| ms > 50.0 && c.tokens.output > 0).map(|ms| c.tokens.output as f64 / (ms / 1000.0));
         let costly = costly_threshold > 0.0 && usd >= costly_threshold;
 
         rows.push(json!({
@@ -1428,10 +1389,10 @@ pub fn build_day_calls_view(
             "cr": c.tokens.cache_read,
             "cw": c.tokens.cache_write,
             "out": c.tokens.output,
-            "hit": hit,
+            "hit": c.tokens.cache_hit(),
             "ttftMs": c.ttft_ms,
             "streamMs": c.stream_ms,
-            "tps": tps,
+            "tps": c.tps(),
             "miss": miss_opt,
         }));
     }
@@ -1441,7 +1402,6 @@ pub fn build_day_calls_view(
         v.sort_by(|a, b| b.1.usd.partial_cmp(&a.1.usd).unwrap_or(std::cmp::Ordering::Equal));
         v.into_iter()
             .map(|((_, cid), ca)| {
-                let hit = if ca.cr + ca.inp > 0 { Some(ca.cr as f64 / (ca.cr + ca.inp) as f64) } else { None };
                 let mut ms: Vec<_> = ca.models.into_iter().collect();
                 ms.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 let mnames: Vec<String> = ms.into_iter().map(|(k, _)| k).collect();
@@ -1452,12 +1412,12 @@ pub fn build_day_calls_view(
                     "calls": ca.calls,
                     "usd": r6(ca.usd),
                     "share": if tot_usd > 0.0 { r4(ca.usd / tot_usd) } else { 0.0 },
-                    "in": ca.inp,
-                    "cr": ca.cr,
-                    "cw": ca.cw,
-                    "out": ca.out,
-                    "tokens": ca.inp + ca.cr + ca.cw + ca.out,
-                    "hit": hit,
+                    "in": ca.tokens.input,
+                    "cr": ca.tokens.cache_read,
+                    "cw": ca.tokens.cache_write,
+                    "out": ca.tokens.output,
+                    "tokens": ca.tokens.total(),
+                    "hit": ca.tokens.cache_hit(),
                     "missCount": ca.miss_n,
                     "missUsd": r6(ca.miss_usd),
                     "firstAt": ca.first_at,
@@ -1477,7 +1437,6 @@ pub fn build_day_calls_view(
         v.into_iter().map(|(name, usd)| json!({ "name": name, "usd": r6(usd) })).collect()
     };
 
-    let tot_hit = if tot_cr + tot_in > 0 { Some(tot_cr as f64 / (tot_cr + tot_in) as f64) } else { None };
     json!({
         "date": date,
         "totalCalls": total_calls,
@@ -1490,12 +1449,12 @@ pub fn build_day_calls_view(
         "missSummary": miss_summary,
         "totals": {
             "usd": r6(tot_usd),
-            "in": tot_in,
-            "cr": tot_cr,
-            "cw": tot_cw,
-            "out": tot_out,
-            "tokens": tot_in + tot_cr + tot_cw + tot_out,
-            "hit": tot_hit,
+            "in": tot.input,
+            "cr": tot.cache_read,
+            "cw": tot.cache_write,
+            "out": tot.output,
+            "tokens": tot.total(),
+            "hit": tot.cache_hit(),
         },
         "byConv": by_conv,
         "calls": rows,

@@ -314,16 +314,8 @@ impl PromptState {
                     self.dont_ask_again = !self.dont_ask_again;
                     return (None, true);
                 }
-                HitZone::Later => {
-                    let res = PromptResult { relaunch: false, dont_ask_again: self.dont_ask_again };
-                    self.outcome = Some(res);
-                    return (Some(res), true);
-                }
-                HitZone::Relaunch => {
-                    let res = PromptResult { relaunch: true, dont_ask_again: self.dont_ask_again };
-                    self.outcome = Some(res);
-                    return (Some(res), true);
-                }
+                HitZone::Later => return (Some(self.finish(false)), true),
+                HitZone::Relaunch => return (Some(self.finish(true)), true),
                 _ => {}
             }
         }
@@ -331,13 +323,16 @@ impl PromptState {
     }
 
     pub fn on_confirm_key(&mut self) -> PromptResult {
-        let res = PromptResult { relaunch: true, dont_ask_again: self.dont_ask_again };
-        self.outcome = Some(res);
-        res
+        self.finish(true)
     }
 
     pub fn on_cancel_key(&mut self) -> PromptResult {
-        let res = PromptResult { relaunch: false, dont_ask_again: self.dont_ask_again };
+        self.finish(false)
+    }
+
+    /// Records and returns the dialog's result.
+    fn finish(&mut self, relaunch: bool) -> PromptResult {
+        let res = PromptResult { relaunch, dont_ask_again: self.dont_ask_again };
         self.outcome = Some(res);
         res
     }
