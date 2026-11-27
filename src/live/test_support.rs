@@ -58,10 +58,13 @@ pub(super) fn view_config() -> Config {
 pub(super) struct At {
     pub ago: i64,
     pub step: u64,
+    /// Backend model name and the name shown to the user.
     pub model: (&'static str, &'static str),
     /// Input, cache read, cache write, output.
     pub tokens: [u64; 4],
+    /// Context window used and its size.
     pub ctx: (u64, u64),
+    /// Checkpoint index; a new one counts as a compaction. -1 for none.
     pub checkpoint: i64,
     /// Time to first token and streaming time.
     pub timing: Option<(f64, f64)>,
@@ -98,8 +101,9 @@ fn at(ago: i64, step: u64, model: (&'static str, &'static str), tokens: [u64; 4]
     At { ago, step, model, tokens, ctx, checkpoint: -1, timing: None, label: None }
 }
 
-/// Ids in [`view_fixture`]: a root conversation, a running subagent, a subagent that just finished,
-/// an older finished subagent, and a top-level conversation known only from its annotation.
+/// Ids in [`view_fixture`]: a root conversation, a running subagent waiting on the user, a subagent
+/// that just finished, an older finished subagent, and a top-level conversation known only from its
+/// annotation. Three more running subagents push the bar's subagent rows past `MAX_SUBS`.
 pub(super) struct ViewIds {
     pub root: String,
     pub running: String,
@@ -109,7 +113,10 @@ pub(super) struct ViewIds {
 }
 
 /// An engine holding one conversation tree with priced calls across two days, quota, hooks,
-/// subagent steps, git status and annotations: enough for every field of the panel and bar.
+/// subagent steps, git status, annotations and an error.
+///
+/// Not covered: today's persisted and `agy CLI` usage (the global `USAGE` store is empty in tests),
+/// online prices, price-cut days, and miss causes that need transcript markers.
 pub(super) fn view_fixture() -> (Engine, ViewIds) {
     let mut e = engine();
     let ids = ViewIds { root: uuid(1), running: uuid(2), done: uuid(3), old: uuid(4), other: uuid(5) };
@@ -117,7 +124,6 @@ pub(super) fn view_fixture() -> (Engine, ViewIds) {
 
     let root_calls = [
         At {
-            checkpoint: -1,
             timing: Some((900.0, 4_000.0)),
             label: Some("Read the sources"),
             ..at(27 * HOUR, 1, OPUS, [20_000, 0, 20_000, 500], (40_000, 200_000))
@@ -195,10 +201,11 @@ pub(super) fn view_fixture() -> (Engine, ViewIds) {
                     label: Some("Search"),
                     ..at(20 * MIN, 1, OPUS, [8_000, 0, 8_000, 300], (16_000, 200_000))
                 },
+                // Over the costly-call threshold.
                 At {
-                    timing: Some((500.0, 2_500.0)),
+                    timing: Some((500.0, 40_000.0)),
                     label: Some("Read callers"),
-                    ..at(10 * MIN, 3, OPUS, [400, 16_000, 1_000, 600], (17_400, 200_000))
+                    ..at(10 * MIN, 3, OPUS, [400, 16_000, 1_000, 8_000], (17_400, 200_000))
                 },
             ],
         ),
@@ -215,6 +222,13 @@ pub(super) fn view_fixture() -> (Engine, ViewIds) {
         let calls = list.iter().map(|a| live_call(id, a)).collect();
         e.convs.insert(id.clone(), Conv { calls, ..Default::default() });
     }
+    for n in 0..3 {
+        let id = uuid(6 + n);
+        let role = format!("Worker {n}");
+        e.summaries.insert(id.clone(), sub("CASCADE_RUN_STATUS_RUNNING", "worker", &role, 5 * MIN));
+        let call = at((15 + 10 * n as i64) * MIN, 1, NEON, [2_000 + n as u64, 0, 0, 100], (2_000, 1_000_000));
+        e.convs.insert(id.clone(), Conv { calls: vec![live_call(&id, &call)], ..Default::default() });
+    }
     let step =
         |status: &str, text: &str, t0: i64, t1: i64| SubStep { status: status.into(), text: text.into(), t0, t1 };
     e.sub_steps.insert(
@@ -224,8 +238,8 @@ pub(super) fn view_fixture() -> (Engine, ViewIds) {
             first_at: NOW - 21 * MIN,
             steps: BTreeMap::from([
                 (0, step("DONE", "Search for callers", NOW - 21 * MIN, NOW - 15 * MIN)),
-                (1, step("DONE", "Read live.rs", NOW - 15 * MIN, NOW - 9 * MIN)),
-                (2, step("RUNNING", "Read panel.rs", NOW - 9 * MIN, 0)),
+                (1, step("ERROR", "Read live.rs", NOW - 15 * MIN, NOW - 9 * MIN)),
+                (2, step("WAITING", "Approve a command", NOW - 9 * MIN, 0)),
             ]),
             ..Default::default()
         },
@@ -256,5 +270,6 @@ pub(super) fn view_fixture() -> (Engine, ViewIds) {
     e.annotations.insert(ids.root.clone(), note("Refactor the panel", NOW - 2 * MIN));
     e.annotations.insert(ids.other.clone(), note("Release notes", NOW - 2 * HOUR));
     e.disk.insert(ids.other.clone(), NOW - 2 * HOUR);
+    e.last_error = Some("language_server: connection refused".into());
     (e, ids)
 }

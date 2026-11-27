@@ -7,7 +7,7 @@
   "activity": "Running · Answer",
   "bar": {
     "costlyThreshold": 0.2,
-    "error": null,
+    "error": "language_server: connection refused",
     "opts": {
       "enabled": true,
       "look": {
@@ -40,7 +40,7 @@
             "elapsed": 0.6,
             "pace": -0.15,
             "resetMs": 1795788000000,
-            "used": 0.44999999999999996,
+            "used": 0.45,
             "window": "5h"
           },
           {
@@ -60,7 +60,7 @@
             "elapsed": 0.3,
             "pace": -0.2,
             "resetMs": 1795793400000,
-            "used": 0.09999999999999998,
+            "used": 0.1,
             "window": "5h"
           }
         ],
@@ -68,12 +68,12 @@
         "name": "Claude and GPT Models"
       }
     ],
-    "today": 0.62235,
+    "today": 0.822956,
     "todayCli": 0.0,
     "views": {
       "00000000-0000-4000-8000-000000000001": {
-        "costConv": 0.85985,
-        "costConvToday": 0.62235,
+        "costConv": 1.060456,
+        "costConvToday": 0.822956,
         "costLast": {
           "cache": 0.0,
           "cw": 0.0,
@@ -105,7 +105,7 @@
           "cacheWrite": 0,
           "calls": 4,
           "compactions": 2,
-          "cost": 0.6350499999999999,
+          "cost": 0.63505,
           "ctxMax": 1000000,
           "ctxUsed": 30000,
           "currentStep": null,
@@ -121,7 +121,7 @@
           "subRole": null,
           "subType": null,
           "timeline": [],
-          "tps": 133.33333333333334,
+          "tps": 133.333333333,
           "ttftMs": 1200.0,
           "waiting": false
         },
@@ -132,7 +132,7 @@
             "elapsed": 0.6,
             "pace": -0.15,
             "resetMs": 1795788000000,
-            "used": 0.44999999999999996,
+            "used": 0.45,
             "window": "5h"
           },
           {
@@ -145,20 +145,20 @@
         ],
         "subs": [
           {
-            "cacheHit": 0.975609756097561,
+            "cacheHit": 0.975609756098,
             "cacheRead": 16000,
             "cacheWrite": 1000,
             "calls": 2,
             "compactions": 0,
-            "cost": 0.12875,
+            "cost": 0.31375,
             "ctxMax": 200000,
             "ctxUsed": 17400,
-            "currentStep": "Read panel.rs (step 3)",
+            "currentStep": "Approve a command (step 3)",
             "endedMs": 1795780260000,
             "id": "00000000-0000-4000-8000-000000000002",
             "lastAt": 1795780200000,
             "model": "Claude Opus 5.5",
-            "outTokens": 600,
+            "outTokens": 8000,
             "respModel": "claude-opus-5-5",
             "running": true,
             "startedMs": 1795779540000,
@@ -167,11 +167,37 @@
             "subType": "explorer",
             "timeline": [
               "✓ #1 Search for callers",
-              "✓ #2 Read live.rs",
-              "● #3 Read panel.rs"
+              "✗ #2 Read live.rs",
+              "? #3 Approve a command"
             ],
-            "tps": 240.0,
+            "tps": 200.0,
             "ttftMs": 500.0,
+            "waiting": true
+          },
+          {
+            "cacheHit": 0.0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "calls": 1,
+            "compactions": 0,
+            "cost": 0.0052,
+            "ctxMax": 1000000,
+            "ctxUsed": 2000,
+            "currentStep": null,
+            "endedMs": 1795779900000,
+            "id": "00000000-0000-4000-8000-000000000006",
+            "lastAt": 1795779900000,
+            "model": "Gemini 4 Neon (High)",
+            "outTokens": 100,
+            "respModel": "gemini-4-neon",
+            "running": true,
+            "startedMs": 1795779900000,
+            "stepTotal": 2,
+            "subRole": "Worker 0",
+            "subType": "worker",
+            "timeline": [],
+            "tps": null,
+            "ttftMs": null,
             "waiting": false
           },
           {
@@ -180,24 +206,76 @@
             "cacheWrite": 0,
             "calls": 1,
             "compactions": 0,
-            "cost": 0.0348,
+            "cost": 0.005202,
             "ctxMax": 1000000,
-            "ctxUsed": 12000,
+            "ctxUsed": 2000,
             "currentStep": null,
-            "endedMs": 1795777800000,
-            "id": "00000000-0000-4000-8000-000000000003",
-            "lastAt": 1795777800000,
+            "endedMs": 1795779300000,
+            "id": "00000000-0000-4000-8000-000000000007",
+            "lastAt": 1795779300000,
             "model": "Gemini 4 Neon (High)",
-            "outTokens": 900,
+            "outTokens": 100,
             "respModel": "gemini-4-neon",
-            "running": false,
-            "startedMs": 1795777800000,
+            "running": true,
+            "startedMs": 1795779300000,
             "stepTotal": 2,
-            "subRole": "Check tests",
-            "subType": "reviewer",
+            "subRole": "Worker 1",
+            "subType": "worker",
             "timeline": [],
-            "tps": 225.0,
-            "ttftMs": 800.0,
+            "tps": null,
+            "ttftMs": null,
+            "waiting": false
+          },
+          {
+            "cacheHit": 0.0,
+            "cacheRead": 0,
+            "cacheWrite": 0,
+            "calls": 1,
+            "compactions": 0,
+            "cost": 0.005204,
+            "ctxMax": 1000000,
+            "ctxUsed": 2000,
+            "currentStep": null,
+            "endedMs": 1795778700000,
+            "id": "00000000-0000-4000-8000-000000000008",
+            "lastAt": 1795778700000,
+            "model": "Gemini 4 Neon (High)",
+            "outTokens": 100,
+            "respModel": "gemini-4-neon",
+            "running": true,
+            "startedMs": 1795778700000,
+            "stepTotal": 2,
+            "subRole": "Worker 2",
+            "subType": "worker",
+            "timeline": [],
+            "tps": null,
+            "ttftMs": null,
+            "waiting": false
+          },
+          {
+            "cacheHit": null,
+            "cacheRead": null,
+            "cacheWrite": null,
+            "calls": 0,
+            "compactions": 0,
+            "cost": 0.0,
+            "ctxMax": 0,
+            "ctxUsed": null,
+            "currentStep": null,
+            "endedMs": null,
+            "id": "+1",
+            "lastAt": null,
+            "model": null,
+            "outTokens": null,
+            "respModel": null,
+            "running": false,
+            "startedMs": null,
+            "stepTotal": 0,
+            "subRole": null,
+            "subType": null,
+            "timeline": [],
+            "tps": null,
+            "ttftMs": null,
             "waiting": false
           }
         ],
@@ -224,8 +302,8 @@
       "usd": 0.28275
     },
     "misses": 2,
-    "savedUsd": 0.24300000000000002,
-    "sessionHit": 0.4125286478227655,
+    "savedUsd": 0.243,
+    "sessionHit": 0.394439858878,
     "ttlSec": 300,
     "warmLeftSec": 120
   },
@@ -250,7 +328,7 @@
       "elapsed": 0.6,
       "pace": -0.15,
       "resetMs": 1795788000000,
-      "used": 0.44999999999999996,
+      "used": 0.45,
       "window": "5h"
     },
     {
@@ -274,22 +352,22 @@
   "root": "00000000-0000-4000-8000-000000000001",
   "running": true,
   "speed": {
-    "avgTps": 161.11111111111111,
+    "avgTps": 161.111111111,
     "avgTtftMs": 1075.0,
-    "lastTps": 133.33333333333334,
+    "lastTps": 133.333333333,
     "lastTtftMs": 1200.0,
     "series": [
       125.0,
-      133.33333333333334,
+      133.333333333,
       240.0,
-      133.33333333333334
+      133.333333333
     ],
     "wallSec": 97020.0
   },
-  "subCost": 0.2248,
+  "subCost": 0.425406,
   "subagents": [
     {
-      "cost": 0.12875,
+      "cost": 0.31375,
       "id": "00000000-0000-4000-8000-000000000002",
       "inLs": true,
       "lastAt": 1795780200000,
@@ -297,8 +375,44 @@
       "parent": "00000000-0000-4000-8000-000000000001",
       "role": "Find callers",
       "running": true,
-      "tokens": 34300,
+      "tokens": 41700,
       "type": "explorer"
+    },
+    {
+      "cost": 0.0052,
+      "id": "00000000-0000-4000-8000-000000000006",
+      "inLs": false,
+      "lastAt": 1795779900000,
+      "model": "Gemini 4 Neon (High)",
+      "parent": "00000000-0000-4000-8000-000000000001",
+      "role": "Worker 0",
+      "running": true,
+      "tokens": 2100,
+      "type": "worker"
+    },
+    {
+      "cost": 0.005202,
+      "id": "00000000-0000-4000-8000-000000000007",
+      "inLs": false,
+      "lastAt": 1795779300000,
+      "model": "Gemini 4 Neon (High)",
+      "parent": "00000000-0000-4000-8000-000000000001",
+      "role": "Worker 1",
+      "running": true,
+      "tokens": 2101,
+      "type": "worker"
+    },
+    {
+      "cost": 0.005204,
+      "id": "00000000-0000-4000-8000-000000000008",
+      "inLs": false,
+      "lastAt": 1795778700000,
+      "model": "Gemini 4 Neon (High)",
+      "parent": "00000000-0000-4000-8000-000000000001",
+      "role": "Worker 2",
+      "running": true,
+      "tokens": 2102,
+      "type": "worker"
     },
     {
       "cost": 0.0348,
@@ -329,24 +443,24 @@
   "tokens": {
     "cache": 54000,
     "cacheWrite": 75000,
-    "cost": 0.8598500000000001,
+    "cost": 1.060456,
     "costCache": 0.027,
     "costCacheWrite": 0.46875,
-    "costIn": 0.2585,
-    "costOut": 0.10560000000000001,
-    "fresh": 76900,
+    "costIn": 0.270506,
+    "costOut": 0.2942,
+    "fresh": 82903,
     "includesSubagents": true,
-    "out": 4900,
-    "ratePerHr": 0.031905380333951766,
+    "out": 12600,
+    "ratePerHr": 0.0393490166976,
     "todayCliCost": 0.0,
-    "todayCost": 0.62235,
-    "todayTokens": 170300,
-    "total": 210800
+    "todayCost": 0.822956,
+    "todayTokens": 184003,
+    "total": 224503
   },
   "turns": [
     {
       "at": 1795683600000,
-      "cost": 0.23750000000000002,
+      "cost": 0.2375,
       "costly": true,
       "ctx": 40000,
       "hit": 0.0,
@@ -375,7 +489,7 @@
       "model": "Claude Opus 5.5",
       "out": 800,
       "step": 3,
-      "tps": 133.33333333333334,
+      "tps": 133.333333333,
       "ttftMs": 1500.0
     },
     {
@@ -383,7 +497,7 @@
       "cost": 0.064,
       "costly": false,
       "ctx": 160000,
-      "hit": 0.987012987012987,
+      "hit": 0.987012987013,
       "label": "Run the tests",
       "miss": null,
       "model": "Claude Opus 5.5",
@@ -409,7 +523,7 @@
       "model": "Gemini 4 Neon (High)",
       "out": 400,
       "step": 7,
-      "tps": 133.33333333333334,
+      "tps": 133.333333333,
       "ttftMs": 1200.0
     }
   ],
