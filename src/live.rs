@@ -25,8 +25,9 @@ use crate::ls::LsClient;
 use crate::pricing::{Pricer, day_sum};
 use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
-    AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
-    maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, update_today,
+    AccountInfo, DayRecord, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, day_calls,
+    load_history, load_samples, maybe_replay_samples, needs_backfill, price_recorded_day, quota_group_id, run_backfill,
+    save_history, update_today,
 };
 use chrono::DateTime;
 use serde_json::{Value, json};
@@ -1084,34 +1085,31 @@ impl Engine {
             live_cost += cost;
             live_tok += tok;
         }
-        // Snapshot today's persisted aggregates + CLI snapshot briefly under USAGE lock, then price lock-free.
-        let today = day.key();
+        // Today's history, priced the way the Usage tab prices it. Copied under the USAGE lock,
+        // priced (and on a price-cut day, today's calls read) after releasing it.
         let snap = USAGE.lock().ok().and_then(|g| {
             let store = g.as_ref()?;
-            let day = store.history.days.get(&today)?;
+            let rec = store.history.days.get(&day.key())?;
+            let rec = DayRecord { raw: rec.raw.clone(), cli_raw: rec.cli_raw.clone(), ..Default::default() };
             Some((
-                day.raw.clone(),
-                day.cli_raw.clone(),
+                rec,
                 store.cli_snap.clone(),
+                store.app_data.clone(),
                 store.cli_data.clone(),
                 store.plugin_data.clone(),
             ))
         });
-        let persisted = snap.map(|(desk_raw, cli_raw, mut cli_snap, cd, pd)| {
-            // On a price-cut day, the calls this engine holds and the CLI's calls are priced at their
-            // own time, and the rest of today's aggregates at noon.
-            let cut = pricer.is_cut_day(day);
-            let desk_exact: Vec<Call> = if cut {
-                self.convs.values().flat_map(|conv| conv.calls_since(midnight)).map(|c| c.call.clone()).collect()
-            } else {
-                Vec::new()
-            };
-            let cli_exact =
-                if cut && !cli_raw.is_empty() { cli_snap.calls_for_day(&cd, &pd, &today) } else { Vec::new() };
-            let (desk_usd, desk_tok) = day_sum(&pricer.price_day(&desk_raw, cut.then_some(desk_exact.as_slice()), day));
-            let (cli_usd, cli_tok) = day_sum(&pricer.price_day(&cli_raw, cut.then_some(cli_exact.as_slice()), day));
+        let persisted = snap.map(|(rec, mut cli_snap, app_data, cli_data, plugin_data)| {
+            let exact = pricer.is_cut_day(day).then(|| {
+                let live: Vec<Call> =
+                    self.convs.values().flat_map(|conv| conv.calls_since(midnight)).map(|c| c.call.clone()).collect();
+                day_calls(&app_data, &cli_data, &plugin_data, &mut cli_snap, day, &live)
+            });
+            let priced = price_recorded_day(&rec, day, pricer, exact.as_deref());
+            let ((desk_usd, desk_tok), (cli_usd, cli_tok)) = (day_sum(&priced.desktop), day_sum(&priced.cli));
             (desk_usd, desk_tok, cli_usd, cli_tok)
         });
+        // The live engine's calls reach history every few seconds; until then they are ahead of it.
         match persisted {
             Some((p_desk_cost, p_desk_tok, cli_cost, cli_tok)) => TodayTotals {
                 usd: live_cost.max(p_desk_cost) + cli_cost,

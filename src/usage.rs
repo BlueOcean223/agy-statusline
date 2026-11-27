@@ -691,6 +691,57 @@ impl DayCallCache {
     }
 }
 
+/// Every desktop and CLI call of `day`: `live_calls` (the live engine's, possibly not on disk yet),
+/// then the desktop databases', then the CLI's, each call once.
+pub(crate) fn day_calls(
+    app_data: &Path,
+    cli_dir: &Path,
+    plugin_data: &Path,
+    cli: &mut CliSnapshot,
+    day: &LocalDay,
+    live_calls: &[Call],
+) -> Vec<Call> {
+    collect_all_day_calls(&list_desktop_dbs(app_data), cli_dir, plugin_data, cli, day, live_calls)
+}
+
+/// A day of history priced, desktop and `agy CLI` apart.
+#[derive(Default)]
+pub(crate) struct PricedDay {
+    pub desktop: DayCost,
+    pub cli: DayCost,
+}
+
+impl PricedDay {
+    /// Both sources by label.
+    pub fn merged(self) -> DayCost {
+        let mut out = self.desktop;
+        for (label, (usd, agg)) in self.cli {
+            let e = out.entry(label).or_default();
+            e.0 += usd;
+            e.1.merge_from(&agg);
+        }
+        out
+    }
+}
+
+/// Prices one day of history, as both the status bar's "today" and the Usage tab's day rows show it.
+/// On a price-cut day, pass the day's calls ([`day_calls`]) as `exact`: each is priced at its own
+/// time and whatever the aggregates hold beyond them at noon. Otherwise everything is priced at noon.
+pub(crate) fn price_recorded_day(
+    rec: &DayRecord,
+    day: &LocalDay,
+    pricer: &Pricer,
+    exact: Option<&[Call]>,
+) -> PricedDay {
+    let exact = exact.filter(|_| pricer.is_cut_day(day));
+    let (cli_exact, desk_exact): (Vec<Call>, Vec<Call>) =
+        exact.into_iter().flatten().cloned().partition(|c| c.source == CLI);
+    PricedDay {
+        desktop: pricer.price_day(&rec.raw, exact.map(|_| desk_exact.as_slice()), day),
+        cli: pricer.price_day(&rec.cli_raw, exact.map(|_| cli_exact.as_slice()), day),
+    }
+}
+
 /// Collects all desktop + CLI calls for a single local day.
 fn collect_all_day_calls(
     desktop_dbs: &[DesktopDb],
@@ -920,7 +971,7 @@ pub fn build_usage_view(
                 .is_cut_day(day)
                 .then(|| day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, day, live_calls).to_vec());
             let exact_cli_calls = exact.iter().flatten().filter(|c| c.source == CLI).count() as u64;
-            by_model = pricer.price_day(r.raw.iter().chain(r.cli_raw.iter()), exact.as_deref(), day);
+            by_model = price_recorded_day(r, day, pricer, exact.as_deref()).merged();
             for (usd, agg) in by_model.values() {
                 day_usd += usd;
                 totals.merge_from(agg);
@@ -1391,6 +1442,55 @@ mod tests {
     use super::*;
     use crate::call::{ModelId, Tokens};
     use crate::config::ModelRule;
+
+    #[test]
+    fn recorded_day_prices_desktop_and_cli_apart_with_exact_calls_on_a_cut_day() {
+        const CUT: i64 = 1_800_000_000_000;
+        // A zone where the cut lands at 10:00: before noon, so the remainder costs the new price.
+        let day = LocalDay::of_in(CUT, &chrono::FixedOffset::east_opt(2 * 3600).unwrap());
+        let tier = |until_ms, input_per_m| crate::config::PriceTier {
+            until_ms,
+            input_per_m,
+            cache_read_per_m: 0.0,
+            cache_write_per_m: 0.0,
+            output_per_m: 0.0,
+        };
+        let rule = ModelRule {
+            pattern: "carbon".into(),
+            short_name: "Carbon".into(),
+            tiers: vec![tier(Some(CUT), 2.0), tier(None, 4.0)],
+            ..Default::default()
+        };
+        let pricer = Pricer::from_rules(vec![rule], CUT);
+        assert!(pricer.is_cut_day(&day));
+
+        let model = ModelId::new("gemini-4-carbon", "Gemini 4 Carbon");
+        let agg = |calls, input| ModelAgg { calls, input, ..Default::default() };
+        let mut rec = DayRecord::default();
+        rec.raw.insert(model.bucket_key(), agg(2, 300_000));
+        rec.cli_raw.insert(model.bucket_key(), agg(1, 100_000));
+        let call = |source, input, at_ms| Call {
+            source,
+            model: model.clone(),
+            tokens: Tokens { input, ..Default::default() },
+            at_ms,
+            ..Default::default()
+        };
+        // Before the cut: one desktop call still on disk, and the CLI's only call.
+        let exact = [call(DESKTOP, 100_000, CUT - 3_600_000), call(CLI, 100_000, CUT - 3_600_000)];
+
+        let priced = price_recorded_day(&rec, &day, &pricer, Some(&exact));
+        // Desktop: 100k at $2/M, the other 200k (no longer on disk) at noon, $4/M.
+        assert!((day_sum(&priced.desktop).0 - (0.2 + 0.8)).abs() < 1e-9);
+        assert!((day_sum(&priced.cli).0 - 0.2).abs() < 1e-9);
+        let merged = priced.merged();
+        assert_eq!(merged["Carbon"].1.calls, 3);
+        assert!((merged["Carbon"].0 - 1.2).abs() < 1e-9);
+
+        // Without the day's calls, everything is priced at noon.
+        let at_noon = price_recorded_day(&rec, &day, &pricer, None).merged();
+        assert!((at_noon["Carbon"].0 - 1.6).abs() < 1e-9);
+    }
 
     #[test]
     fn masks_emails_and_hashes_deterministically() {
