@@ -207,16 +207,24 @@ impl DedupSet {
             return false;
         }
         let soft = format!("{}:{}:{}:{}", c.conv_id, c.at_ms.div_euclid(1000), c.tokens.input, c.tokens.output);
-        if let Some(&some_without_id) = self.soft.get(&soft)
-            && (id.is_none() || some_without_id)
-        {
-            return false;
-        }
         if let Some(id) = id {
             self.ids.insert(id.to_string());
         }
-        *self.soft.entry(soft).or_default() |= id.is_none();
-        true
+        match self.soft.get_mut(&soft) {
+            // A copy without an ID was seen: this is that call. With an ID, it now names the copy,
+            // so a third call with the same key and another ID is a different call.
+            Some(without_id) if *without_id => {
+                *without_id = id.is_none();
+                false
+            }
+            // Only calls with IDs had this key: the same call only if this one has no ID.
+            Some(_) if id.is_none() => false,
+            Some(_) => true,
+            None => {
+                self.soft.insert(soft, id.is_none());
+                true
+            }
+        }
     }
 }
 
@@ -251,6 +259,22 @@ mod tests {
         let mut seen = DedupSet::default();
         assert!(seen.insert(&call(None, 1_000, 10)));
         assert!(!seen.insert(&call(Some("r2"), 1_000, 10)));
+    }
+
+    #[test]
+    fn a_call_matched_by_the_soft_key_still_records_its_response_id() {
+        let mut seen = DedupSet::default();
+        assert!(seen.insert(&call(None, 1_000, 10)));
+        assert!(!seen.insert(&call(Some("r1"), 1_500, 10)), "the copy without an ID");
+        assert!(!seen.insert(&call(Some("r1"), 5_000, 10)), "r1 again, at another second");
+    }
+
+    #[test]
+    fn a_copy_without_an_id_stands_for_one_call_only() {
+        let mut seen = DedupSet::default();
+        assert!(seen.insert(&call(None, 1_000, 10)));
+        assert!(!seen.insert(&call(Some("r1"), 1_100, 10)));
+        assert!(seen.insert(&call(Some("r2"), 1_200, 10)), "another call in the same second");
     }
 
     #[test]

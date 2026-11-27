@@ -635,15 +635,7 @@ fn desktop_db_calls(db: &DesktopDb, sig: DbSig) -> Option<Arc<DesktopDbCalls>> {
 
 /// Collects deduplicated desktop calls falling inside `[from_ms, to_ms)` from live memory + SQLite DBs.
 fn collect_desktop_calls_in_range(dbs: &[DesktopDb], from_ms: i64, to_ms: i64, live_calls: &[Call]) -> Vec<Call> {
-    let mut merged = Vec::new();
-    let mut seen = DedupSet::default();
-
-    for c in live_calls {
-        if c.at_ms >= from_ms && c.at_ms < to_ms && seen.insert(c) {
-            merged.push(c.clone());
-        }
-    }
-
+    let mut read = Vec::new();
     for db in dbs {
         // A DB whose metadata cannot be read cannot be opened either.
         let Some(sig) = db.sig else { continue };
@@ -655,14 +647,40 @@ fn collect_desktop_calls_in_range(dbs: &[DesktopDb], from_ms: i64, to_ms: i64, l
         if recs.max_at < from_ms || recs.min_at >= to_ms {
             continue;
         }
-        for r in &recs.calls {
-            if r.at_ms >= from_ms && r.at_ms < to_ms && seen.insert(r) {
-                merged.push(r.clone());
-            }
+        read.push(recs);
+    }
+    let disk = read.iter().flat_map(|r| r.calls.iter());
+    merge_live_first(live_calls, disk, |at| at >= from_ms && at < to_ms)
+}
+
+/// The live engine's calls, then the database calls not among them, keeping those `in_range`.
+///
+/// A live call keeps its own tokens but takes its database copy's time (same response ID): the
+/// database dates it from its step, while a live call not yet in the transcript has a stand-in
+/// time (when it was seen, or its neighbours'). That time decides its day and, on a price-cut day,
+/// its price.
+fn merge_live_first<'a>(
+    live_calls: &[Call],
+    disk: impl Iterator<Item = &'a Call> + Clone,
+    in_range: impl Fn(i64) -> bool,
+) -> Vec<Call> {
+    let disk_time: HashMap<&str, i64> = disk
+        .clone()
+        .filter(|c| c.at_ms > 0)
+        .filter_map(|c| Some((c.response_id.as_deref().filter(|s| !s.is_empty())?, c.at_ms)))
+        .collect();
+    let mut seen = DedupSet::default();
+    let mut out = Vec::new();
+    for c in live_calls {
+        let at = c.response_id.as_deref().and_then(|id| disk_time.get(id)).copied().unwrap_or(c.at_ms);
+        let c = Call { at_ms: at, ..c.clone() };
+        // Recorded even when out of range, so its database copy is not counted on another day.
+        if seen.insert(&c) && in_range(c.at_ms) {
+            out.push(c);
         }
     }
-
-    merged
+    out.extend(disk.filter(|c| in_range(c.at_ms) && seen.insert(c)).cloned());
+    out
 }
 
 /// Per-request cache of deduplicated desktop + CLI calls per calendar day, preventing
@@ -708,11 +726,9 @@ pub(crate) fn disk_day_calls(
 /// then the desktop calls of `disk` ([`disk_day_calls`]) not already among them, then its CLI calls.
 /// The same calls, in the same order, as reading the day with the live calls in hand.
 pub(crate) fn with_live_calls(live_calls: &[Call], disk: &[Call], day: &LocalDay) -> Vec<Call> {
-    let mut seen = DedupSet::default();
-    let mut out: Vec<Call> = live_calls.iter().filter(|c| day.contains(c.at_ms) && seen.insert(c)).cloned().collect();
-    let (desktop, cli): (Vec<&Call>, Vec<&Call>) = disk.iter().partition(|c| c.source != CLI);
-    out.extend(desktop.into_iter().filter(|c| seen.insert(c)).cloned());
-    out.extend(cli.into_iter().cloned());
+    let desktop = disk.iter().filter(|c| c.source != CLI);
+    let mut out = merge_live_first(live_calls, desktop, |at| day.contains(at));
+    out.extend(disk.iter().filter(|c| c.source == CLI).cloned());
     out
 }
 
@@ -1547,8 +1563,28 @@ mod tests {
         let ids = |calls: &[Call]| calls.iter().map(|c| c.response_id.clone().unwrap()).collect::<Vec<_>>();
         let merged = with_live_calls(&live, &disk, &day);
         assert_eq!(ids(&merged), ["r1", "r2", "r3"]);
-        assert_eq!(merged[0].at_ms, at, "the live copy is kept");
+        assert_eq!(merged[0].at_ms, at + 4_000, "the live copy, dated from its database step");
         assert_eq!(ids(&with_live_calls(&[], &disk, &day)), ["r1", "r2", "r3"]);
+    }
+
+    #[test]
+    fn a_live_call_with_a_stand_in_time_takes_its_database_copys_day() {
+        let day = LocalDay::of_in(1_800_000_000_000, &chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let call = |source: &'static str, input: u64, at_ms: i64| Call {
+            conv_id: "a".into(),
+            source,
+            tokens: Tokens { input, ..Default::default() },
+            at_ms,
+            response_id: Some("r1".into()),
+            ..Default::default()
+        };
+        // Not yet in the transcript: dated a minute before midnight from its neighbours, while its
+        // step (in the database) is a minute after. Live tokens are the final ones.
+        let live = [call(DESKTOP, 120, day.start_ms() - 60_000)];
+        let disk = [call(DESKTOP, 100, day.start_ms() + 60_000)];
+        let merged = with_live_calls(&live, &disk, &day);
+        assert_eq!(merged.len(), 1);
+        assert_eq!((merged[0].tokens.input, merged[0].at_ms), (120, day.start_ms() + 60_000));
     }
 
     #[test]

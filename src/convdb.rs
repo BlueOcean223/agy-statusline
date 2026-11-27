@@ -76,7 +76,8 @@ pub struct ConvMeta {
 /// the language_server's records.
 pub fn read(app_data: &Path, id: &str, sig: DbSig) -> Result<(Vec<Call>, ConvMeta), String> {
     let conn = open(&db_path(app_data, id)).map_err(|e| format!("{id}.db: {e}"))?;
-    let calls = calls_from(&conn, id, crate::call::DESKTOP, None).map_err(|e| format!("{id}.db: {e}"))?;
+    let calls =
+        calls_from(&conn, id, crate::call::DESKTOP, None, OnStepError::Fail).map_err(|e| format!("{id}.db: {e}"))?;
     let step_count = conn.query_row("SELECT COUNT(*) FROM steps", [], |r| r.get::<_, i64>(0)).unwrap_or(0).max(0);
     let meta: Option<Vec<u8>> =
         conn.query_row("SELECT data FROM trajectory_metadata_blob LIMIT 1", [], |r| r.get(0)).ok().flatten();
@@ -88,11 +89,11 @@ pub fn read(app_data: &Path, id: &str, sig: DbSig) -> Result<(Vec<Call>, ConvMet
 
 /// One call per generator row, in language_server order (row `idx`), so index `i` here is record
 /// `i` there. Rows without usage are kept ([`Call::has_usage`] is false); calls whose steps carry
-/// no time have `at_ms == 0`.
+/// no time have `at_ms == 0`. If SQLite fails partway through, the rows read before are returned.
 pub fn read_calls(path: &Path, conv_id: &str, source: &'static str) -> Result<Vec<Call>, String> {
     let conn = open(path).map_err(|e| e.to_string())?;
     let times = StepTimes::read(&conn);
-    calls_from(&conn, conv_id, source, Some(&times)).map_err(|e| e.to_string())
+    calls_from(&conn, conv_id, source, Some(&times), OnStepError::KeepRead).map_err(|e| e.to_string())
 }
 
 fn open(path: &Path) -> rusqlite::Result<Connection> {
@@ -102,21 +103,38 @@ fn open(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// The calls in `conn`, dated from `times` (left at 0 without).
+/// What [`calls_from`] does when SQLite fails partway through the table.
+#[derive(Clone, Copy, PartialEq)]
+enum OnStepError {
+    /// Fail the read: the live engine must not take a partial table for the whole conversation.
+    Fail,
+    /// Keep the rows read so far: history and the CLI scan count what they can.
+    KeepRead,
+}
+
+/// The calls in `conn`, dated from `times` (left at 0 without). A row whose value is not a blob
+/// reads as a call without usage, so row `i` stays call `i` and the other rows still count.
 fn calls_from(
     conn: &Connection,
     conv_id: &str,
     source: &'static str,
     times: Option<&StepTimes>,
+    on_step_error: OnStepError,
 ) -> rusqlite::Result<Vec<Call>> {
     // Fall back to storage order for a schema without `idx` (only the live engine needs the order).
     let mut stmt = conn
         .prepare("SELECT data FROM gen_metadata ORDER BY idx")
         .or_else(|_| conn.prepare("SELECT data FROM gen_metadata"))?;
-    let rows = stmt.query_map([], |r| r.get::<_, Option<Vec<u8>>>(0))?;
+    let mut rows = stmt.query([])?;
     let mut out = Vec::new();
-    for row in rows {
-        let data = row?.unwrap_or_default();
+    loop {
+        let row = match rows.next() {
+            Ok(Some(row)) => row,
+            Ok(None) => break,
+            Err(e) if on_step_error == OnStepError::Fail => return Err(e),
+            Err(_) => break,
+        };
+        let data = row.get::<_, Option<Vec<u8>>>(0).ok().flatten().unwrap_or_default();
         let mut c = call_from_pb(&data);
         c.conv_id = conv_id.to_string();
         c.source = source;
@@ -546,6 +564,37 @@ mod tests {
         );
         assert_eq!(calls.iter().map(Call::has_usage).collect::<Vec<_>>(), vec![true, false, true, true]);
         assert!(calls.iter().all(|c| c.conv_id == "conv" && c.source == crate::call::CLI));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_that_is_not_a_blob_reads_as_a_call_without_usage() {
+        let (dir, path) = temp_db("bad-row");
+        write_db(&path, &[], &[Gen { input: 1000, ..Default::default() }], None);
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("INSERT INTO gen_metadata VALUES (1, 'oops')", []).unwrap();
+        conn.execute("INSERT INTO gen_metadata VALUES (2, ?1)", [Gen { input: 20, ..Default::default() }.encode()])
+            .unwrap();
+        drop(conn);
+        let calls = read_calls(&path, "conv", crate::call::CLI).unwrap();
+        assert_eq!(calls.iter().map(|c| c.tokens.input).collect::<Vec<_>>(), vec![1000, 0, 20]);
+        assert!(!calls[1].has_usage());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_table_without_idx_is_read_in_storage_order() {
+        let (dir, path) = temp_db("no-idx");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
+        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
+        for input in [7, 9] {
+            conn.execute("INSERT INTO gen_metadata VALUES (?1)", [Gen { input, ..Default::default() }.encode()])
+                .unwrap();
+        }
+        drop(conn);
+        let calls = read_calls(&path, "conv", crate::call::CLI).unwrap();
+        assert_eq!(calls.iter().map(|c| c.tokens.input).collect::<Vec<_>>(), vec![7, 9]);
         let _ = fs::remove_dir_all(&dir);
     }
 
