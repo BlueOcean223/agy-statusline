@@ -399,7 +399,7 @@ impl Engine {
         self.last_error = self.tick_errors.first().cloned();
 
         if self.evict_at.is_none_or(|t| t.elapsed() >= EVICT_EVERY) {
-            self.evict(&f.keep);
+            self.evict(&f.keep, now);
             self.evict_at = Some(now);
         }
     }
@@ -408,7 +408,8 @@ impl Engine {
     /// been used for a while; they are re-read (cheaply, from the language_server or their
     /// database) if they come back. Today's cost is unaffected: those conversations are kept, and
     /// earlier days live in the persisted usage history.
-    fn evict(&mut self, keep: &HashSet<String>) {
+    fn evict(&mut self, keep: &HashSet<String>, at: Instant) {
+        let idle = |t: &Instant| at.saturating_duration_since(*t) >= EVICT_IDLE;
         let now = now_ms();
         let today = today_str();
         if self.evict_day != today {
@@ -416,7 +417,7 @@ impl Engine {
             self.probed_hints.clear();
             self.evict_day = today;
         }
-        self.convs.retain(|id, c| keep.contains(id) || c.fetched_at.is_some_and(|t| t.elapsed() < EVICT_IDLE));
+        self.convs.retain(|id, c| keep.contains(id) || c.fetched_at.is_some_and(|t| !idle(&t)));
         let convs = &self.convs;
         let ls_loaded = &self.ls_loaded;
         self.summaries.retain(|id, _| ls_loaded.contains(id) || convs.contains_key(id));
@@ -424,10 +425,9 @@ impl Engine {
         self.sub_done.retain(|_, t| now - *t < EVICT_IDLE_MS);
         self.hooks.retain(|_, h| now - h.at_ms < EVICT_IDLE_MS);
         let sub_done = &self.sub_done;
-        self.sub_steps.retain(|id, c| {
-            keep.contains(id) || sub_done.contains_key(id) || c.fetched_at.is_some_and(|t| t.elapsed() < EVICT_IDLE)
-        });
-        self.git.retain(|_, (at, _)| at.elapsed() < EVICT_IDLE);
+        self.sub_steps
+            .retain(|id, c| keep.contains(id) || sub_done.contains_key(id) || c.fetched_at.is_some_and(|t| !idle(&t)));
+        self.git.retain(|_, (t, _)| !idle(t));
     }
 }
 
@@ -503,15 +503,16 @@ mod tests {
     #[test]
     fn database_reads_per_tick_are_capped_and_on_screen_conversations_go_first() {
         let mut e = engine();
-        let now = now_ms();
-        for n in 0..30 {
+        // Tomorrow is "today or later" even if local midnight passes while the test runs.
+        let now = now_ms() + 86_400_000;
+        for n in 0..DB_LOADS_PER_TICK + 6 {
             e.disk.insert(uuid(n), now);
         }
         for n in 100..103 {
             e.ls_loaded.insert(uuid(n));
             e.summaries.insert(uuid(n), Summary { modified_ms: now, ..Default::default() });
         }
-        let on_screen = uuid(29);
+        let on_screen = uuid(DB_LOADS_PER_TICK + 5); // sorts after every other database read
         let plan = e.plan_convs(&HashSet::from([on_screen.clone()]));
         let db: Vec<&str> = plan.convs.iter().filter(|r| matches!(r, ConvReq::Db { .. })).map(ConvReq::id).collect();
         assert_eq!(db.len(), DB_LOADS_PER_TICK);
@@ -533,6 +534,7 @@ mod tests {
         let first = e.plan_convs(&interest);
         assert!(ids(&first).contains(&on_disk));
         assert!(!ids(&first).contains(&missing), "no database or transcript: nothing to read");
+        assert!(e.probed_hints.contains(&missing), "a missing hint is not checked on disk again");
         let second = e.plan_convs(&interest);
         assert!(!ids(&second).contains(&on_disk));
     }
@@ -540,13 +542,15 @@ mod tests {
     #[test]
     fn eviction_keeps_wanted_conversations_and_drops_idle_ones() {
         let mut e = engine();
-        let long_ago = Instant::now().checked_sub(EVICT_IDLE + Duration::from_secs(60)).unwrap();
+        // Evict "later" rather than fetch "earlier": on Windows an `Instant` cannot predate boot.
+        let fetched = Instant::now();
+        let later = fetched + EVICT_IDLE + Duration::from_secs(60);
         let (kept, idle, recent) = (uuid(1), uuid(2), uuid(3));
-        for (id, at) in [(&kept, long_ago), (&idle, long_ago), (&recent, Instant::now())] {
+        for (id, at) in [(&kept, fetched), (&idle, fetched), (&recent, later)] {
             e.convs.insert(id.clone(), Conv { fetched_at: Some(at), ..Default::default() });
             e.summaries.insert(id.clone(), Summary::default());
         }
-        e.evict(&HashSet::from([kept.clone()]));
+        e.evict(&HashSet::from([kept.clone()]), later);
         assert!(e.convs.contains_key(&kept) && e.convs.contains_key(&recent));
         assert!(!e.convs.contains_key(&idle));
         assert!(!e.summaries.contains_key(&idle), "summaries go with their conversation");
