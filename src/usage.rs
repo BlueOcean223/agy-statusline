@@ -7,9 +7,10 @@
 //! - `quota-samples.json`: up to 8 days of periodic weekly quota snapshots for forecasting & replay.
 //! - `cli-index.json`: day index of `~/.gemini/antigravity-cli/conversations/*.db` files.
 
+use crate::call::{Call, DESKTOP, DedupSet, Tokens};
 use crate::cli_usage::{CliBackfillMeta, CliSnapshot, read_cli_titles};
 use crate::config::{ModelRule, ReadFile, any_price_cut_in, read_json_keep, write_atomic};
-use crate::convdb::{DbSig, signature};
+use crate::convdb::{DbSig, is_uuid_db, read_calls, signature};
 use crate::miss::{MissCallInput, MissInfo, MissSummary, miss_scan};
 pub use crate::quota::{
     CycleRecord, DayQuotaRec, QuotaBucketSample, QuotaSamplePoint, QuotaSamples, ResetEvent, note_cycle_end,
@@ -17,7 +18,6 @@ pub use crate::quota::{
 };
 use crate::transcript::{read_annotation, scan_step_markers};
 use chrono::{Local, TimeZone};
-use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -189,6 +189,10 @@ impl ModelAgg {
         self.cache_read += cr;
         self.cache_write += cw;
         self.output += out;
+    }
+
+    pub fn add_tokens(&mut self, t: &Tokens) {
+        self.add(t.input, t.cache_read, t.cache_write, t.output);
     }
 
     pub fn merge_from(&mut self, other: &ModelAgg) {
@@ -532,233 +536,13 @@ pub fn update_today(
     (hist_dirty, samp_dirty)
 }
 
-// ---------------------------------------------------------------- lightweight protobuf reader
-
-pub(crate) enum PbVal<'a> {
-    Varint(u64),
-    Bytes(&'a [u8]),
-}
-
-fn read_varint(buf: &[u8], i: &mut usize) -> Option<u64> {
-    let mut x = 0u64;
-    let mut shift = 0u32;
-    while *i < buf.len() {
-        let c = buf[*i];
-        *i += 1;
-        if shift < 64 {
-            x |= ((c & 0x7f) as u64) << shift;
-        }
-        if c & 0x80 == 0 {
-            return Some(x);
-        }
-        shift += 7;
-    }
-    None
-}
-
-pub(crate) fn pb_get(buf: &[u8], target: u64) -> Option<PbVal<'_>> {
-    let mut i = 0usize;
-    while i < buf.len() {
-        let key = read_varint(buf, &mut i)?;
-        let field = key >> 3;
-        let wt = key & 7;
-        if field == 0 {
-            return None;
-        }
-        match wt {
-            0 => {
-                let v = read_varint(buf, &mut i)?;
-                if field == target {
-                    return Some(PbVal::Varint(v));
-                }
-            }
-            2 => {
-                let len = read_varint(buf, &mut i)? as usize;
-                let end = i.checked_add(len)?;
-                if end > buf.len() {
-                    return None;
-                }
-                let slice = &buf[i..end];
-                i = end;
-                if field == target {
-                    return Some(PbVal::Bytes(slice));
-                }
-            }
-            1 => {
-                i = i.checked_add(8)?;
-                if i > buf.len() {
-                    return None;
-                }
-            }
-            5 => {
-                i = i.checked_add(4)?;
-                if i > buf.len() {
-                    return None;
-                }
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
-pub(crate) fn pb_bytes(buf: &[u8], field: u64) -> Option<&[u8]> {
-    match pb_get(buf, field)? {
-        PbVal::Bytes(b) => Some(b),
-        _ => None,
-    }
-}
-
-pub(crate) fn pb_u64(buf: &[u8], field: u64) -> Option<u64> {
-    match pb_get(buf, field)? {
-        PbVal::Varint(v) => Some(v),
-        _ => None,
-    }
-}
-
-pub(crate) fn pb_duration_ms(buf: &[u8]) -> Option<f64> {
-    let sec = pb_u64(buf, 1).unwrap_or(0) as f64;
-    let nanos = pb_u64(buf, 2).unwrap_or(0) as f64;
-    let ms = sec * 1000.0 + nanos / 1_000_000.0;
-    (ms > 0.0).then_some(ms)
-}
-
-pub(crate) fn pb_varints(buf: &[u8]) -> Vec<u64> {
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < buf.len() {
-        let Some(v) = read_varint(buf, &mut i) else { break };
-        out.push(v);
-    }
-    out
-}
-
 // ---------------------------------------------------------------- SQLite backfill & call collection
 
-#[derive(Clone, Debug)]
-pub struct CallRecord {
-    pub conv_id: String,
-    pub at_ms: i64,
-    pub step: Option<u64>,
-    pub model_raw: String,
-    pub model_display: String,
-    pub input: u64,
-    pub cache_read: u64,
-    pub cache_write: u64,
-    pub output: u64,
-    pub ttft_ms: Option<f64>,
-    pub stream_ms: Option<f64>,
-    pub dedup_key: String,
-    /// `"desktop"` or `"cli"`.
-    pub source: &'static str,
-}
-
-pub fn read_conv_db(path: &Path, conv_id: &str, source: &'static str) -> Result<Vec<CallRecord>, String> {
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    let conn = Connection::open_with_flags(path, flags).map_err(|e| e.to_string())?;
-    let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
-
-    let mut step_at: HashMap<u64, i64> = HashMap::new();
-    let mut exec_first: HashMap<String, i64> = HashMap::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT idx, metadata FROM steps")
-        && let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))
-    {
-        for row in rows.flatten() {
-            let (idx, Some(meta)) = row else { continue };
-            let sec = pb_bytes(&meta, 1).and_then(|ts| pb_u64(ts, 1)).unwrap_or(0);
-            if sec == 0 {
-                continue;
-            }
-            let ms = (sec as i64) * 1000;
-            if idx >= 0 {
-                step_at.insert(idx as u64, ms);
-            }
-            if let Some(ex) = pb_bytes(&meta, 12)
-                && let Ok(ex_str) = std::str::from_utf8(ex)
-            {
-                exec_first.entry(ex_str.to_string()).or_insert(ms);
-            }
-        }
-    }
-
-    let mut out = Vec::new();
-    let mut stmt = conn.prepare("SELECT data FROM gen_metadata").map_err(|e| e.to_string())?;
-    let rows = stmt.query_map([], |r| r.get::<_, Option<Vec<u8>>>(0)).map_err(|e| e.to_string())?;
-    for row in rows.flatten() {
-        let Some(data) = row else { continue };
-        let Some(cm) = pb_bytes(&data, 1) else { continue };
-        let Some(u) = pb_bytes(cm, 4) else { continue };
-        let inp = pb_u64(u, 2).unwrap_or(0);
-        let cw = pb_u64(u, 4).unwrap_or(0);
-        let cr = pb_u64(u, 5).unwrap_or(0);
-        let out_tok =
-            pb_u64(u, 3).unwrap_or(0).max(pb_u64(u, 9).unwrap_or(0).saturating_add(pb_u64(u, 10).unwrap_or(0)));
-        if inp == 0 && cr == 0 && cw == 0 && out_tok == 0 {
-            continue;
-        }
-        let exec = pb_bytes(&data, 4).and_then(|b| std::str::from_utf8(b).ok()).unwrap_or("");
-        let step_indices = match pb_get(&data, 2) {
-            Some(PbVal::Bytes(b)) => pb_varints(b),
-            Some(PbVal::Varint(v)) => vec![v],
-            None => Vec::new(),
-        };
-        let at_ms = step_indices
-            .iter()
-            .find_map(|idx| step_at.get(idx).copied())
-            .or_else(|| exec_first.get(exec).copied())
-            .unwrap_or(0);
-        if at_ms <= 0 {
-            continue;
-        }
-        let dedup_key = pb_bytes(u, 11)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                if source == "cli" {
-                    format!("{conv_id}:{at_ms}:{inp}:{out_tok}")
-                } else {
-                    format!("{exec}:{inp}:{cr}:{out_tok}")
-                }
-            });
-
-        let model_raw = pb_bytes(cm, 19)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
-            .chars()
-            .take(64)
-            .collect::<String>();
-        let model_display = pb_bytes(cm, 21)
-            .and_then(|b| std::str::from_utf8(b).ok())
-            .unwrap_or("")
-            .chars()
-            .take(64)
-            .collect::<String>();
-        let ttft_ms = pb_bytes(cm, 11).and_then(pb_duration_ms);
-        let stream_ms = pb_bytes(cm, 12).and_then(pb_duration_ms);
-
-        out.push(CallRecord {
-            conv_id: conv_id.to_string(),
-            at_ms,
-            step: step_indices.first().copied(),
-            model_raw: if model_raw.is_empty() { model_display.clone() } else { model_raw },
-            model_display,
-            input: inp,
-            cache_read: cr,
-            cache_write: cw,
-            output: out_tok,
-            ttft_ms,
-            stream_ms,
-            dedup_key,
-            source,
-        });
-    }
-    Ok(out)
-}
-
-pub fn is_uuid_db(name: &str) -> Option<&str> {
-    let stem = name.strip_suffix(".db")?;
-    (stem.len() == 36 && stem.chars().all(|c| c.is_ascii_hexdigit() || c == '-')).then_some(stem)
+/// Calls of one conversation database that count toward usage: with tokens and a time.
+pub(crate) fn read_usage_calls(path: &Path, conv_id: &str, source: &'static str) -> Result<Vec<Call>, String> {
+    let mut calls = read_calls(path, conv_id, source)?;
+    calls.retain(|c| c.has_usage() && c.at_ms > 0);
+    Ok(calls)
 }
 
 /// Scans `<app_data>/conversations/*.db` once to backfill historical days prior to today.
@@ -776,33 +560,26 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
         return true;
     };
     let today = today_str();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = DedupSet::default();
     let mut acc: BTreeMap<String, (HashMap<String, ModelAgg>, HashSet<String>)> = BTreeMap::new();
     let (mut dbs, mut calls, mut errors) = (0usize, 0usize, 0usize);
 
     for entry in rd.flatten() {
         let fname = entry.file_name().to_string_lossy().to_string();
         let Some(cid) = is_uuid_db(&fname) else { continue };
-        match read_conv_db(&entry.path(), cid, "desktop") {
+        match read_usage_calls(&entry.path(), cid, DESKTOP) {
             Ok(recs) => {
                 dbs += 1;
                 for r in recs {
-                    if !seen.insert(r.dedup_key) {
+                    if !seen.insert(&r) {
                         continue;
                     }
                     let day = local_day_str(r.at_ms);
                     if day >= today {
                         continue;
                     }
-                    let model_key = if !r.model_raw.is_empty() {
-                        r.model_raw
-                    } else if !r.model_display.is_empty() {
-                        r.model_display
-                    } else {
-                        "unknown".to_string()
-                    };
                     let (raw, convs) = acc.entry(day).or_default();
-                    raw.entry(model_key).or_default().add(r.input, r.cache_read, r.cache_write, r.output);
+                    raw.entry(r.model.bucket_key()).or_default().add_tokens(&r.tokens);
                     convs.insert(r.conv_id);
                     calls += 1;
                 }
@@ -842,7 +619,7 @@ pub fn run_backfill(app_data: &Path, h: &mut UsageHistory, now_ms: i64) -> bool 
 
 /// Parsed conversation DBs keyed by path, reused while the DB's [`DbSig`] (mtime + length of
 /// `.db` and `.db-wal`) is unchanged. Any write to the DB or its WAL changes the signature, so a
-/// hit holds what `read_conv_db` would return now.
+/// hit holds what reading the DB would return now.
 ///
 /// Memory bound: each DB weighs its call-record count + 1, and the least recently used DBs are
 /// evicted once the total would exceed `MAX`; a single DB heavier than `MAX` is never cached.
@@ -924,7 +701,7 @@ impl<T, const MAX: usize> DbCache<T, MAX> {
 const DESKTOP_CACHE_MAX_RECORDS: usize = 100_000;
 
 struct DesktopDbCalls {
-    calls: Vec<CallRecord>,
+    calls: Vec<Call>,
     min_at: i64,
     max_at: i64,
 }
@@ -967,7 +744,7 @@ fn desktop_db_calls(db: &DesktopDb, sig: DbSig) -> Option<Arc<DesktopDbCalls>> {
     if hit.is_some() {
         return hit;
     }
-    let calls = read_conv_db(&db.path, &db.cid, "desktop").ok()?;
+    let calls = read_usage_calls(&db.path, &db.cid, DESKTOP).ok()?;
     let min_at = calls.iter().map(|c| c.at_ms).min().unwrap_or(i64::MAX);
     let max_at = calls.iter().map(|c| c.at_ms).max().unwrap_or(i64::MIN);
     let records = calls.len();
@@ -977,22 +754,12 @@ fn desktop_db_calls(db: &DesktopDb, sig: DbSig) -> Option<Arc<DesktopDbCalls>> {
 }
 
 /// Collects deduplicated desktop calls falling inside `[from_ms, to_ms)` from live memory + SQLite DBs.
-fn collect_desktop_calls_in_range(
-    dbs: &[DesktopDb],
-    from_ms: i64,
-    to_ms: i64,
-    live_calls: &[CallRecord],
-) -> Vec<CallRecord> {
+fn collect_desktop_calls_in_range(dbs: &[DesktopDb], from_ms: i64, to_ms: i64, live_calls: &[Call]) -> Vec<Call> {
     let mut merged = Vec::new();
-    let mut seen: HashSet<String> = HashSet::new();
+    let mut seen = DedupSet::default();
 
     for c in live_calls {
-        if c.at_ms < from_ms || c.at_ms >= to_ms {
-            continue;
-        }
-        let soft_key = format!("{}:{}:{}:{}", c.conv_id, c.at_ms / 1000, c.input, c.output);
-        if seen.insert(c.dedup_key.clone()) {
-            seen.insert(soft_key);
+        if c.at_ms >= from_ms && c.at_ms < to_ms && seen.insert(c) {
             merged.push(c.clone());
         }
     }
@@ -1009,11 +776,7 @@ fn collect_desktop_calls_in_range(
             continue;
         }
         for r in &recs.calls {
-            if r.at_ms < from_ms || r.at_ms >= to_ms {
-                continue;
-            }
-            let soft_key = format!("{}:{}:{}:{}", r.conv_id, r.at_ms / 1000, r.input, r.output);
-            if seen.insert(r.dedup_key.clone()) && seen.insert(soft_key) {
+            if r.at_ms >= from_ms && r.at_ms < to_ms && seen.insert(r) {
                 merged.push(r.clone());
             }
         }
@@ -1027,7 +790,7 @@ fn collect_desktop_calls_in_range(
 /// The desktop DB listing is taken once per request; parsed DBs come from `DESKTOP_DB_CACHE`.
 #[derive(Default)]
 struct DayCallCache {
-    days: HashMap<String, Vec<CallRecord>>,
+    days: HashMap<String, Vec<Call>>,
     desktop_dbs: Option<Vec<DesktopDb>>,
 }
 
@@ -1039,8 +802,8 @@ impl DayCallCache {
         plugin_data: &Path,
         cli: &mut CliSnapshot,
         date: &str,
-        live_calls: &[CallRecord],
-    ) -> &'a [CallRecord] {
+        live_calls: &[Call],
+    ) -> &'a [Call] {
         if !self.days.contains_key(date) {
             let dbs = self.desktop_dbs.get_or_insert_with(|| list_desktop_dbs(app_data));
             let calls = collect_all_day_calls(dbs, cli_dir, plugin_data, cli, date, live_calls);
@@ -1057,22 +820,21 @@ fn collect_all_day_calls(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     date: &str,
-    live_calls: &[CallRecord],
-) -> Vec<CallRecord> {
+    live_calls: &[Call],
+) -> Vec<Call> {
     let Some(start) = day_start_ms(date) else {
         return Vec::new();
     };
     // Add 26h buffer then filter by exact local_day_str to stay DST-safe.
-    let mut out: Vec<CallRecord> =
-        collect_desktop_calls_in_range(desktop_dbs, start, start + 26 * 3_600_000, live_calls)
-            .into_iter()
-            .filter(|c| local_day_str(c.at_ms) == date)
-            .collect();
+    let mut out: Vec<Call> = collect_desktop_calls_in_range(desktop_dbs, start, start + 26 * 3_600_000, live_calls)
+        .into_iter()
+        .filter(|c| local_day_str(c.at_ms) == date)
+        .collect();
     out.extend(cli.calls_for_day(cli_dir, plugin_data, date));
     out
 }
 
-type AnalyzedCall = (CallRecord, Option<String>, f64, Option<MissInfo>);
+type AnalyzedCall = (Call, Option<String>, f64, Option<MissInfo>);
 
 /// Runs per-conversation chronological `miss_scan` for `date`, seeding each active conversation
 /// with its previous-day calls so cross-midnight first cache misses are accurately detected,
@@ -1085,7 +847,7 @@ fn analyze_day_calls_with_miss(
     cli: &mut CliSnapshot,
     day_cache: &mut DayCallCache,
     date: &str,
-    live_calls: &[CallRecord],
+    live_calls: &[Call],
     rules: &[ModelRule],
     now_ms: i64,
 ) -> (Vec<AnalyzedCall>, MissSummary) {
@@ -1096,7 +858,7 @@ fn analyze_day_calls_with_miss(
     let active_convs: HashSet<(&'static str, String)> =
         target_calls.iter().map(|c| (c.source, c.conv_id.clone())).collect();
 
-    let mut by_conv: HashMap<(&'static str, String), Vec<CallRecord>> = HashMap::new();
+    let mut by_conv: HashMap<(&'static str, String), Vec<Call>> = HashMap::new();
     if let Some(prev_date) = prev_day_str(date) {
         let prev_calls = day_cache.get_or_load(app_data, cli_dir, plugin_data, cli, &prev_date, live_calls);
         for c in prev_calls {
@@ -1114,29 +876,29 @@ fn analyze_day_calls_with_miss(
     let mut summary = MissSummary::default();
 
     for ((src, cid), mut list) in by_conv {
-        list.sort_by_key(|c| (c.at_ms, c.step.unwrap_or(0)));
+        list.sort_by_key(|c| (c.at_ms, c.step().unwrap_or(0)));
         let markers = if src == "desktop" { scan_step_markers(app_data, &cid) } else { None };
         let mut inputs = Vec::with_capacity(list.len());
         let mut priced = Vec::with_capacity(list.len());
 
         for c in &list {
-            let price_key = format!("{} {}", c.model_raw, c.model_display);
+            let price_key = c.model.price_key();
             if let Some(r) = match_rule(rules, &price_key) {
                 let (p_in, p_cr, p_cw, p_out) = r.rates_at(c.at_ms, now_ms);
-                let usd = (c.input as f64 * p_in
-                    + c.cache_read as f64 * p_cr
-                    + c.cache_write as f64 * p_cw
-                    + c.output as f64 * p_out)
+                let usd = (c.tokens.input as f64 * p_in
+                    + c.tokens.cache_read as f64 * p_cr
+                    + c.tokens.cache_write as f64 * p_cw
+                    + c.tokens.output as f64 * p_out)
                     / 1e6;
                 inputs.push(MissCallInput {
                     at_ms: c.at_ms,
                     ttft_ms: c.ttft_ms,
                     stream_ms: c.stream_ms,
-                    step: c.step,
+                    step: c.step(),
                     model_name: Some(r.short_name.clone()),
-                    input: c.input,
-                    cache_read: c.cache_read,
-                    cache_write: c.cache_write,
+                    input: c.tokens.input,
+                    cache_read: c.tokens.cache_read,
+                    cache_write: c.tokens.cache_write,
                     p_in,
                     p_cache: p_cr,
                     p_cw,
@@ -1147,11 +909,11 @@ fn analyze_day_calls_with_miss(
                     at_ms: c.at_ms,
                     ttft_ms: c.ttft_ms,
                     stream_ms: c.stream_ms,
-                    step: c.step,
+                    step: c.step(),
                     model_name: None,
-                    input: c.input,
-                    cache_read: c.cache_read,
-                    cache_write: c.cache_write,
+                    input: c.tokens.input,
+                    cache_read: c.tokens.cache_read,
+                    cache_write: c.tokens.cache_write,
                     p_in: 0.0,
                     p_cache: 0.0,
                     p_cw: 0.0,
@@ -1189,7 +951,7 @@ fn cycle_spend(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     day_cache: &mut DayCallCache,
-    live_calls: &[CallRecord],
+    live_calls: &[Call],
     bucket_id: &str,
     from_ms: i64,
     to_ms: i64,
@@ -1216,14 +978,22 @@ fn cycle_spend(
         if !day_calls.is_empty() {
             any_exact_boundary = true;
             for c in day_calls.iter().filter(|c| c.at_ms >= from_ms && c.at_ms < to_ms) {
-                let price_key = format!("{} {}", c.model_raw, c.model_display);
+                let price_key = c.model.price_key();
                 if !model_belongs_to_group(&price_key, bucket_id) {
                     continue;
                 }
-                let (_, u) =
-                    price_tokens(rules, &price_key, c.input, c.cache_read, c.cache_write, c.output, c.at_ms, now_ms);
+                let (_, u) = price_tokens(
+                    rules,
+                    &price_key,
+                    c.tokens.input,
+                    c.tokens.cache_read,
+                    c.tokens.cache_write,
+                    c.tokens.output,
+                    c.at_ms,
+                    now_ms,
+                );
                 usd += u;
-                tokens += c.input + c.cache_read + c.cache_write + c.output;
+                tokens += c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output;
             }
         } else if let Some(drec) = h.days.get(bd) {
             let group_has_persisted = drec
@@ -1288,7 +1058,7 @@ pub fn build_usage_view(
     cli_dir: &Path,
     plugin_data: &Path,
     cli: &mut CliSnapshot,
-    live_calls: &[CallRecord],
+    live_calls: &[Call],
     rules: &[ModelRule],
     now_ms: i64,
     price_source: &str,
@@ -1374,21 +1144,21 @@ pub fn build_usage_view(
                 let mut exact_by_label: BTreeMap<String, (f64, ModelAgg)> = BTreeMap::new();
                 let mut exact_cli_calls = 0u64;
                 for c in exact_calls {
-                    let price_key = format!("{} {}", c.model_raw, c.model_display);
+                    let price_key = c.model.price_key();
                     let (short_opt, usd) = price_tokens(
                         rules,
                         &price_key,
-                        c.input,
-                        c.cache_read,
-                        c.cache_write,
-                        c.output,
+                        c.tokens.input,
+                        c.tokens.cache_read,
+                        c.tokens.cache_write,
+                        c.tokens.output,
                         c.at_ms,
                         now_ms,
                     );
                     let label = short_opt.unwrap_or_else(|| "Other".to_string());
                     let entry = exact_by_label.entry(label).or_default();
                     entry.0 += usd;
-                    entry.1.add(c.input, c.cache_read, c.cache_write, c.output);
+                    entry.1.add(c.tokens.input, c.tokens.cache_read, c.tokens.cache_write, c.tokens.output);
                     if c.source == "cli" {
                         exact_cli_calls += 1;
                     }
@@ -1613,7 +1383,7 @@ fn weekly_forecasts(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     day_cache: &mut DayCallCache,
-    live_calls: &[CallRecord],
+    live_calls: &[Call],
     rules: &[ModelRule],
     now_ms: i64,
 ) -> Vec<Value> {
@@ -1760,7 +1530,7 @@ pub fn build_day_calls_view(
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     date: &str,
-    live_calls: &[CallRecord],
+    live_calls: &[Call],
     rules: &[ModelRule],
     now_ms: i64,
     costly_threshold: f64,
@@ -1814,10 +1584,10 @@ pub fn build_day_calls_view(
 
     for (idx, (c, short_opt, usd, miss_opt)) in analyzed.into_iter().enumerate() {
         tot_usd += usd;
-        tot_in += c.input;
-        tot_cr += c.cache_read;
-        tot_cw += c.cache_write;
-        tot_out += c.output;
+        tot_in += c.tokens.input;
+        tot_cr += c.tokens.cache_read;
+        tot_cw += c.tokens.cache_write;
+        tot_out += c.tokens.output;
         if c.source == "cli" {
             cli_count += 1;
         } else {
@@ -1839,8 +1609,8 @@ pub fn build_day_calls_view(
             .clone();
 
         let model_label = short_opt
-            .or_else(|| (!c.model_display.is_empty()).then_some(c.model_display.clone()))
-            .unwrap_or_else(|| c.model_raw.clone());
+            .or_else(|| (!c.model.display.is_empty()).then_some(c.model.display.clone()))
+            .unwrap_or_else(|| c.model.raw.clone());
         *model_usd.entry(model_label.clone()).or_default() += usd;
 
         // Per-conversation rollup across ALL calls of the day.
@@ -1853,10 +1623,10 @@ pub fn build_day_calls_view(
         });
         ce.calls += 1;
         ce.usd += usd;
-        ce.inp += c.input;
-        ce.cr += c.cache_read;
-        ce.cw += c.cache_write;
-        ce.out += c.output;
+        ce.inp += c.tokens.input;
+        ce.cr += c.tokens.cache_read;
+        ce.cw += c.tokens.cache_write;
+        ce.out += c.tokens.output;
         ce.first_at = ce.first_at.min(c.at_ms);
         ce.last_at = ce.last_at.max(c.at_ms);
         *ce.models.entry(model_label.clone()).or_default() += usd;
@@ -1869,9 +1639,13 @@ pub fn build_day_calls_view(
             continue;
         }
 
-        let hit =
-            if c.cache_read + c.input > 0 { Some(c.cache_read as f64 / (c.cache_read + c.input) as f64) } else { None };
-        let tps = c.stream_ms.filter(|&ms| ms > 50.0 && c.output > 0).map(|ms| c.output as f64 / (ms / 1000.0));
+        let hit = if c.tokens.cache_read + c.tokens.input > 0 {
+            Some(c.tokens.cache_read as f64 / (c.tokens.cache_read + c.tokens.input) as f64)
+        } else {
+            None
+        };
+        let tps =
+            c.stream_ms.filter(|&ms| ms > 50.0 && c.tokens.output > 0).map(|ms| c.tokens.output as f64 / (ms / 1000.0));
         let costly = costly_threshold > 0.0 && usd >= costly_threshold;
 
         rows.push(json!({
@@ -1882,10 +1656,10 @@ pub fn build_day_calls_view(
             "model": model_label,
             "usd": r6(usd),
             "costly": costly,
-            "in": c.input,
-            "cr": c.cache_read,
-            "cw": c.cache_write,
-            "out": c.output,
+            "in": c.tokens.input,
+            "cr": c.tokens.cache_read,
+            "cw": c.tokens.cache_write,
+            "out": c.tokens.output,
             "hit": hit,
             "ttftMs": c.ttft_ms,
             "streamMs": c.stream_ms,
@@ -1963,6 +1737,7 @@ pub fn build_day_calls_view(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::call::ModelId;
 
     #[test]
     fn masks_emails_and_hashes_deterministically() {
@@ -1988,57 +1763,46 @@ mod tests {
     }
 
     #[test]
-    fn read_conv_db_parses_protobuf_and_handles_cli_dedup() {
+    fn usage_calls_keep_dated_rows_with_tokens() {
+        use crate::convdb::fixture::{Gen, Step, write_db};
         let dir = std::env::temp_dir().join(format!("agy-pb-db-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         let cid = "00000000-0000-4000-8000-000000000001";
         let db_path = dir.join(format!("{cid}.db"));
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
-        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
-
-        fn varint(mut n: u64) -> Vec<u8> {
-            let mut b = Vec::new();
-            loop {
-                let mut c = (n & 0x7f) as u8;
-                n >>= 7;
-                if n != 0 {
-                    c |= 0x80;
-                }
-                b.push(c);
-                if n == 0 {
-                    break;
-                }
-            }
-            b
-        }
-        fn fv(f: u64, n: u64) -> Vec<u8> {
-            [varint(f << 3), varint(n)].concat()
-        }
-        fn fb(f: u64, data: &[u8]) -> Vec<u8> {
-            [varint((f << 3) | 2), varint(data.len() as u64), data.to_vec()].concat()
-        }
-
         let t1 = 1_795_500_000u64;
-        let meta1 = [fb(1, &fv(1, t1)), fb(12, b"exec-a")].concat();
-        conn.execute("INSERT INTO steps VALUES (2, ?1)", [&meta1]).unwrap();
+        write_db(
+            &db_path,
+            &[Step { idx: 2, at_s: t1, exec: "exec-a" }],
+            &[
+                Gen {
+                    input: 1000,
+                    output: 50,
+                    cache_read: 9000,
+                    thinking_output: 40,
+                    response_output: 30,
+                    response_id: "req-1",
+                    raw: "gemini-4-neon",
+                    display: "Gemini 4 Neon",
+                    steps: vec![2],
+                    exec: "exec-a",
+                    ttft: Some((1, 250_000_000)),
+                    stream: Some((8, 500_000_000)),
+                    ..Default::default()
+                },
+                // No tokens, and no time: neither counts toward usage.
+                Gen { no_usage: true, steps: vec![2], ..Default::default() },
+                Gen { input: 5, steps: vec![7], ..Default::default() },
+            ],
+            None,
+        );
 
-        let usage = [fv(2, 1000), fv(3, 50), fv(5, 9000), fv(9, 40), fv(10, 30), fb(11, b"req-1")].concat();
-        let dur1 = [fv(1, 1), fv(2, 250_000_000)].concat();
-        let dur2 = [fv(1, 8), fv(2, 500_000_000)].concat();
-        let cm =
-            [fb(4, &usage), fb(11, &dur1), fb(12, &dur2), fb(19, b"gemini-4-neon"), fb(21, b"Gemini 4 Neon")].concat();
-        let gen_row = [fb(1, &cm), fb(2, &varint(2)), fb(4, b"exec-a")].concat();
-        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&gen_row]).unwrap();
-        drop(conn);
-
-        let calls = read_conv_db(&db_path, cid, "cli").unwrap();
+        let calls = read_usage_calls(&db_path, cid, crate::call::CLI).unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].at_ms, (t1 as i64) * 1000);
-        assert_eq!(calls[0].step, Some(2));
-        assert_eq!(calls[0].output, 70);
-        assert_eq!(calls[0].dedup_key, "req-1");
+        assert_eq!(calls[0].step(), Some(2));
+        assert_eq!(calls[0].tokens.output, 70);
+        assert_eq!(calls[0].response_id.as_deref(), Some("req-1"));
         assert_eq!(calls[0].source, "cli");
         assert!((calls[0].ttft_ms.unwrap() - 1250.0).abs() < 1.0);
         assert!((calls[0].stream_ms.unwrap() - 8500.0).abs() < 1.0);
@@ -2091,20 +1855,15 @@ mod tests {
         );
         h.days.insert(today.clone(), day_rec);
 
-        let live = vec![CallRecord {
+        let live = vec![Call {
             conv_id: "00000000-0000-4000-8000-000000000001".into(),
-            at_ms: cut_ms + 3_600_000, // post-cut: $4/M → $0.20 for 50k tokens
-            step: Some(1),
-            model_raw: "gemini-4-carbon".into(),
-            model_display: "Gemini 4 Carbon".into(),
-            input: 50_000,
-            cache_read: 0,
-            cache_write: 0,
-            output: 0,
-            ttft_ms: None,
-            stream_ms: None,
-            dedup_key: "req-post".into(),
             source: "desktop",
+            at_ms: cut_ms + 3_600_000, // post-cut: $4/M → $0.20 for 50k tokens
+            steps: vec![1],
+            model: ModelId::new("gemini-4-carbon", "Gemini 4 Carbon"),
+            tokens: Tokens { input: 50_000, cache_read: 0, cache_write: 0, output: 0 },
+            response_id: Some("req-post".into()),
+            ..Default::default()
         }];
 
         let mut cli = CliSnapshot::default();
@@ -2141,35 +1900,29 @@ mod tests {
         let conv_id = "00000000-0000-4000-8000-0000000000aa";
 
         let live = vec![
-            CallRecord {
+            Call {
                 conv_id: conv_id.into(),
+                source: "desktop",
                 at_ms: midnight - 300_000, // 23:55 yesterday
-                step: Some(1),
-                model_raw: "gemini-4-neon".into(),
-                model_display: "Gemini 4 Neon".into(),
-                input: 50_000,
-                cache_read: 0,
-                cache_write: 0,
-                output: 100,
+                steps: vec![1],
+                model: ModelId::new("gemini-4-neon", "Gemini 4 Neon"),
+                tokens: Tokens { input: 50_000, cache_read: 0, cache_write: 0, output: 100 },
                 ttft_ms: Some(1000.0),
                 stream_ms: Some(2000.0),
-                dedup_key: "req-prev".into(),
-                source: "desktop",
+                response_id: Some("req-prev".into()),
+                ..Default::default()
             },
-            CallRecord {
+            Call {
                 conv_id: conv_id.into(),
+                source: "desktop",
                 at_ms: midnight + 300_000, // 00:05 today (10 min later, 0 cache read)
-                step: Some(2),
-                model_raw: "gemini-4-neon".into(),
-                model_display: "Gemini 4 Neon".into(),
-                input: 50_000,
-                cache_read: 0,
-                cache_write: 0,
-                output: 100,
+                steps: vec![2],
+                model: ModelId::new("gemini-4-neon", "Gemini 4 Neon"),
+                tokens: Tokens { input: 50_000, cache_read: 0, cache_write: 0, output: 100 },
                 ttft_ms: Some(1000.0),
                 stream_ms: Some(2000.0),
-                dedup_key: "req-today".into(),
-                source: "desktop",
+                response_id: Some("req-today".into()),
+                ..Default::default()
             },
         ];
 
@@ -2212,28 +1965,7 @@ mod tests {
 
     #[test]
     fn desktop_db_cache_reuses_calls_until_signature_changes() {
-        fn varint(mut n: u64) -> Vec<u8> {
-            let mut b = Vec::new();
-            loop {
-                let mut c = (n & 0x7f) as u8;
-                n >>= 7;
-                if n != 0 {
-                    c |= 0x80;
-                }
-                b.push(c);
-                if n == 0 {
-                    break;
-                }
-            }
-            b
-        }
-        fn fv(f: u64, n: u64) -> Vec<u8> {
-            [varint(f << 3), varint(n)].concat()
-        }
-        fn fb(f: u64, data: &[u8]) -> Vec<u8> {
-            [varint((f << 3) | 2), varint(data.len() as u64), data.to_vec()].concat()
-        }
-
+        use crate::convdb::fixture::{Gen, Step, write_db};
         let root = std::env::temp_dir().join(format!("agy-desk-cache-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(root.join("conversations")).unwrap();
@@ -2241,13 +1973,15 @@ mod tests {
         let db_path = root.join("conversations").join(format!("{cid}.db"));
         let today = today_str();
         let at_s = (crate::live::now_ms() / 1000) as u64;
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute("CREATE TABLE steps (idx INTEGER, metadata BLOB)", []).unwrap();
-        conn.execute("CREATE TABLE gen_metadata (data BLOB)", []).unwrap();
-        conn.execute("INSERT INTO steps VALUES (1, ?1)", [&fb(1, &fv(1, at_s))]).unwrap();
-        let cm = [fb(4, &[fv(2, 1000), fv(3, 20), fb(11, b"req-cache")].concat()), fb(19, b"gemini-4-neon")].concat();
-        conn.execute("INSERT INTO gen_metadata VALUES (?1)", [&[fb(1, &cm), fb(2, &varint(1))].concat()]).unwrap();
-        drop(conn);
+        let row = Gen {
+            input: 1000,
+            output: 20,
+            response_id: "req-cache",
+            raw: "gemini-4-neon",
+            steps: vec![1],
+            ..Default::default()
+        };
+        write_db(&db_path, &[Step { idx: 1, at_s, exec: "" }], &[row], None);
 
         let day_calls = || {
             let mut cli = CliSnapshot::default();
@@ -2263,7 +1997,7 @@ mod tests {
         fs::File::options().write(true).open(&db_path).unwrap().set_modified(meta.modified().unwrap()).unwrap();
         let calls = day_calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].dedup_key, "req-cache");
+        assert_eq!(calls[0].response_id.as_deref(), Some("req-cache"));
 
         // A length change invalidates the entry; the garbage file then yields no calls.
         fs::write(&db_path, vec![0u8; meta.len() as usize + 1]).unwrap();
@@ -2310,20 +2044,15 @@ mod tests {
         );
         h.days.insert(start_day.into(), s_rec);
 
-        let live = vec![CallRecord {
+        let live = vec![Call {
             conv_id: "00000000-0000-4000-8000-0000000000bb".into(),
-            at_ms: to_ms - 60_000,
-            step: Some(1),
-            model_raw: "gemini-4-neon".into(),
-            model_display: "Gemini 4 Neon".into(),
-            input: 100_000,
-            cache_read: 0,
-            cache_write: 0,
-            output: 0,
-            ttft_ms: None,
-            stream_ms: None,
-            dedup_key: "req-end".into(),
             source: "desktop",
+            at_ms: to_ms - 60_000,
+            steps: vec![1],
+            model: ModelId::new("gemini-4-neon", "Gemini 4 Neon"),
+            tokens: Tokens { input: 100_000, cache_read: 0, cache_write: 0, output: 0 },
+            response_id: Some("req-end".into()),
+            ..Default::default()
         }];
 
         let mut cli = CliSnapshot::default();

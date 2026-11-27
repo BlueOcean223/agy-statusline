@@ -1,3 +1,4 @@
+mod call;
 mod cdp;
 mod cli_usage;
 mod config;

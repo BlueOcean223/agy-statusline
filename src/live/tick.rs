@@ -390,7 +390,7 @@ impl Engine {
             .convs
             .iter()
             .filter(|(_, c)| c.changed_at.is_some_and(|t| t.elapsed() < RESYNC_WINDOW))
-            .filter(|(_, c)| c.calls.iter().any(|call| call.has_usage && (!call.dated || call.label.is_none())))
+            .filter(|(_, c)| c.calls.iter().any(|call| call.has_usage() && (!call.dated || call.label.is_none())))
             .map(|(id, _)| id.clone())
             .collect();
         for id in sync_ids {
