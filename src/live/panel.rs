@@ -4,7 +4,6 @@ use super::{Engine, LiveCall, now_ms};
 use crate::config::{Config, OnlinePrices};
 use crate::miss::MissSummary;
 use crate::pricing::Pricer;
-use crate::transcript::read_annotation;
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
@@ -251,11 +250,9 @@ impl Engine {
     }
 
     fn title(&self, id: &str) -> String {
-        let t = match self.annotations.get(id) {
-            Some((_, a)) => a.title.clone(),
-            // Created since the last annotation scan.
-            None => read_annotation(&self.app_data, id).map(|a| a.title).unwrap_or_default(),
-        };
+        // From the engine's annotation scan (every 10s, off-lock): a conversation created since
+        // then shows its fallback name until the next scan.
+        let t = self.annotations.get(id).map(|(_, a)| a.title.clone()).unwrap_or_default();
         if !t.is_empty() {
             return t;
         }

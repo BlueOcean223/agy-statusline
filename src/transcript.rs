@@ -24,10 +24,12 @@ pub struct StepInfo {
     pub label: Option<String>,
 }
 
+/// The part of a conversation's transcript read so far. Reading happens without it (see
+/// [`read_since`]), so the engine can read with its lock released and merge the result after.
 #[derive(Default)]
 pub struct Transcript {
-    path: PathBuf,
     offset: u64,
+    mtime_ms: i64,
     pub steps: HashMap<u64, StepInfo>,
     pub markers: StepMarkers,
     /// Candidate subagent conversation ids seen in this transcript (used only as load hints;
@@ -35,62 +37,112 @@ pub struct Transcript {
     pub subagent_hints: HashSet<String>,
 }
 
-impl Transcript {
-    pub fn new(app_data: &Path, id: &str) -> Self {
-        Self {
-            path: app_data.join("brain").join(id).join(".system_generated/logs/transcript.jsonl"),
-            ..Default::default()
+/// Lines appended to a transcript after a byte offset, read by [`read_since`].
+#[derive(Debug, Default)]
+pub struct TranscriptChunk {
+    /// The offset the read started from, as passed to [`read_since`].
+    from: u64,
+    /// The file was rewritten (shorter than `from`), so this was parsed from the start.
+    reset: bool,
+    /// Offset after the last complete line read.
+    end: u64,
+    steps: HashMap<u64, StepInfo>,
+    markers: StepMarkers,
+    subagent_hints: HashSet<String>,
+    /// Modification time of the file when read (0 if missing).
+    mtime_ms: i64,
+}
+
+pub fn transcript_path(app_data: &Path, id: &str) -> PathBuf {
+    app_data.join("brain").join(id).join(".system_generated/logs/transcript.jsonl")
+}
+
+/// Reads the complete lines appended to `id`'s transcript after byte `from` (a partially written
+/// last line is left for the next read).
+pub fn read_since(app_data: &Path, id: &str, from: u64) -> TranscriptChunk {
+    let mut chunk = TranscriptChunk { from, end: from, ..Default::default() };
+    let Ok(mut f) = File::open(transcript_path(app_data, id)) else { return chunk };
+    let Ok(md) = f.metadata() else { return chunk };
+    chunk.mtime_ms = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let len = md.len();
+    let start = if len < from {
+        chunk.reset = true;
+        chunk.end = 0;
+        0
+    } else {
+        from
+    };
+    if len == start || f.seek(SeekFrom::Start(start)).is_err() {
+        return chunk;
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    if f.read_to_end(&mut buf).is_err() {
+        return chunk;
+    }
+    let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return chunk };
+    for line in buf[..end].split(|&b| b == b'\n') {
+        let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
+        let Some(idx) = v["step_index"].as_u64() else { continue };
+        let kind = v["type"].as_str().unwrap_or("");
+        if kind == "USER_INPUT" {
+            chunk.markers.user.insert(idx);
+        } else if kind == "CHECKPOINT" {
+            chunk.markers.ckpt.insert(idx);
         }
+        let at_ms = v["created_at"].as_str().and_then(crate::live::parse_ts).unwrap_or(0);
+        let label = (kind == "PLANNER_RESPONSE").then(|| {
+            v["tool_calls"]
+                .as_array()
+                .and_then(|tcs| tcs.last())
+                .map(describe_tool_call)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "Final reply".into())
+        });
+        extract_subagent_hints(&v, &mut chunk.subagent_hints);
+        chunk.steps.insert(idx, StepInfo { at_ms, label });
+    }
+    chunk.end = start + end as u64 + 1;
+    chunk
+}
+
+impl Transcript {
+    /// Where the next [`read_since`] should start.
+    pub fn offset(&self) -> u64 {
+        self.offset
     }
 
+    /// The file's modification time at the last merged read.
     pub fn mtime_ms(&self) -> i64 {
-        file_mtime_ms(&self.path)
+        self.mtime_ms
     }
 
-    /// Reads lines appended since the last call. Returns true if anything new was parsed.
-    pub fn sync(&mut self) -> bool {
-        let Ok(mut f) = File::open(&self.path) else { return false };
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-        if len < self.offset {
-            // Rewritten from scratch.
+    /// Merges a chunk read from [`Transcript::offset`]. Returns `None`, merging nothing but the
+    /// file time, if another chunk was merged since that read was started (the read is stale);
+    /// otherwise whether any new line was parsed.
+    pub fn apply(&mut self, chunk: TranscriptChunk) -> Option<bool> {
+        self.mtime_ms = chunk.mtime_ms;
+        if chunk.from != self.offset {
+            return None;
+        }
+        if chunk.reset {
             self.offset = 0;
             self.steps.clear();
             self.markers.user.clear();
             self.markers.ckpt.clear();
             self.subagent_hints.clear();
         }
-        if len == self.offset || f.seek(SeekFrom::Start(self.offset)).is_err() {
-            return false;
-        }
-        let mut buf = Vec::with_capacity((len - self.offset) as usize);
-        if f.read_to_end(&mut buf).is_err() {
-            return false;
-        }
-        // Only consume complete lines; a partially written last line is read next time.
-        let Some(end) = buf.iter().rposition(|&b| b == b'\n') else { return false };
-        for line in buf[..end].split(|&b| b == b'\n') {
-            let Ok(v) = serde_json::from_slice::<Value>(line) else { continue };
-            let Some(idx) = v["step_index"].as_u64() else { continue };
-            let kind = v["type"].as_str().unwrap_or("");
-            if kind == "USER_INPUT" {
-                self.markers.user.insert(idx);
-            } else if kind == "CHECKPOINT" {
-                self.markers.ckpt.insert(idx);
-            }
-            let at_ms = v["created_at"].as_str().and_then(crate::live::parse_ts).unwrap_or(0);
-            let label = (kind == "PLANNER_RESPONSE").then(|| {
-                v["tool_calls"]
-                    .as_array()
-                    .and_then(|tcs| tcs.last())
-                    .map(describe_tool_call)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "Final reply".into())
-            });
-            extract_subagent_hints(&v, &mut self.subagent_hints);
-            self.steps.insert(idx, StepInfo { at_ms, label });
-        }
-        self.offset += end as u64 + 1;
-        true
+        let parsed_new = chunk.end != self.offset;
+        self.steps.extend(chunk.steps);
+        self.markers.user.extend(chunk.markers.user);
+        self.markers.ckpt.extend(chunk.markers.ckpt);
+        self.subagent_hints.extend(chunk.subagent_hints);
+        self.offset = chunk.end;
+        Some(parsed_new)
     }
 }
 
@@ -357,6 +409,93 @@ pub fn read_annotation(app_data: &Path, id: &str) -> Option<Annotation> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A throwaway app-data directory with one conversation's transcript.
+    struct Fixture {
+        dir: PathBuf,
+        id: &'static str,
+    }
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("agy-transcript-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            let f = Self { dir, id: "00000000-0000-4000-8000-000000000001" };
+            fs::create_dir_all(transcript_path(&f.dir, f.id).parent().unwrap()).unwrap();
+            f
+        }
+
+        fn write(&self, text: &str) {
+            fs::write(transcript_path(&self.dir, self.id), text).unwrap();
+        }
+
+        fn read(&self, t: &Transcript) -> TranscriptChunk {
+            read_since(&self.dir, self.id, t.offset())
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn line(step: u64, kind: &str) -> String {
+        format!("{}\n", json!({ "step_index": step, "type": kind, "created_at": "2026-11-27T01:00:00Z" }))
+    }
+
+    #[test]
+    fn reads_complete_lines_incrementally() {
+        let f = Fixture::new("incremental");
+        let mut t = Transcript::default();
+        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + r#"{"step_index": 3"#));
+        assert_eq!(t.apply(f.read(&t)), Some(true));
+        assert_eq!(t.steps.len(), 2, "the partial last line waits");
+        assert!(t.markers.user.contains(&1));
+        assert_eq!(t.steps[&2].label.as_deref(), Some("Final reply"));
+        assert!(t.mtime_ms() > 0);
+
+        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + &line(3, "CHECKPOINT")));
+        assert_eq!(t.apply(f.read(&t)), Some(true));
+        assert_eq!(t.steps.len(), 3);
+        assert!(t.markers.ckpt.contains(&3));
+        assert_eq!(t.apply(f.read(&t)), Some(false), "nothing new");
+    }
+
+    #[test]
+    fn a_rewritten_file_is_read_from_the_start() {
+        let f = Fixture::new("rewrite");
+        let mut t = Transcript::default();
+        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE") + &line(3, "PLANNER_RESPONSE")));
+        t.apply(f.read(&t));
+        f.write(&line(7, "USER_INPUT"));
+        assert_eq!(t.apply(f.read(&t)), Some(true));
+        assert_eq!(t.steps.keys().copied().collect::<Vec<_>>(), vec![7]);
+        assert!(!t.markers.user.contains(&1));
+    }
+
+    #[test]
+    fn a_read_started_before_another_merge_is_stale() {
+        let f = Fixture::new("stale");
+        let mut t = Transcript::default();
+        f.write(&line(1, "USER_INPUT"));
+        // Two reads from the same offset (the side panel and the engine loop).
+        let (first, second) = (f.read(&t), f.read(&t));
+        assert_eq!(t.apply(first), Some(true));
+        assert_eq!(t.apply(second), None);
+        f.write(&(line(1, "USER_INPUT") + &line(2, "PLANNER_RESPONSE")));
+        assert_eq!(t.apply(f.read(&t)), Some(true));
+        assert_eq!(t.steps.len(), 2, "nothing lost or read twice");
+    }
+
+    #[test]
+    fn a_missing_transcript_reads_as_nothing() {
+        let f = Fixture::new("missing");
+        let mut t = Transcript::default();
+        let chunk = read_since(&f.dir, "00000000-0000-4000-8000-000000000009", 0);
+        assert_eq!(t.apply(chunk), Some(false));
+        assert_eq!((t.offset(), t.mtime_ms()), (0, 0));
+    }
 
     #[test]
     fn extracts_subagent_hints_without_task_ids() {

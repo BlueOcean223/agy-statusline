@@ -1,10 +1,12 @@
-//! One engine step, split so the ENGINE lock is never held across language_server RPCs, SQLite
-//! reads, directory scans or git subprocesses (the side panel's HTTP handlers wait on that lock):
+//! One engine step, split so the ENGINE lock is never held across language_server RPCs, SQLite or
+//! transcript reads, directory scans or git subprocesses (the side panel's HTTP handlers wait on
+//! that lock):
 //!
 //! 1. `plan_status` (locked) → `StatusPlan::fetch` (unlocked) → `apply_status` (locked):
 //!    trajectory summaries, quota, account, `brain/` scan, annotation titles.
 //! 2. `plan_convs` (locked) → `ConvPlan::fetch` (unlocked) → `apply_convs` (locked):
-//!    generator records, visible subagents' steps, git status, then eviction.
+//!    generator records and the transcripts that date them, visible subagents' steps, git
+//!    status, then eviction.
 //!
 //! The second plan depends on the first apply (new summaries decide what is stale).
 
@@ -72,6 +74,8 @@ pub(super) struct ConvPlan {
     app_data: PathBuf,
     convs: Vec<ConvReq>,
     subs: Vec<SubReq>,
+    /// Transcripts to read, each from the offset its conversation has read up to.
+    transcripts: Vec<(String, u64)>,
     git: Vec<String>,
     /// Kept for `apply_convs`: what the bar/panel shows and what today's cost needs. `None` for a
     /// side-panel load, which only adds conversations: it neither evicts nor reports errors.
@@ -81,6 +85,7 @@ pub(super) struct ConvPlan {
 pub(super) struct ConvFetched {
     convs: Vec<(ConvReq, Result<ConvData, String>)>,
     subs: Vec<(SubReq, Option<Value>)>,
+    transcripts: Vec<(String, TranscriptChunk)>,
     git: Vec<(String, Option<GitInfo>)>,
     keep: Option<HashSet<String>>,
 }
@@ -103,6 +108,15 @@ impl ConvPlan {
                 (r, j.ok())
             })
             .collect();
+        // After the records, so the transcript has the steps those records refer to.
+        let transcripts = self
+            .transcripts
+            .into_iter()
+            .map(|(id, from)| {
+                let chunk = crate::transcript::read_since(&self.app_data, &id, from);
+                (id, chunk)
+            })
+            .collect();
         let git = self
             .git
             .into_iter()
@@ -111,7 +125,7 @@ impl ConvPlan {
                 (p, info)
             })
             .collect();
-        ConvFetched { convs, subs, git, keep: self.keep }
+        ConvFetched { convs, subs, transcripts, git, keep: self.keep }
     }
 }
 
@@ -336,7 +350,16 @@ impl Engine {
 
         let mut keep = want;
         keep.extend(visible);
-        ConvPlan { ls: self.ls.clone(), app_data: self.app_data.clone(), convs, subs, git, keep: Some(keep) }
+        let transcripts = self.plan_transcripts(&convs, true);
+        ConvPlan {
+            ls: self.ls.clone(),
+            app_data: self.app_data.clone(),
+            convs,
+            subs,
+            transcripts,
+            git,
+            keep: Some(keep),
+        }
     }
 
     /// Plans reading what the side panel needs for `id` and does not have yet: the conversation,
@@ -369,15 +392,46 @@ impl Engine {
         queued.extend(tried.iter().cloned());
         self.plan_hints(&seeds, &mut queued, &mut db_budget, &mut convs);
         tried.extend(convs.iter().map(|r| r.id().to_string()));
-        let ls = self.ls.clone();
-        (!convs.is_empty()).then(|| ConvPlan {
-            ls,
+        if convs.is_empty() {
+            return None;
+        }
+        let transcripts = self.plan_transcripts(&convs, false);
+        Some(ConvPlan {
+            ls: self.ls.clone(),
             app_data: self.app_data.clone(),
             convs,
             subs: Vec::new(),
+            transcripts,
             git: Vec::new(),
             keep: None,
         })
+    }
+
+    /// The transcripts to read alongside `convs`: theirs, and with `resync` those of recently
+    /// changed conversations that still have undated or unlabeled calls. Late-flushed
+    /// transcript.jsonl entries are picked up that way without an LS RPC, only for a while: some
+    /// records never get a label, and re-reading every transcript every second is costly with
+    /// many subagents.
+    fn plan_transcripts(&self, convs: &[ConvReq], resync: bool) -> Vec<(String, u64)> {
+        let mut ids: Vec<&str> = convs.iter().map(ConvReq::id).collect();
+        if resync {
+            let mut late: Vec<&str> = self
+                .convs
+                .iter()
+                .filter(|(_, c)| c.changed_at.is_some_and(|t| t.elapsed() < RESYNC_WINDOW))
+                .filter(|(_, c)| c.calls.iter().any(|call| call.has_usage() && (!call.dated || call.label.is_none())))
+                .map(|(id, _)| id.as_str())
+                .filter(|id| !ids.contains(id))
+                .collect();
+            late.sort();
+            ids.extend(late);
+        }
+        ids.into_iter()
+            .map(|id| {
+                let from = self.convs.get(id).and_then(|c| c.transcript.as_ref()).map_or(0, Transcript::offset);
+                (id.to_string(), from)
+            })
+            .collect()
     }
 
     /// Queues historical subagents named in the transcripts of `seeds`, each probed once (see
@@ -401,13 +455,15 @@ impl Engine {
             if *db_budget == 0 {
                 break;
             }
-            if self.convs.contains_key(&sid) || queued.contains(&sid) || self.probed_hints.contains(&sid) {
+            // Not on disk (as of the last `brain/` scan): nothing to read yet, ask again later.
+            if self.convs.contains_key(&sid)
+                || queued.contains(&sid)
+                || self.probed_hints.contains(&sid)
+                || !self.disk.contains_key(&sid)
+            {
                 continue;
             }
             self.probed_hints.insert(sid.clone());
-            if !self.disk.contains_key(&sid) && !self.app_data.join("brain").join(&sid).is_dir() {
-                continue;
-            }
             let req = self.conv_req(&sid);
             if matches!(req, ConvReq::Db { .. }) {
                 *db_budget -= 1;
@@ -419,13 +475,14 @@ impl Engine {
 
     pub(super) fn apply_convs(&mut self, f: ConvFetched) {
         let now = Instant::now();
+        let mut changed: HashSet<String> = HashSet::new();
         for (req, res) in f.convs {
             let id = req.id().to_string();
             match res {
                 Ok(data) => match self.apply_conv(&req, data) {
                     Applied::Changed => {
                         self.dirty.remove(&id);
-                        self.sync_transcript(&id, true);
+                        changed.insert(id);
                     }
                     Applied::Unchanged => {
                         self.dirty.remove(&id);
@@ -448,24 +505,17 @@ impl Engine {
                 self.apply_sub_steps(&r.id, r.from, r.running, &j);
             }
         }
+        for (id, chunk) in f.transcripts {
+            let force = changed.remove(&id);
+            self.apply_transcript(&id, Some(chunk), force);
+        }
+        for id in changed {
+            self.apply_transcript(&id, None, true);
+        }
         for (path, info) in f.git {
             self.git.insert(path, (now, info));
         }
         let Some(keep) = f.keep else { return };
-
-        // Pick up late-flushed transcript.jsonl entries (timestamps/labels) without an LS RPC,
-        // only for conversations that changed recently: some records never get a label, and
-        // re-opening their transcripts every second forever is costly with many subagents.
-        let sync_ids: Vec<String> = self
-            .convs
-            .iter()
-            .filter(|(_, c)| c.changed_at.is_some_and(|t| t.elapsed() < RESYNC_WINDOW))
-            .filter(|(_, c)| c.calls.iter().any(|call| call.has_usage() && (!call.dated || call.label.is_none())))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in sync_ids {
-            self.sync_transcript(&id, false);
-        }
         self.last_error = self.tick_errors.first().cloned();
 
         if self.evict_at.is_none_or(|t| t.elapsed() >= EVICT_EVERY) {
@@ -483,7 +533,7 @@ impl Engine {
         let now = now_ms();
         let today = today_str();
         if self.evict_day != today {
-            // Lets yesterday's probed-but-missing subagent ids be tried again; bounds the set.
+            // Lets yesterday's probed subagent ids be tried again; bounds the set.
             self.probed_hints.clear();
             self.evict_day = today;
         }
@@ -527,7 +577,13 @@ mod tests {
     /// Merges fetched conversations, keeping every conversation so eviction stays out of the way.
     fn apply(e: &mut Engine, convs: Vec<(ConvReq, Result<ConvData, String>)>) {
         let keep = e.convs.keys().cloned().chain(convs.iter().map(|(r, _)| r.id().to_string())).collect();
-        e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep: Some(keep) });
+        e.apply_convs(ConvFetched {
+            convs,
+            subs: Vec::new(),
+            transcripts: Vec::new(),
+            git: Vec::new(),
+            keep: Some(keep),
+        });
     }
 
     #[test]
@@ -594,7 +650,7 @@ mod tests {
     fn transcript_subagent_hints_are_probed_once() {
         let mut e = engine();
         let (root, on_disk, missing) = (uuid(1), uuid(2), uuid(3));
-        let mut t = Transcript::new(&e.app_data, &root);
+        let mut t = Transcript::default();
         t.subagent_hints.extend([on_disk.clone(), missing.clone()]);
         e.convs.insert(root.clone(), Conv { loaded_once: true, transcript: Some(t), ..Default::default() });
         e.disk.insert(on_disk.clone(), 1); // an old subagent: not wanted for today's cost
@@ -603,10 +659,12 @@ mod tests {
         let ids = |p: &ConvPlan| p.convs.iter().map(|r| r.id().to_string()).collect::<Vec<_>>();
         let first = e.plan_convs(&interest);
         assert!(ids(&first).contains(&on_disk));
-        assert!(!ids(&first).contains(&missing), "no database or transcript: nothing to read");
-        assert!(e.probed_hints.contains(&missing), "a missing hint is not checked on disk again");
+        assert!(!ids(&first).contains(&missing), "not on disk: nothing to read");
         let second = e.plan_convs(&interest);
         assert!(!ids(&second).contains(&on_disk));
+        // It appears in the next `brain/` scan.
+        e.disk.insert(missing.clone(), 1);
+        assert!(ids(&e.plan_convs(&interest)).contains(&missing));
     }
 
     #[test]
@@ -640,7 +698,13 @@ mod tests {
         let Some(plan) = e.plan_load(id, tried) else { return Vec::new() };
         let ids: Vec<String> = plan.convs.iter().map(|r| r.id().to_string()).collect();
         let convs = plan.convs.into_iter().map(|r| (r.clone(), data(r.id()))).collect();
-        e.apply_convs(ConvFetched { convs, subs: Vec::new(), git: Vec::new(), keep: plan.keep });
+        e.apply_convs(ConvFetched {
+            convs,
+            subs: Vec::new(),
+            transcripts: Vec::new(),
+            git: Vec::new(),
+            keep: plan.keep,
+        });
         ids
     }
 
@@ -708,7 +772,7 @@ mod tests {
         assert_eq!(plan.convs.len(), DB_LOADS_PER_TICK, "root and tree members share one budget");
 
         let mut e = engine();
-        let mut t = Transcript::new(&e.app_data, &root);
+        let mut t = Transcript::default();
         t.subagent_hints.insert(hint.clone());
         e.convs.insert(root.clone(), Conv { loaded_once: true, transcript: Some(t), ..Default::default() });
         e.disk.insert(hint.clone(), 1);
@@ -764,5 +828,62 @@ mod tests {
         assert!(e.plan_convs(&interest).convs.is_empty(), "the database read backs off");
         e.apply_summaries(&json!({ "trajectorySummaries": { a.clone(): {} } }));
         assert!(matches!(e.plan_convs(&interest).convs.as_slice(), [ConvReq::Ls { .. }]));
+    }
+
+    #[test]
+    fn transcripts_are_read_with_their_conversations_and_late_ones_resynced() {
+        let mut e = engine();
+        let (fetched, late, settled) = (uuid(1), uuid(2), uuid(3));
+        e.ls_loaded.insert(fetched.clone());
+        let undated = LiveCall {
+            call: Call { tokens: Tokens { input: 1, ..Default::default() }, ..Default::default() },
+            ..Default::default()
+        };
+        for id in [&late, &settled] {
+            let calls = if id == &late { vec![undated.clone()] } else { Vec::new() };
+            e.convs.insert(
+                id.clone(),
+                Conv { loaded_once: true, changed_at: Some(Instant::now()), calls, ..Default::default() },
+            );
+        }
+        let plan = e.plan_convs(&HashSet::from([fetched.clone()]));
+        let ids: Vec<&str> = plan.transcripts.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec![fetched.as_str(), late.as_str()], "fetched first, then late; settled ones not at all");
+
+        let mut tried = HashSet::new();
+        let panel = e.plan_load(&fetched, &mut tried).expect("planned");
+        assert_eq!(panel.transcripts.len(), 1, "a panel load reads only what it loads");
+    }
+
+    #[test]
+    fn a_changed_conversation_is_dated_from_its_transcript() {
+        let mut e = engine();
+        e.app_data = std::env::temp_dir().join(format!("agy-engine-dating-{}", std::process::id()));
+        let a = uuid(1);
+        let path = crate::transcript::transcript_path(&e.app_data, &a);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let at = "2026-11-27T01:00:00Z";
+        std::fs::write(
+            &path,
+            format!("{}\n", json!({ "step_index": 1, "type": "PLANNER_RESPONSE", "created_at": at })),
+        )
+        .unwrap();
+
+        e.ls_loaded.insert(a.clone());
+        let req = e.conv_req(&a);
+        let chunk = crate::transcript::read_since(&e.app_data, &a, 0);
+        let keep = HashSet::from([a.clone()]);
+        e.apply_convs(ConvFetched {
+            convs: vec![(req, ls_page(&[record(10)]))],
+            subs: Vec::new(),
+            transcripts: vec![(a.clone(), chunk)],
+            git: Vec::new(),
+            keep: Some(keep),
+        });
+        let _ = std::fs::remove_dir_all(&e.app_data);
+        let c = &e.convs[&a].calls[0];
+        assert!(c.dated);
+        assert_eq!(c.at_ms, parse_ts(at).unwrap());
+        assert_eq!(c.label.as_deref(), Some("Final reply"));
     }
 }

@@ -23,7 +23,7 @@ use crate::git::GitInfo;
 use crate::ls::LsClient;
 use crate::miss::{MissInfo, miss_scan};
 use crate::pricing::{Cost, DayCost, Pricer};
-use crate::transcript::{Annotation, Transcript};
+use crate::transcript::{Annotation, Transcript, TranscriptChunk};
 use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
     maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
@@ -892,16 +892,16 @@ impl Engine {
         }
     }
 
-    /// Dates calls and labels turns from transcript.jsonl (read incrementally).
-    /// Undated calls fall back to neighbouring calls or the conversation's modified time rather
-    /// than `now`, so loading a historical conversation never pollutes today's cost.
-    fn sync_transcript(&mut self, id: &str, force: bool) {
-        let app_data = self.app_data.clone();
+    /// Merges what was read from transcript.jsonl (see `transcript::read_since`), then dates
+    /// calls and labels turns from it; `force` re-dates even if nothing new was read (the records
+    /// changed). Undated calls fall back to neighbouring calls or the conversation's modified time
+    /// rather than `now`, so loading a historical conversation never pollutes today's cost.
+    fn apply_transcript(&mut self, id: &str, chunk: Option<TranscriptChunk>, force: bool) {
         let summary_mod = self.summaries.get(id).map(|s| s.modified_ms).unwrap_or(0);
         let disk_mod = self.disk.get(id).copied().unwrap_or(0);
         let Some(conv) = self.convs.get_mut(id) else { return };
-        let t = conv.transcript.get_or_insert_with(|| Transcript::new(&app_data, id));
-        let parsed_new = t.sync();
+        let t = conv.transcript.get_or_insert_with(Transcript::default);
+        let parsed_new = chunk.and_then(|c| t.apply(c)).unwrap_or(false);
         let file_mod = if disk_mod > 0 { disk_mod } else { t.mtime_ms() };
         let conv_mod = summary_mod.max(file_mod);
         if force || parsed_new || conv_mod != conv.last_conv_mod {
@@ -1563,8 +1563,8 @@ pub fn run(shared: SharedRef) {
                 .unwrap_or_default()
         };
 
-        // The ENGINE lock is taken only to plan and to merge; RPCs, SQLite, directory scans and
-        // git run unlocked so side-panel requests are never stuck behind a slow call.
+        // The ENGINE lock is taken only to plan and to merge; RPCs, SQLite and transcript reads,
+        // directory scans and git run unlocked so side-panel requests are never stuck behind them.
         let status_plan = {
             let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
             if engine.is_none() {
