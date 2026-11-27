@@ -691,17 +691,29 @@ impl DayCallCache {
     }
 }
 
-/// Every desktop and CLI call of `day`: `live_calls` (the live engine's, possibly not on disk yet),
-/// then the desktop databases', then the CLI's, each call once.
-pub(crate) fn day_calls(
+/// Every call of `day` on disk: the desktop databases', then the CLI's, each call once. Lists and
+/// reads files, so callers must not hold the ENGINE lock; combine with the live engine's calls
+/// through [`with_live_calls`].
+pub(crate) fn disk_day_calls(
     app_data: &Path,
     cli_dir: &Path,
     plugin_data: &Path,
     cli: &mut CliSnapshot,
     day: &LocalDay,
-    live_calls: &[Call],
 ) -> Vec<Call> {
-    collect_all_day_calls(&list_desktop_dbs(app_data), cli_dir, plugin_data, cli, day, live_calls)
+    collect_all_day_calls(&list_desktop_dbs(app_data), cli_dir, plugin_data, cli, day, &[])
+}
+
+/// Every desktop and CLI call of `day`: `live_calls` (the live engine's, possibly not on disk yet),
+/// then the desktop calls of `disk` ([`disk_day_calls`]) not already among them, then its CLI calls.
+/// The same calls, in the same order, as reading the day with the live calls in hand.
+pub(crate) fn with_live_calls(live_calls: &[Call], disk: &[Call], day: &LocalDay) -> Vec<Call> {
+    let mut seen = DedupSet::default();
+    let mut out: Vec<Call> = live_calls.iter().filter(|c| day.contains(c.at_ms) && seen.insert(c)).cloned().collect();
+    let (desktop, cli): (Vec<&Call>, Vec<&Call>) = disk.iter().partition(|c| c.source != CLI);
+    out.extend(desktop.into_iter().filter(|c| seen.insert(c)).cloned());
+    out.extend(cli.into_iter().cloned());
+    out
 }
 
 /// A day of history priced, desktop and `agy CLI` apart.
@@ -1513,6 +1525,30 @@ mod tests {
         let has_bad = fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".bad-"));
         assert!(has_bad, "corrupt JSON should be renamed to .bad-*");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn live_calls_come_first_and_their_disk_copies_are_dropped() {
+        let day = LocalDay::of_in(1_800_000_000_000, &chrono::FixedOffset::east_opt(8 * 3600).unwrap());
+        let at = day.start_ms() + 3_600_000;
+        let call = |conv: &str, source: &'static str, id: &str, at_ms: i64| Call {
+            conv_id: conv.into(),
+            source,
+            model: ModelId::new("gemini-4-neon", "Gemini 4 Neon"),
+            tokens: Tokens { input: 10, output: 5, ..Default::default() },
+            at_ms,
+            response_id: Some(id.into()),
+            ..Default::default()
+        };
+        // Live: one call of the day, one from the day before (dropped).
+        let live = [call("a", DESKTOP, "r1", at), call("a", DESKTOP, "r0", day.start_ms() - 1)];
+        // Disk: the live call's database copy (dated a few seconds apart), another desktop call, a CLI call.
+        let disk = [call("a", DESKTOP, "r1", at + 4_000), call("b", DESKTOP, "r2", at), call("c", CLI, "r3", at)];
+        let ids = |calls: &[Call]| calls.iter().map(|c| c.response_id.clone().unwrap()).collect::<Vec<_>>();
+        let merged = with_live_calls(&live, &disk, &day);
+        assert_eq!(ids(&merged), ["r1", "r2", "r3"]);
+        assert_eq!(merged[0].at_ms, at, "the live copy is kept");
+        assert_eq!(ids(&with_live_calls(&[], &disk, &day)), ["r1", "r2", "r3"]);
     }
 
     #[test]

@@ -42,6 +42,18 @@ impl ModelId {
         }
     }
 
+    /// The key this model's daily aggregates had before ADR 0001: the raw name, else the display
+    /// name, else `"unknown"`.
+    pub fn legacy_bucket_key(&self) -> &str {
+        if !self.raw.is_empty() {
+            &self.raw
+        } else if !self.display.is_empty() {
+            &self.display
+        } else {
+            "unknown"
+        }
+    }
+
     /// Reads a daily-aggregate key. Keys written before ADR 0001 hold only the raw name.
     pub fn from_bucket_key(key: &str) -> Self {
         match key.split_once('|') {

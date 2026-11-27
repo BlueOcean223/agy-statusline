@@ -25,9 +25,9 @@ use crate::ls::LsClient;
 use crate::pricing::{Pricer, day_sum};
 use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
-    AccountInfo, DayRecord, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, day_calls,
+    AccountInfo, DayRecord, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, disk_day_calls,
     load_history, load_samples, maybe_replay_samples, needs_backfill, price_recorded_day, quota_group_id, run_backfill,
-    save_history, update_today,
+    save_history, update_today, with_live_calls,
 };
 use chrono::DateTime;
 use serde_json::{Value, json};
@@ -484,6 +484,48 @@ pub struct UsageStore {
     /// History changed since the last save (saves are throttled, so this must outlive a tick).
     pub history_pending: bool,
     save_gen: u64,
+    /// On a price-cut day, the day's desktop and CLI calls on disk, read by
+    /// [`refresh_cut_day_calls`] with no lock held. `today_totals` prices today from these and the
+    /// live engine's calls, so it never reads files under the ENGINE lock.
+    cut_day_calls: Option<CutDayCalls>,
+}
+
+struct CutDayCalls {
+    day: LocalDay,
+    calls: Arc<[Call]>,
+    read_at: Instant,
+}
+
+/// How often [`refresh_cut_day_calls`] re-reads the day's calls; the same cadence as the live
+/// engine's calls reaching history.
+const CUT_DAY_CALLS_EVERY: Duration = Duration::from_secs(5);
+
+/// On a price-cut day, re-reads the day's desktop and CLI calls from disk when the copy in the
+/// usage store is older than [`CUT_DAY_CALLS_EVERY`] or from another day; otherwise drops it. Call
+/// with no lock held (it lists and reads conversation databases).
+fn refresh_cut_day_calls(cfg: &Config, online: Option<&OnlinePrices>) {
+    let clock = Clock::read();
+    let day = clock.today;
+    let cut_day = Pricer::new(&cfg.models, online, clock.now).is_cut_day(&day);
+    let paths = {
+        let Ok(mut guard) = USAGE.lock() else { return };
+        let Some(store) = guard.as_mut() else { return };
+        if !cut_day {
+            store.cut_day_calls = None;
+            return;
+        }
+        if store.cut_day_calls.as_ref().is_some_and(|c| c.day == day && c.read_at.elapsed() < CUT_DAY_CALLS_EVERY) {
+            return;
+        }
+        (store.cli_snap.clone(), store.app_data.clone(), store.cli_data.clone(), store.plugin_data.clone())
+    };
+    let (mut cli_snap, app_data, cli_data, plugin_data) = paths;
+    let calls = disk_day_calls(&app_data, &cli_data, &plugin_data, &mut cli_snap, &day);
+    if let Ok(mut guard) = USAGE.lock()
+        && let Some(store) = guard.as_mut()
+    {
+        store.cut_day_calls = Some(CutDayCalls { day, calls: calls.into(), read_at: Instant::now() });
+    }
 }
 
 pub static USAGE: Mutex<Option<UsageStore>> = Mutex::new(None);
@@ -574,6 +616,7 @@ fn init_usage_store(app_data: PathBuf, plugin_data: PathBuf, shared: SharedRef) 
             last_saved: Instant::now(),
             history_pending: false,
             save_gen: 0,
+            cut_day_calls: None,
         });
     }
     if need_bf {
@@ -1085,25 +1128,22 @@ impl Engine {
             live_cost += cost;
             live_tok += tok;
         }
-        // Today's history, priced the way the Usage tab prices it. Copied under the USAGE lock,
-        // priced (and on a price-cut day, today's calls read) after releasing it.
+        // Today's history, priced the way the Usage tab prices it. Copied under the USAGE lock and
+        // priced after releasing it. On a price-cut day the day's calls on disk come from the copy
+        // `refresh_cut_day_calls` reads off the ENGINE lock; until its first read only the live
+        // calls are priced exactly.
         let snap = USAGE.lock().ok().and_then(|g| {
             let store = g.as_ref()?;
             let rec = store.history.days.get(&day.key())?;
             let rec = DayRecord { raw: rec.raw.clone(), cli_raw: rec.cli_raw.clone(), ..Default::default() };
-            Some((
-                rec,
-                store.cli_snap.clone(),
-                store.app_data.clone(),
-                store.cli_data.clone(),
-                store.plugin_data.clone(),
-            ))
+            let disk = store.cut_day_calls.as_ref().filter(|c| c.day == *day).map(|c| Arc::clone(&c.calls));
+            Some((rec, disk))
         });
-        let persisted = snap.map(|(rec, mut cli_snap, app_data, cli_data, plugin_data)| {
+        let persisted = snap.map(|(rec, disk)| {
             let exact = pricer.is_cut_day(day).then(|| {
                 let live: Vec<Call> =
                     self.convs.values().flat_map(|conv| conv.calls_since(midnight)).map(|c| c.call.clone()).collect();
-                day_calls(&app_data, &cli_data, &plugin_data, &mut cli_snap, day, &live)
+                with_live_calls(&live, disk.as_deref().unwrap_or_default(), day)
             });
             let priced = price_recorded_day(&rec, day, pricer, exact.as_deref());
             let ((desk_usd, desk_tok), (cli_usd, cli_tok)) = (day_sum(&priced.desktop), day_sum(&priced.cli));
@@ -1300,6 +1340,8 @@ pub fn run(shared: SharedRef) {
             });
             let fetched = conv_plan.map(tick::ConvPlan::fetch);
             let cfg = load_config(&plugin_data);
+            let active_online = cfg.online_data_sync.then_some(online_prices).flatten();
+            refresh_cut_day_calls(&cfg, active_online.as_ref());
 
             let mut writes = PendingWrites::default();
             let mut engine = lock_engine();
@@ -1315,7 +1357,6 @@ pub fn run(shared: SharedRef) {
                     s.ui_zh = ui_zh;
                     s.running = running;
                 });
-                let active_online = cfg.online_data_sync.then_some(online_prices).flatten();
                 let payload = eng.build_payload(&panes, &cfg, active_online.as_ref(), Clock::read());
                 let payload = serde_json::to_string(&payload).unwrap_or_default();
                 if payload != last_payload {

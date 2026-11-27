@@ -145,14 +145,15 @@ impl Pricer {
         self.cost(&c.model, &c.tokens, c.at_ms)
     }
 
-    /// True when some price changes during `day` (after its first instant, up to its end). Such a
-    /// day is priced call by call, so pass its calls to [`Pricer::price_day`].
+    /// True when some price changes during `day`: strictly after its first instant and before the
+    /// next day's start. A cut at either bound leaves one price for the whole day. Such a day is
+    /// priced call by call, so pass its calls to [`Pricer::price_day`].
     pub fn is_cut_day(&self, day: &LocalDay) -> bool {
         self.rules
             .iter()
             .flat_map(|r| &r.tiers)
             .filter_map(|t| t.until_ms)
-            .any(|u| u > day.start_ms() && u <= day.end_ms())
+            .any(|u| u > day.start_ms() && u < day.end_ms())
     }
 
     /// Prices one day of daily aggregates (keys as written by [`ModelId::bucket_key`]).
@@ -178,24 +179,60 @@ impl Pricer {
             return out;
         };
 
+        // The exact calls not yet matched to an aggregate, by the key they are recorded under.
+        let mut unmatched: BTreeMap<String, (ModelId, ModelAgg)> = BTreeMap::new();
         for c in exact {
             let e = out.entry(self.label(&c.model)).or_default();
             e.0 += self.call_cost(c).total();
             e.1.add_tokens(&c.tokens);
+            unmatched
+                .entry(c.model.bucket_key())
+                .or_insert_with(|| (c.model.clone(), ModelAgg::default()))
+                .1
+                .add_tokens(&c.tokens);
         }
-        let mut persisted: BTreeMap<String, (ModelId, ModelAgg)> = BTreeMap::new();
-        for (key, agg) in aggregates {
-            let model = ModelId::from_bucket_key(key);
-            persisted.entry(self.label(&model)).or_insert_with(|| (model, ModelAgg::default())).1.merge_from(agg);
+        // Each aggregate's remainder is what it holds beyond the exact calls recorded under it. An
+        // aggregate is matched to the calls of its own key first; one written before ADR 0001 then
+        // to the calls of its raw name (that key matched the rule on raw alone, so its label can
+        // differ from the calls'); whatever is left then to the calls of the same label. Matching
+        // only by label counted a call twice when the two labels differed.
+        let mut rems: Vec<(ModelId, ModelAgg, bool)> = Vec::new();
+        let mut keyed: Vec<(&String, &ModelAgg)> = aggregates.into_iter().collect();
+        keyed.sort_by_key(|(k, _)| *k);
+        for (key, agg) in keyed {
+            let mut rem = agg.clone();
+            if let Some((_, pool)) = unmatched.get_mut(key) {
+                absorb(&mut rem, pool);
+            }
+            rems.push((ModelId::from_bucket_key(key), rem, !key.contains('|')));
         }
-        for (label, (model, p)) in persisted {
-            let e = out.entry(label).or_default();
-            let rem = p.tokens().saturating_sub(&e.1.tokens());
-            e.0 += self.cost(&model, &rem, noon).total();
-            e.1.merge_from(&ModelAgg { calls: p.calls.saturating_sub(e.1.calls), ..ModelAgg::from(rem) });
+        for (model, rem, _) in rems.iter_mut().filter(|(_, _, legacy)| *legacy) {
+            for (_, pool) in unmatched.values_mut().filter(|(m, _)| m.legacy_bucket_key() == model.raw) {
+                absorb(rem, pool);
+            }
+        }
+        for (model, rem, _) in rems.iter_mut() {
+            let label = self.label(model);
+            for (_, pool) in unmatched.values_mut().filter(|(m, _)| self.label(m) == label) {
+                absorb(rem, pool);
+            }
+        }
+        for (model, rem, _) in rems.into_iter().filter(|(_, r, _)| r.calls > 0 || r.tokens().any()) {
+            let e = out.entry(self.label(&model)).or_default();
+            e.0 += self.cost(&model, &rem.tokens(), noon).total();
+            e.1.merge_from(&rem);
         }
         out
     }
+}
+
+/// Takes from `rem` what `exact` also holds (calls and each token kind), and removes it from both.
+fn absorb(rem: &mut ModelAgg, exact: &mut ModelAgg) {
+    let left = rem.tokens().saturating_sub(&exact.tokens());
+    let taken = rem.tokens().saturating_sub(&left);
+    let calls = rem.calls.min(exact.calls);
+    *exact = ModelAgg { calls: exact.calls - calls, ..ModelAgg::from(exact.tokens().saturating_sub(&taken)) };
+    *rem = ModelAgg { calls: rem.calls - calls, ..ModelAgg::from(left) };
 }
 
 /// `hay` is already lowercase. Same as `hay.contains(&pat.to_lowercase())`, without allocating
@@ -315,6 +352,56 @@ mod tests {
         let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[call(&m, 50_000, CUT + 1)]), &day);
         assert_eq!(day_cost.keys().collect::<Vec<_>>(), vec!["Hydrogen"]);
         assert_eq!(day_cost["Hydrogen"].1.calls, 1);
+    }
+
+    fn one_call(input: u64) -> ModelAgg {
+        let mut agg = ModelAgg::default();
+        agg.add_tokens(&Tokens { input, ..Default::default() });
+        agg
+    }
+
+    #[test]
+    fn price_cut_day_counts_a_call_once_under_a_key_written_before_adr_0001() {
+        let p = pricer();
+        let day = cut_day();
+        let m = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
+        // Written by v0.5.1: the raw name alone, which matches "orchestrator" (Carbon), while the
+        // call itself matches "hydrogen" on raw+display.
+        let aggs = [(m.legacy_bucket_key().to_string(), one_call(100_000))];
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[call(&m, 100_000, CUT + 1)]), &day);
+        assert_eq!(day_cost.keys().collect::<Vec<_>>(), vec!["Hydrogen"], "{day_cost:?}");
+        let (usd, totals) = &day_cost["Hydrogen"];
+        assert_eq!((totals.calls, totals.input), (1, 100_000));
+        assert!((usd - 0.4).abs() < 1e-9, "got {usd}");
+    }
+
+    #[test]
+    fn price_cut_day_on_upgrade_counts_old_and_new_rows_against_their_own_calls() {
+        let p = pricer();
+        let day = cut_day();
+        let m = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
+        // The morning's call under the old key, the afternoon's under the new one, plus 50k under
+        // the old key that no surviving call accounts for (e.g. a deleted database).
+        let aggs = [(m.legacy_bucket_key().to_string(), one_call(150_000)), (m.bucket_key(), one_call(200_000))];
+        let exact = [call(&m, 100_000, day.start_ms() + HOUR), call(&m, 200_000, CUT + 1)];
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&exact), &day);
+        let totals = |label: &str| day_cost.get(label).map(|(_, t)| (t.calls, t.input));
+        assert_eq!(totals("Hydrogen"), Some((2, 300_000)));
+        // The unaccounted 50k keeps the old key's rule, priced at noon (after the cut, $4/M).
+        assert_eq!(totals("Carbon"), Some((0, 50_000)));
+        assert!((day_cost["Carbon"].0 - 0.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn price_cut_day_prices_each_aggregates_remainder_with_its_own_rule() {
+        let mut cheap = rule("lite-a", "Lite");
+        cheap.tiers.iter_mut().for_each(|t| t.input_per_m = 1.0);
+        let p = Pricer::from_rules(vec![cheap, rule("lite-b", "Lite")], CUT);
+        let day = cut_day();
+        let aggs = [("lite-a|".to_string(), one_call(1_000_000)), ("lite-b|".to_string(), one_call(1_000_000))];
+        let day_cost = p.price_day(aggs.iter().map(|(k, a)| (k, a)), Some(&[]), &day);
+        // $1/M for lite-a plus $4/M (after the cut, at noon) for lite-b, whichever key comes first.
+        assert!((day_cost["Lite"].0 - 5.0).abs() < 1e-9, "got {}", day_cost["Lite"].0);
     }
 
     #[test]
