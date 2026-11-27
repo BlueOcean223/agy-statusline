@@ -28,7 +28,11 @@ const RRF_RT_REG_DWORD: u32 = 0x0000_0010;
 const WS_POPUP: u32 = 0x8000_0000;
 const WS_EX_LAYERED: u32 = 0x0008_0000;
 const WS_EX_TOPMOST: u32 = 0x0000_0008;
-const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+/// Gives the dialog a taskbar button (and an Alt+Tab entry), so it can be found when Windows
+/// refuses to bring it to the foreground.
+const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+const FLASHW_ALL: u32 = 0x3;
+const FLASHW_TIMERNOFG: u32 = 0xC;
 
 const SW_SHOW: i32 = 5;
 const ULW_ALPHA: u32 = 0x0000_0002;
@@ -72,6 +76,7 @@ const PIXEL_FORMAT_32BPP_PARGB: i32 = 0x000E_200B;
 const SMOOTHING_MODE_ANTI_ALIAS: i32 = 4;
 const PIXEL_OFFSET_MODE_HIGH_QUALITY: i32 = 2;
 const TEXT_RENDERING_HINT_ANTI_ALIAS_GRID_FIT: i32 = 3;
+const UNIT_WORLD: i32 = 0;
 const UNIT_PIXEL: i32 = 2;
 const FONT_STYLE_REGULAR: i32 = 0;
 const FONT_STYLE_BOLD: i32 = 1;
@@ -243,6 +248,7 @@ unsafe extern "system" {
     fn DestroyWindow(h_wnd: *mut c_void) -> i32;
     fn ShowWindow(h_wnd: *mut c_void, n_cmd_show: i32) -> i32;
     fn SetForegroundWindow(h_wnd: *mut c_void) -> i32;
+    fn FlashWindowEx(pfwi: *const FlashWInfo) -> i32;
     fn GetWindowRect(h_wnd: *mut c_void, lp_rect: *mut WinRect) -> i32;
     fn GetCursorPos(lp_point: *mut Point) -> i32;
     fn MonitorFromPoint(pt: Point, dw_flags: u32) -> *mut c_void;
@@ -498,7 +504,7 @@ unsafe fn execute_paint_cmds(g: *mut c_void, font_family: *mut c_void, cmds: &[P
                     continue;
                 }
                 let mut pen = null_mut();
-                if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_PIXEL, &mut pen) == 0 && !pen.is_null() {
+                if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_WORLD, &mut pen) == 0 && !pen.is_null() {
                     GdipDrawPath(g, pen, path);
                     GdipDeletePen(pen);
                 }
@@ -513,7 +519,7 @@ unsafe fn execute_paint_cmds(g: *mut c_void, font_family: *mut c_void, cmds: &[P
             },
             PaintCmd::StrokeLine { x1, y1, x2, y2, width, color } => unsafe {
                 let mut pen = null_mut();
-                if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_PIXEL, &mut pen) == 0 && !pen.is_null() {
+                if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_WORLD, &mut pen) == 0 && !pen.is_null() {
                     GdipSetPenStartCap(pen, LINE_CAP_ROUND);
                     GdipSetPenEndCap(pen, LINE_CAP_ROUND);
                     GdipDrawLine(g, pen, *x1, *y1, *x2, *y2);
@@ -527,7 +533,7 @@ unsafe fn execute_paint_cmds(g: *mut c_void, font_family: *mut c_void, cmds: &[P
                 let gpts: Vec<PointF> = pts.iter().map(|&(x, y)| PointF { x, y }).collect();
                 unsafe {
                     let mut pen = null_mut();
-                    if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_PIXEL, &mut pen) == 0 && !pen.is_null() {
+                    if GdipCreatePen1(color.to_argb_u32(), *width, UNIT_WORLD, &mut pen) == 0 && !pen.is_null() {
                         GdipSetPenStartCap(pen, LINE_CAP_ROUND);
                         GdipSetPenEndCap(pen, LINE_CAP_ROUND);
                         GdipSetPenLineJoin(pen, LINE_JOIN_ROUND);
@@ -587,92 +593,110 @@ struct WinRuntime {
     cursor_hand: *mut c_void,
 }
 
+#[repr(C)]
+struct FlashWInfo {
+    cb_size: u32,
+    hwnd: *mut c_void,
+    dw_flags: u32,
+    u_count: u32,
+    dw_timeout: u32,
+}
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(size_of::<FlashWInfo>() == 32);
+
 thread_local! {
     static WIN_RT: RefCell<Option<WinRuntime>> = const { RefCell::new(None) };
 }
 
-fn repaint_layered(hwnd: *mut c_void, move_to: Option<Point>) {
-    WIN_RT.with(|cell| {
-        let guard = cell.borrow();
-        let Some(rt) = guard.as_ref() else {
-            return;
-        };
-        let scale = rt.scale;
-        let px_w = (CANVAS_W * scale).round() as i32;
-        let px_h = (CANVAS_H * scale).round() as i32;
-        let cmds = rt.state.paint_commands();
-        let theme = rt.state.theme;
-        let font_family = rt.font_family;
+/// Paints the dialog into the layered window (moving it to `move_to`). Returns false when any step
+/// failed, so the first paint can fall back to a message box instead of an invisible window.
+///
+/// The runtime is copied out first: `UpdateLayeredWindow` can move the window onto another
+/// monitor and send `WM_DPICHANGED` synchronously, whose handler borrows the runtime mutably.
+fn repaint_layered(hwnd: *mut c_void, move_to: Option<Point>) -> bool {
+    let Some((scale, cmds, theme, font_family)) = WIN_RT.with(|cell| {
+        let guard = cell.try_borrow().ok()?;
+        let rt = guard.as_ref()?;
+        Some((rt.scale, rt.state.paint_commands(), rt.state.theme, rt.font_family))
+    }) else {
+        return false;
+    };
+    let px_w = (CANVAS_W * scale).round() as i32;
+    let px_h = (CANVAS_H * scale).round() as i32;
 
-        unsafe {
-            let hdc_screen = GetDC(null_mut());
-            if hdc_screen.is_null() {
-                return;
-            }
-            let hdc_mem = CreateCompatibleDC(hdc_screen);
-            if hdc_mem.is_null() {
-                ReleaseDC(null_mut(), hdc_screen);
-                return;
-            }
-            let mut bmi: BitmapInfo = zeroed();
-            bmi.bmi_header.bi_size = size_of::<BitmapInfoHeader>() as u32;
-            bmi.bmi_header.bi_width = px_w;
-            bmi.bmi_header.bi_height = -px_h; // top-down DIB
-            bmi.bmi_header.bi_planes = 1;
-            bmi.bmi_header.bi_bit_count = 32;
-            bmi.bmi_header.bi_compression = BI_RGB;
+    unsafe {
+        let hdc_screen = GetDC(null_mut());
+        if hdc_screen.is_null() {
+            return false;
+        }
+        let hdc_mem = CreateCompatibleDC(hdc_screen);
+        if hdc_mem.is_null() {
+            ReleaseDC(null_mut(), hdc_screen);
+            return false;
+        }
+        let mut bmi: BitmapInfo = zeroed();
+        bmi.bmi_header.bi_size = size_of::<BitmapInfoHeader>() as u32;
+        bmi.bmi_header.bi_width = px_w;
+        bmi.bmi_header.bi_height = -px_h; // top-down DIB
+        bmi.bmi_header.bi_planes = 1;
+        bmi.bmi_header.bi_bit_count = 32;
+        bmi.bmi_header.bi_compression = BI_RGB;
 
-            let mut bits: *mut c_void = null_mut();
-            let hbmp = CreateDIBSection(hdc_screen, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
-            if hbmp.is_null() || bits.is_null() {
-                DeleteDC(hdc_mem);
-                ReleaseDC(null_mut(), hdc_screen);
-                return;
-            }
-            std::ptr::write_bytes(bits.cast::<u8>(), 0, (px_w * px_h * 4) as usize);
-
-            let mut gp_bmp = null_mut();
-            if GdipCreateBitmapFromScan0(px_w, px_h, px_w * 4, PIXEL_FORMAT_32BPP_PARGB, bits.cast::<u8>(), &mut gp_bmp)
-                == 0
-                && !gp_bmp.is_null()
-            {
-                let mut g = null_mut();
-                if GdipGetImageGraphicsContext(gp_bmp, &mut g) == 0 && !g.is_null() {
-                    GdipSetSmoothingMode(g, SMOOTHING_MODE_ANTI_ALIAS);
-                    GdipSetPixelOffsetMode(g, PIXEL_OFFSET_MODE_HIGH_QUALITY);
-                    GdipSetTextRenderingHint(g, TEXT_RENDERING_HINT_ANTI_ALIAS_GRID_FIT);
-                    // Row-vector GDI+ prepend: p * (T * S) = (p + SHADOW_PAD) * scale.
-                    GdipScaleWorldTransform(g, scale, scale, MATRIX_ORDER_PREPEND);
-                    GdipTranslateWorldTransform(g, SHADOW_PAD, SHADOW_PAD, MATRIX_ORDER_PREPEND);
-                    paint_soft_elevation_shadow(g, theme);
-                    execute_paint_cmds(g, font_family, &cmds);
-                    GdipDeleteGraphics(g);
-                }
-                GdipDisposeImage(gp_bmp);
-            }
-
-            let old = SelectObject(hdc_mem, hbmp);
-            let dst_opt = move_to.or_else(|| {
-                let mut wr = WinRect::default();
-                (GetWindowRect(hwnd, &mut wr) != 0).then_some(Point { x: wr.left, y: wr.top })
-            });
-            let dst_ptr = dst_opt.as_ref().map_or(null(), |p| p as *const Point);
-            let size = Size { cx: px_w, cy: px_h };
-            let src = Point { x: 0, y: 0 };
-            let blend = BlendFunction {
-                blend_op: AC_SRC_OVER,
-                blend_flags: 0,
-                source_constant_alpha: 255,
-                alpha_format: AC_SRC_ALPHA,
-            };
-            UpdateLayeredWindow(hwnd, hdc_screen, dst_ptr, &size, hdc_mem, &src, 0, &blend, ULW_ALPHA);
-
-            SelectObject(hdc_mem, old);
-            DeleteObject(hbmp);
+        let mut bits: *mut c_void = null_mut();
+        let hbmp = CreateDIBSection(hdc_screen, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+        if hbmp.is_null() || bits.is_null() {
             DeleteDC(hdc_mem);
             ReleaseDC(null_mut(), hdc_screen);
+            return false;
         }
-    });
+        std::ptr::write_bytes(bits.cast::<u8>(), 0, (px_w * px_h * 4) as usize);
+
+        let mut painted = false;
+        let mut gp_bmp = null_mut();
+        if GdipCreateBitmapFromScan0(px_w, px_h, px_w * 4, PIXEL_FORMAT_32BPP_PARGB, bits.cast::<u8>(), &mut gp_bmp)
+            == 0
+            && !gp_bmp.is_null()
+        {
+            let mut g = null_mut();
+            if GdipGetImageGraphicsContext(gp_bmp, &mut g) == 0 && !g.is_null() {
+                GdipSetSmoothingMode(g, SMOOTHING_MODE_ANTI_ALIAS);
+                GdipSetPixelOffsetMode(g, PIXEL_OFFSET_MODE_HIGH_QUALITY);
+                GdipSetTextRenderingHint(g, TEXT_RENDERING_HINT_ANTI_ALIAS_GRID_FIT);
+                // Row-vector GDI+ prepend: p * (T * S) = (p + SHADOW_PAD) * scale.
+                GdipScaleWorldTransform(g, scale, scale, MATRIX_ORDER_PREPEND);
+                GdipTranslateWorldTransform(g, SHADOW_PAD, SHADOW_PAD, MATRIX_ORDER_PREPEND);
+                paint_soft_elevation_shadow(g, theme);
+                execute_paint_cmds(g, font_family, &cmds);
+                GdipDeleteGraphics(g);
+                painted = true;
+            }
+            GdipDisposeImage(gp_bmp);
+        }
+
+        let old = SelectObject(hdc_mem, hbmp);
+        let dst_opt = move_to.or_else(|| {
+            let mut wr = WinRect::default();
+            (GetWindowRect(hwnd, &mut wr) != 0).then_some(Point { x: wr.left, y: wr.top })
+        });
+        let dst_ptr = dst_opt.as_ref().map_or(null(), |p| p as *const Point);
+        let size = Size { cx: px_w, cy: px_h };
+        let src = Point { x: 0, y: 0 };
+        let blend = BlendFunction {
+            blend_op: AC_SRC_OVER,
+            blend_flags: 0,
+            source_constant_alpha: 255,
+            alpha_format: AC_SRC_ALPHA,
+        };
+        let updated =
+            painted && UpdateLayeredWindow(hwnd, hdc_screen, dst_ptr, &size, hdc_mem, &src, 0, &blend, ULW_ALPHA) != 0;
+
+        SelectObject(hdc_mem, old);
+        DeleteObject(hbmp);
+        DeleteDC(hdc_mem);
+        ReleaseDC(null_mut(), hdc_screen);
+        updated
+    }
 }
 
 fn client_to_logical(l_param: isize, scale: f32) -> (f32, f32) {
@@ -818,7 +842,9 @@ unsafe extern "system" fn wnd_proc(hwnd: *mut c_void, msg: u32, w_param: usize, 
                 None
             };
             WIN_RT.with(|cell| {
-                if let Some(rt) = cell.borrow_mut().as_mut() {
+                if let Ok(mut guard) = cell.try_borrow_mut()
+                    && let Some(rt) = guard.as_mut()
+                {
                     rt.scale = (new_dpi.max(72) as f32) / 96.0;
                 }
             });
@@ -880,16 +906,20 @@ fn show_custom_dialog(theme: Theme) -> Option<PromptResult> {
         return None;
     }
 
+    // Created (hidden, 1x1) at the cursor, so its DPI is that of the monitor it is shown on: the
+    // first paint then stays on that monitor and sizes it right on mixed-DPI setups.
+    let mut pt = Point::default();
+    unsafe { GetCursorPos(&mut pt) };
     let hwnd = unsafe {
         CreateWindowExW(
-            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+            WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_APPWINDOW,
             class_name.as_ptr(),
             title.as_ptr(),
             WS_POPUP,
-            0,
-            0,
-            CANVAS_W as i32,
-            CANVAS_H as i32,
+            pt.x,
+            pt.y,
+            1,
+            1,
             null_mut(),
             null_mut(),
             h_inst,
@@ -910,8 +940,6 @@ fn show_custom_dialog(theme: Theme) -> Option<PromptResult> {
     let px_h = (CANVAS_H * scale).round() as i32;
 
     // Center on the monitor containing the mouse cursor (slightly above vertical center).
-    let mut pt = Point::default();
-    unsafe { GetCursorPos(&mut pt) };
     let mon = unsafe { MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST) };
     let mut mi: MonitorInfo = unsafe { zeroed() };
     mi.cb_size = size_of::<MonitorInfo>() as u32;
@@ -935,10 +963,33 @@ fn show_custom_dialog(theme: Theme) -> Option<PromptResult> {
         });
     });
 
-    repaint_layered(hwnd, Some(Point { x: pos_x, y: pos_y }));
+    if !repaint_layered(hwnd, Some(Point { x: pos_x, y: pos_y })) {
+        // Nothing would be visible: tear down and let the caller show the message box.
+        unsafe { DestroyWindow(hwnd) };
+        if let Some(rt) = WIN_RT.with(|cell| cell.borrow_mut().take())
+            && !rt.font_family.is_null()
+        {
+            unsafe { GdipDeleteFontFamily(rt.font_family) };
+        }
+        unsafe {
+            UnregisterClassW(class_name.as_ptr(), h_inst);
+            GdiplusShutdown(gp_token);
+        }
+        return None;
+    }
     unsafe {
         ShowWindow(hwnd, SW_SHOW);
-        SetForegroundWindow(hwnd);
+        // A background process is usually refused the foreground: flash the taskbar button.
+        if SetForegroundWindow(hwnd) == 0 {
+            let fw = FlashWInfo {
+                cb_size: size_of::<FlashWInfo>() as u32,
+                hwnd,
+                dw_flags: FLASHW_ALL | FLASHW_TIMERNOFG,
+                u_count: 0,
+                dw_timeout: 0,
+            };
+            FlashWindowEx(&fw);
+        }
     }
 
     let mut msg: Msg = unsafe { zeroed() };
