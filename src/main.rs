@@ -78,7 +78,7 @@ fn print_status(conv: &str) {
         return;
     };
     eng.load_for_panel(&id);
-    let p = eng.panel(&id, &cfg, None);
+    let p = eng.panel(&id, &cfg, None, live::Clock::read());
     let id = id.as_str();
     let v = &p["bar"]["views"][id];
     let m = &v["main"];
@@ -143,7 +143,7 @@ fn print_live(ids: Vec<String>) {
         panes.insert(id.clone());
     }
     eng.tick(&panes);
-    let payload = eng.build_payload(&panes, &cfg, None);
+    let payload = eng.build_payload(&panes, &cfg, None, live::Clock::read());
     println!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
 }
 

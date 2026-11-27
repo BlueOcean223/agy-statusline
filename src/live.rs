@@ -28,7 +28,7 @@ use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
     maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
 };
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -42,6 +42,8 @@ const MAX_SUBS: usize = 4;
 const SUB_STEPS_KEEP: usize = 30;
 
 mod panel;
+#[cfg(test)]
+mod test_support;
 mod tick;
 
 pub fn now_ms() -> i64 {
@@ -1011,12 +1013,12 @@ impl Engine {
         cur
     }
 
-    fn is_running(&self, id: &str) -> bool {
+    fn is_running(&self, id: &str, now: i64) -> bool {
         if self.summaries.get(id).is_some_and(Summary::active) {
             return true;
         }
         // Hooks fire before the next status poll; trust a fresh PreInvocation/PostInvocation.
-        self.hooks.get(id).is_some_and(|h| h.event != "Stop" && now_ms() - h.at_ms < 15_000)
+        self.hooks.get(id).is_some_and(|h| h.event != "Stop" && now - h.at_ms < 15_000)
     }
 
     fn tree(&self, root: &str) -> Vec<String> {
@@ -1033,7 +1035,7 @@ impl Engine {
         self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage())
     }
 
-    fn quota_for(&self, call: Option<&LiveCall>) -> Vec<QuotaView> {
+    fn quota_for(&self, call: Option<&LiveCall>, now: i64) -> Vec<QuotaView> {
         let groups = self.quota["groups"].as_array().cloned().unwrap_or_default();
         if groups.is_empty() {
             return Vec::new();
@@ -1054,13 +1056,13 @@ impl Engine {
                 })
             })
             .unwrap_or(&groups[0]);
-        quota_views(group)
+        quota_views(group, now)
     }
 
     /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
     /// returning `(total_usd, total_tokens, cli_usd)`.
-    fn today_totals(&self, pricer: &Pricer) -> (f64, u64, f64) {
-        let midnight = local_midnight_ms();
+    fn today_totals(&self, pricer: &Pricer, clock: Clock) -> (f64, u64, f64) {
+        let midnight = clock.midnight;
         let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
@@ -1080,7 +1082,7 @@ impl Engine {
             live_tok += tok;
         }
         // Snapshot today's persisted aggregates + CLI snapshot briefly under USAGE lock, then price lock-free.
-        let today = today_str();
+        let today = crate::usage::local_day_str(midnight);
         let snap = USAGE.lock().ok().and_then(|g| {
             let store = g.as_ref()?;
             let day = store.history.days.get(&today)?;
@@ -1126,14 +1128,22 @@ impl Engine {
         miss_scan(conv.calls.iter().filter(|c| c.has_usage()).map(|c| &c.call), pricer, markers)
     }
 
-    pub fn build_payload(&self, panes: &HashSet<String>, cfg: &Config, online: Option<&OnlinePrices>) -> Value {
-        let pricer = Pricer::new(&cfg.models, online, now_ms());
-        let (today, _, today_cli) = self.today_totals(&pricer);
+    /// The status bar's payload for the conversations in `panes`, as of `clock`.
+    pub fn build_payload(
+        &self,
+        panes: &HashSet<String>,
+        cfg: &Config,
+        online: Option<&OnlinePrices>,
+        clock: Clock,
+    ) -> Value {
+        let now = clock.now;
+        let pricer = Pricer::new(&cfg.models, online, now);
+        let (today, _, today_cli) = self.today_totals(&pricer, clock);
         let price_src = pricer.source().to_string();
 
         let mut views = serde_json::Map::new();
         for id in panes {
-            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &pricer)).unwrap_or(Value::Null));
+            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &pricer, clock)).unwrap_or(Value::Null));
         }
         let groups: Vec<Value> = self.quota["groups"]
             .as_array()
@@ -1143,7 +1153,7 @@ impl Engine {
                         json!({
                             "name": g["displayName"],
                             "models": g["description"],
-                            "buckets": quota_views(g),
+                            "buckets": quota_views(g, now),
                         })
                     })
                     .collect()
@@ -1165,7 +1175,7 @@ impl Engine {
         })
     }
 
-    fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer) -> AgentLine {
+    fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer, now: i64) -> AgentLine {
         let calls = self.convs.get(id).map(|c| c.calls.as_slice()).unwrap_or(&[]);
         let last = self.last_call(id);
         let ctx_max = if cfg.context_limit_override > 0 {
@@ -1246,7 +1256,7 @@ impl Engine {
             id: id.to_string(),
             sub_type: s.and_then(|s| s.sub_type.clone()),
             sub_role: s.and_then(|s| s.sub_role.clone()),
-            running: self.is_running(id),
+            running: self.is_running(id, now),
             waiting,
             model: last.map(|c| c.model.display.clone()),
             resp_model: last.map(|c| c.model.raw.clone()),
@@ -1273,13 +1283,14 @@ impl Engine {
         }
     }
 
-    fn view(&self, id: &str, cfg: &Config, pricer: &Pricer) -> View {
+    fn view(&self, id: &str, cfg: &Config, pricer: &Pricer, clock: Clock) -> View {
+        let now = clock.now;
         let root = self.root_of(id);
         let is_sub = root != id;
-        let main = self.agent_line(id, cfg, pricer);
+        let main = self.agent_line(id, cfg, pricer, now);
         let includes_subagents = !is_sub && cfg.include_subagents;
         let ids = if includes_subagents { self.tree(&root) } else { vec![id.to_string()] };
-        let midnight = local_midnight_ms();
+        let midnight = clock.midnight;
         let mut cost_conv = 0.0;
         let mut cost_conv_today = 0.0;
         let mut multi_day = false;
@@ -1306,19 +1317,20 @@ impl Engine {
 
         let mut subs = Vec::new();
         if !is_sub {
-            let now = now_ms();
             let mut ids: Vec<&String> = self
                 .summaries
                 .iter()
                 .filter(|(sid, s)| *sid != id && s.root.as_deref() == Some(root.as_str()))
                 .filter(|(sid, _)| {
-                    self.is_running(sid) || self.sub_done.get(*sid).is_some_and(|t| now - t < SUB_DONE_SHOW_MS)
+                    self.is_running(sid, now) || self.sub_done.get(*sid).is_some_and(|t| now - t < SUB_DONE_SHOW_MS)
                 })
                 .map(|(sid, _)| sid)
                 .collect();
-            ids.sort_by_key(|sid| (!self.is_running(sid), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms))));
+            ids.sort_by_key(|sid| {
+                (!self.is_running(sid, now), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms)))
+            });
             let more = ids.len().saturating_sub(MAX_SUBS);
-            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, pricer)).collect();
+            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, pricer, now)).collect();
             if more > 0 {
                 subs.push(AgentLine { id: format!("+{more}"), ..Default::default() });
             }
@@ -1341,7 +1353,7 @@ impl Engine {
             last_call_key,
             last_call_miss: last_miss,
             price_name: price,
-            quota: self.quota_for(last),
+            quota: self.quota_for(last, now),
             subs,
         }
     }
@@ -1444,7 +1456,7 @@ pub struct QuotaView {
     pub elapsed: Option<f64>,
 }
 
-fn quota_views(group: &Value) -> Vec<QuotaView> {
+fn quota_views(group: &Value, now: i64) -> Vec<QuotaView> {
     let mut out: Vec<QuotaView> = group["buckets"]
         .as_array()
         .map(|bs| {
@@ -1459,7 +1471,7 @@ fn quota_views(group: &Value) -> Vec<QuotaView> {
                         _ => None,
                     };
                     let elapsed = match (reset_ms, span_ms) {
-                        (Some(r), Some(span)) => Some(1.0 - ((r - now_ms()) as f64 / span as f64).clamp(0.0, 1.0)),
+                        (Some(r), Some(span)) => Some(1.0 - ((r - now) as f64 / span as f64).clamp(0.0, 1.0)),
                         _ => None,
                     };
                     // Rounded so the pushed payload only changes when the shown numbers can.
@@ -1482,7 +1494,27 @@ fn model_family(display: &str) -> String {
 
 /// Start of today in local time (see `day_start_in` for days whose 00:00 does not exist).
 fn local_midnight_ms() -> i64 {
-    let now = Local::now();
+    local_midnight_at(now_ms())
+}
+
+/// When a view is built: the wall clock, read once per request, and the start of its local day.
+#[derive(Clone, Copy, Debug)]
+pub struct Clock {
+    pub now: i64,
+    /// Local midnight starting the day that contains `now`.
+    pub midnight: i64,
+}
+
+impl Clock {
+    pub fn read() -> Self {
+        let now = now_ms();
+        Self { now, midnight: local_midnight_at(now) }
+    }
+}
+
+/// Local midnight of the day containing `now_ms`.
+fn local_midnight_at(now_ms: i64) -> i64 {
+    let Some(now) = Local.timestamp_millis_opt(now_ms).earliest() else { return now_ms };
     // `now` is itself a valid instant of today, so the fallback is never reached in practice;
     // if it were, counting nothing as today beats counting all history as today.
     crate::usage::day_start_in(now.date_naive(), &Local).unwrap_or_else(|| now.timestamp_millis())
@@ -1531,7 +1563,7 @@ pub fn panel_json(
         s.panel.insert(id.clone(), Instant::now());
     }
     match engine().as_ref() {
-        Some(eng) => eng.panel(&id, cfg, online),
+        Some(eng) => eng.panel(&id, cfg, online, Clock::read()),
         None => json!({ "id": null, "error": "language_server not connected" }),
     }
 }
@@ -1618,7 +1650,7 @@ pub fn run(shared: SharedRef) {
                     s.running = running;
                 });
                 let active_online = cfg.online_data_sync.then_some(online_prices).flatten();
-                let payload = eng.build_payload(&panes, &cfg, active_online.as_ref()).to_string();
+                let payload = eng.build_payload(&panes, &cfg, active_online.as_ref(), Clock::read()).to_string();
                 if payload != last_payload {
                     last_payload = payload.clone();
                     let (m, cv) = &*shared;

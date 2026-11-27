@@ -82,6 +82,12 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
+侧边面板与状态栏的 JSON 有快照测试（`src/live/snapshots/*.json`，数据来自 `src/live/test_support.rs` 的 `view_fixture`，时钟固定）。有意改变输出时，用下面的命令重写快照，再检查 diff：
+
+```bash
+UPDATE_SNAPSHOTS=1 cargo test snapshot
+```
+
 ---
 
 ## CI 与发版流程
