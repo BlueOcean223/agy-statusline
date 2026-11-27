@@ -423,16 +423,27 @@
     }).join('');
   }
 
+  // What the panel shows that the status bar shows too (context, last call, cost, quota, running)
+  // comes from the bar's view of the conversation.
+  const barView = (p) => p.bar?.views?.[p.id] || { main: {}, quota: [] };
+
   // ---------------------------------------------------------------- Overview tab
   function renderOverview(p) {
     const { ctx, cache, tokens: t, speed } = p;
-    const ctxPct = ctx.max ? (ctx.used / ctx.max) * 100 : 0;
+    const v = barView(p);
+    const m = v.main;
+    const ctxUsed = m.ctxUsed || 0;
+    const ctxMax = m.ctxMax || 0;
+    const compactions = m.compactions || 0;
+    // A last call with nothing to hit (no input, no cache read) shows as 0%.
+    const lastHit = m.cacheHit ?? (m.lastAt != null ? 0 : null);
+    const ctxPct = ctxMax ? (ctxUsed / ctxMax) * 100 : 0;
     const ctxColor = ctxPct >= 85 ? 'var(--k-crit)' : ctxPct >= 65 ? 'var(--k-warn)' : 'var(--k-context)';
-    const cacheHitPct = (cache.lastHit || 0) * 100;
+    const cacheHitPct = (lastHit || 0) * 100;
 
     // Checkpoint viewer button & expandable summary box
-    const ckptBtn = ctx.compactions > 0
-      ? `<button type="button" class="pill-btn sm" id="btn-view-ckpt">${ckptOpenConvId === p.id ? '收起摘要' : `压缩 ${ctx.compactions}×`}</button>`
+    const ckptBtn = compactions > 0
+      ? `<button type="button" class="pill-btn sm" id="btn-view-ckpt">${ckptOpenConvId === p.id ? '收起摘要' : `压缩 ${compactions}×`}</button>`
       : `<span style="color:var(--fg-faint)">压缩 0×</span>`;
     let ckptBoxHtml = '';
     if (ckptOpenConvId === p.id) {
@@ -480,12 +491,12 @@
         </div>`
       : '';
 
-    const todayVal = t.todayCliCost > 0
-      ? `<b>${fmtUsd(t.todayCost)}</b> <span style="color:var(--fg-muted);font-size:10.5px">(含 CLI ${fmtUsd(t.todayCliCost)})</span>`
-      : `<b>${fmtUsd(t.todayCost)}</b>`;
+    const todayVal = p.bar.todayCli > 0
+      ? `<b>${fmtUsd(p.bar.today)}</b> <span style="color:var(--fg-muted);font-size:10.5px">(含 CLI ${fmtUsd(p.bar.todayCli)})</span>`
+      : `<b>${fmtUsd(p.bar.today)}</b>`;
 
     // Quota windows (dual track: used + elapsed) + embedded weekly forecasts
-    const quotaRows = (p.quota || []).map((q) => {
+    const quotaRows = (v.quota || []).map((q) => {
       const label = q.window === '5h' ? '5 小时窗口' : q.window === 'weekly' ? '每周窗口' : q.window;
       const pacePill = q.pace == null || Math.abs(q.pace) < 0.01
         ? '<span class="tonal-tag" style="padding:1px 6px;font-size:10px">平稳</span>'
@@ -572,8 +583,8 @@
             ${ringSvg(ctxPct, ctxColor)}
             <div class="ring-info">
               <div class="ring-label">上下文窗口</div>
-              <div class="ring-hero" style="color:${ctxColor}">${ctx.max ? ctxPct.toFixed(1) + '%' : '—'}</div>
-              <div class="ring-sub">${fmtTok(ctx.used)}${ctx.max ? ' / ' + fmtTok(ctx.max) : ''}</div>
+              <div class="ring-hero" style="color:${ctxColor}">${ctxMax ? ctxPct.toFixed(1) + '%' : '—'}</div>
+              <div class="ring-sub">${fmtTok(ctxUsed)}${ctxMax ? ' / ' + fmtTok(ctxMax) : ''}</div>
             </div>
           </div>
           <div class="ring-foot">
@@ -587,7 +598,7 @@
             ${ringSvg(cacheHitPct, 'var(--k-cache)')}
             <div class="ring-info">
               <div class="ring-label">Prompt 缓存</div>
-              <div class="ring-hero" style="color:var(--k-cache)">${pct(cache.lastHit)}</div>
+              <div class="ring-hero" style="color:var(--k-cache)">${pct(lastHit)}</div>
               <div class="ring-sub">${warmTxt}</div>
             </div>
           </div>
@@ -603,11 +614,11 @@
       <!-- Tokens & Cost Card -->
       <div class="sec-title">
         <span>费用与 Token 分布</span>
-        <span class="sec-meta">${t.includesSubagents ? '含子代理 · ' : ''}${fmtTok(t.total)} tok</span>
+        <span class="sec-meta">${v.includesSubagents ? '含子代理 · ' : ''}${fmtTok(t.total)} tok</span>
       </div>
       <div class="surface surface-pad">
         <div class="hero-row">
-          <span class="hero-num" style="color:var(--k-cost)">${fmtUsd(t.cost)}</span>
+          <span class="hero-num" style="color:var(--k-cost)">${fmtUsd(v.costConv)}</span>
           <span class="hero-unit">今日全部 ${todayVal}</span>
         </div>
         ${splitBarHtml}
@@ -630,14 +641,14 @@
       <div class="surface surface-pad">
         <div class="hero-row" style="margin-bottom:10px">
           <div style="display:flex;align-items:baseline;gap:6px">
-            <span class="hero-num" style="color:var(--k-tokens)">${speed.lastTps ? speed.lastTps.toFixed(1) : '—'}</span>
+            <span class="hero-num" style="color:var(--k-tokens)">${m.tps ? m.tps.toFixed(1) : '—'}</span>
             <span class="hero-unit">tok/s 最近输出</span>
           </div>
-          <span class="tonal-tag">TTFT ${speed.lastTtftMs ? (speed.lastTtftMs / 1000).toFixed(1) + 's' : '—'}</span>
+          <span class="tonal-tag">TTFT ${m.ttftMs ? (m.ttftMs / 1000).toFixed(1) + 's' : '—'}</span>
         </div>
         <div class="kv-grid">
           ${kv('平均速度', speed.avgTps ? speed.avgTps.toFixed(1) + ' tok/s' : '—')}
-          ${kv('最近首字', speed.lastTtftMs ? (speed.lastTtftMs / 1000).toFixed(1) + 's' : '—')}
+          ${kv('最近首字', m.ttftMs ? (m.ttftMs / 1000).toFixed(1) + 's' : '—')}
           ${kv('平均首字', speed.avgTtftMs ? (speed.avgTtftMs / 1000).toFixed(1) + 's' : '—')}
           ${kv('上次上下文 Δ', (ctx.delta >= 0 ? '+' : '') + fmtTok(ctx.delta))}
         </div>
@@ -2134,8 +2145,9 @@
         recents.filter((c) => c.id !== hostConvId).map((c) =>
           `<option value="${esc(c.id)}" ${c.id === selectedConvId ? 'selected' : ''}>${esc(c.title)}</option>`).join('');
 
-      livePill.classList.toggle('running', !!p.running);
-      liveLabel.textContent = p.activity || (p.running ? '运行中' : '空闲');
+      const running = !!barView(p).main.running;
+      livePill.classList.toggle('running', running);
+      liveLabel.textContent = p.activity || (running ? '运行中' : '空闲');
 
       renderStrip(p);
       renderPanels(p, false);

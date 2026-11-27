@@ -21,15 +21,13 @@ use crate::config::{
 use crate::convdb::{self, ConvMeta, DbSig};
 use crate::git::GitInfo;
 use crate::ls::LsClient;
-use crate::miss::{MissInfo, miss_scan};
-use crate::pricing::{Cost, DayCost, Pricer};
+use crate::pricing::{DayCost, Pricer};
 use crate::transcript::{Annotation, ReadPos, Transcript, TranscriptChunk};
 use crate::usage::{
     AccountInfo, QuotaBucketSample, QuotaSamples, UsageHistory, account_from_user_status, load_history, load_samples,
     maybe_replay_samples, needs_backfill, quota_group_id, run_backfill, save_history, today_str, update_today,
 };
 use chrono::{DateTime, Local, TimeZone};
-use serde::Serialize;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::UdpSocket;
@@ -45,6 +43,7 @@ mod panel;
 #[cfg(test)]
 mod test_support;
 mod tick;
+mod view;
 
 pub fn now_ms() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -1035,30 +1034,6 @@ impl Engine {
         self.convs.get(id)?.calls.iter().rev().find(|c| c.has_usage())
     }
 
-    fn quota_for(&self, call: Option<&LiveCall>, now: i64) -> Vec<QuotaView> {
-        let groups = self.quota["groups"].as_array().cloned().unwrap_or_default();
-        if groups.is_empty() {
-            return Vec::new();
-        }
-        let name = call.map(|c| model_family(&c.model.display)).unwrap_or_default();
-        let group = groups
-            .iter()
-            .find(|g| !name.is_empty() && g["description"].as_str().unwrap_or("").contains(&name))
-            .or_else(|| {
-                // Claude/GPT models live in the third-party group.
-                let third = call.is_some_and(|c| {
-                    let k = c.model.price_key();
-                    k.contains("claude") || k.contains("gpt")
-                });
-                groups.iter().find(|g| {
-                    let d = g["displayName"].as_str().unwrap_or("").to_lowercase();
-                    if third { d.contains("claude") } else { d.contains("gemini") }
-                })
-            })
-            .unwrap_or(&groups[0]);
-        quota_views(group, now)
-    }
-
     /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
     /// returning `(total_usd, total_tokens, cli_usd)`.
     fn today_totals(&self, pricer: &Pricer, midnight: i64) -> (f64, u64, f64) {
@@ -1118,245 +1093,6 @@ impl Engine {
         }
     }
 
-    /// Runs 6-cause cache-miss analysis over a conversation's usage calls.
-    fn conv_misses(&self, id: &str, pricer: &Pricer) -> Vec<Option<MissInfo>> {
-        let Some(conv) = self.convs.get(id) else {
-            return Vec::new();
-        };
-        let markers = conv.transcript.as_ref().map(|t| &t.markers);
-        miss_scan(conv.calls.iter().filter(|c| c.has_usage()).map(|c| &c.call), pricer, markers)
-    }
-
-    /// The status bar's payload for the conversations in `panes`, as of `clock`.
-    pub fn build_payload(
-        &self,
-        panes: &HashSet<String>,
-        cfg: &Config,
-        online: Option<&OnlinePrices>,
-        clock: Clock,
-    ) -> Value {
-        let now = clock.now;
-        let pricer = Pricer::new(&cfg.models, online, now);
-        let (today, _, today_cli) = self.today_totals(&pricer, clock.midnight);
-        let price_src = pricer.source().to_string();
-
-        let mut views = serde_json::Map::new();
-        for id in panes {
-            views.insert(id.clone(), serde_json::to_value(self.view(id, cfg, &pricer, clock)).unwrap_or(Value::Null));
-        }
-        let groups: Vec<Value> = self.quota["groups"]
-            .as_array()
-            .map(|gs| {
-                gs.iter()
-                    .map(|g| {
-                        json!({
-                            "name": g["displayName"],
-                            "models": g["description"],
-                            "buckets": quota_views(g, now),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        json!({
-            "today": today,
-            "todayCli": today_cli,
-            "costlyThreshold": cfg.costly_call_usd,
-            "priceSource": price_src,
-            "quotaGroups": groups,
-            "views": views,
-            "opts": {
-                "enabled": cfg.bar_enabled,
-                "seg": cfg.bar_segments,
-                "look": cfg.bar_look,
-            },
-            "error": self.last_error,
-        })
-    }
-
-    fn agent_line(&self, id: &str, cfg: &Config, pricer: &Pricer, now: i64) -> AgentLine {
-        let calls = self.convs.get(id).map(|c| c.calls.as_slice()).unwrap_or(&[]);
-        let last = self.last_call(id);
-        let ctx_max = if cfg.context_limit_override > 0 {
-            cfg.context_limit_override
-        } else {
-            last.map(|c| c.ctx_max).unwrap_or(0)
-        };
-        let mut by_ck = 0;
-        let mut by_drop = 0;
-        let mut prev_ck = -1;
-        let mut prev_used = 0u64;
-        let mut own_cost = 0.0;
-        let mut first_call_at = 0i64;
-        for c in calls.iter().filter(|c| c.has_usage()) {
-            own_cost += pricer.call_cost(c).total();
-            if c.at_ms > 0 && (first_call_at == 0 || c.at_ms < first_call_at) {
-                first_call_at = c.at_ms;
-            }
-            if c.checkpoint > prev_ck {
-                if c.checkpoint >= 0 {
-                    by_ck += 1;
-                }
-                prev_ck = c.checkpoint;
-            }
-            if prev_used > 100_000 && c.ctx_used > 0 && (c.ctx_used as f64) < prev_used as f64 * 0.6 {
-                by_drop += 1;
-            }
-            if c.ctx_used > 0 {
-                prev_used = c.ctx_used;
-            }
-        }
-        let compactions = by_ck.max(by_drop);
-        let s = self.summaries.get(id);
-        let sc = self.sub_steps.get(id);
-
-        let started_ms = [s.map(|x| x.created_ms).unwrap_or(0), sc.map(|x| x.first_at).unwrap_or(0), first_call_at]
-            .into_iter()
-            .filter(|&t| t > 0)
-            .min();
-
-        let (waiting, current_step, timeline, ended_ms, step_total) = if let Some(sc) = sc {
-            let active_step = sc
-                .steps
-                .iter()
-                .rev()
-                .find(|(_, st)| st.status.contains("WAIT") || st.status == "RUNNING" || st.status == "GENERATING")
-                .or_else(|| sc.steps.iter().next_back());
-            let waiting = active_step.is_some_and(|(_, st)| st.status.contains("WAIT"));
-            let cur = active_step.map(|(k, st)| format!("{} (step {})", st.text, k + 1));
-            let tl: Vec<String> = sc
-                .steps
-                .iter()
-                .rev()
-                .take(5)
-                .rev()
-                .map(|(k, st)| {
-                    let sym = if st.status.contains("WAIT") {
-                        "?"
-                    } else if st.status == "ERROR" {
-                        "✗"
-                    } else if st.status == "DONE" {
-                        "✓"
-                    } else {
-                        "●"
-                    };
-                    format!("{sym} #{} {}", k + 1, st.text)
-                })
-                .collect();
-            let end = sc.steps.values().map(|st| st.t1.max(st.t0)).max().filter(|&t| t > 0);
-            (waiting, cur, tl, end, sc.total)
-        } else {
-            (false, None, Vec::new(), None, s.map(|x| x.step_count as usize).unwrap_or(0))
-        };
-
-        let ended_ms = ended_ms.or_else(|| last.map(|c| c.at_ms).filter(|&t| t > 0));
-
-        AgentLine {
-            id: id.to_string(),
-            sub_type: s.and_then(|s| s.sub_type.clone()),
-            sub_role: s.and_then(|s| s.sub_role.clone()),
-            running: self.is_running(id, now),
-            waiting,
-            model: last.map(|c| c.model.display.clone()),
-            resp_model: last.map(|c| c.model.raw.clone()),
-            ctx_used: last.map(|c| c.ctx_used),
-            ctx_max,
-            compactions,
-            cache_read: last.map(|c| c.tokens.cache_read),
-            cache_write: last.map(|c| c.tokens.cache_write),
-            cache_hit: last.and_then(|c| {
-                let denom = c.tokens.cache_read + c.tokens.input;
-                (denom > 0).then(|| c.tokens.cache_read as f64 / denom as f64)
-            }),
-            ttft_ms: last.and_then(|c| c.ttft_ms),
-            tps: last.and_then(|c| c.tps()),
-            out_tokens: last.map(|c| c.tokens.output),
-            cost: own_cost,
-            started_ms,
-            ended_ms,
-            step_total,
-            current_step,
-            timeline,
-            last_at: last.map(|c| c.at_ms),
-            calls: calls.iter().filter(|c| c.has_usage()).count(),
-        }
-    }
-
-    fn view(&self, id: &str, cfg: &Config, pricer: &Pricer, clock: Clock) -> View {
-        let now = clock.now;
-        let root = self.root_of(id);
-        let is_sub = root != id;
-        let main = self.agent_line(id, cfg, pricer, now);
-        let includes_subagents = !is_sub && cfg.include_subagents;
-        let ids = if includes_subagents { self.tree(&root) } else { vec![id.to_string()] };
-        let midnight = clock.midnight;
-        let mut cost_conv = 0.0;
-        let mut cost_conv_today = 0.0;
-        let mut multi_day = false;
-        for cid in &ids {
-            if let Some(conv) = self.convs.get(cid) {
-                for c in conv.calls.iter().filter(|c| c.has_usage()) {
-                    let cost = pricer.call_cost(c).total();
-                    cost_conv += cost;
-                    if c.at_ms >= midnight {
-                        cost_conv_today += cost;
-                    } else if c.at_ms > 0 {
-                        multi_day = true;
-                    }
-                }
-            }
-        }
-        let last = self.last_call(id);
-        let cost_last = last.map(|c| pricer.call_cost(c));
-        let last_usd = cost_last.map(|k| k.total());
-        let last_costly = last_usd.is_some_and(|u| cfg.costly_call_usd > 0.0 && u >= cfg.costly_call_usd);
-        let last_call_key = last.map(|c| format!("{}:{}:{}", id, main.calls, c.at_ms));
-        let last_miss = self.conv_misses(id, pricer).into_iter().last().flatten();
-        let price = last.and_then(|c| pricer.rule(&c.model)).map(|r| r.display_name.clone());
-
-        let mut subs = Vec::new();
-        if !is_sub {
-            let mut ids: Vec<&String> = self
-                .summaries
-                .iter()
-                .filter(|(sid, s)| *sid != id && s.root.as_deref() == Some(root.as_str()))
-                .filter(|(sid, _)| {
-                    self.is_running(sid, now) || self.sub_done.get(*sid).is_some_and(|t| now - t < SUB_DONE_SHOW_MS)
-                })
-                .map(|(sid, _)| sid)
-                .collect();
-            ids.sort_by_key(|sid| {
-                (!self.is_running(sid, now), std::cmp::Reverse(self.last_call(sid).map(|c| c.at_ms)))
-            });
-            let more = ids.len().saturating_sub(MAX_SUBS);
-            subs = ids.into_iter().take(MAX_SUBS).map(|sid| self.agent_line(sid, cfg, pricer, now)).collect();
-            if more > 0 {
-                subs.push(AgentLine { id: format!("+{more}"), ..Default::default() });
-            }
-        }
-
-        let summary = self.summaries.get(id);
-        let git =
-            summary.and_then(|s| s.workspace_path.as_ref()).and_then(|p| self.git.get(p)).and_then(|(_, g)| g.clone());
-        View {
-            git,
-            workspace: summary.and_then(|s| s.workspace_path.clone()),
-            main,
-            is_sub,
-            cost_conv,
-            cost_conv_today,
-            multi_day,
-            includes_subagents,
-            cost_last,
-            last_call_costly: last_costly,
-            last_call_key,
-            last_call_miss: last_miss,
-            price_name: price,
-            quota: self.quota_for(last, now),
-            subs,
-        }
-    }
-
     pub fn summaries(&self) -> &HashMap<String, Summary> {
         &self.summaries
     }
@@ -1392,103 +1128,6 @@ fn date_calls(calls: &mut [LiveCall], steps: &HashMap<u64, crate::transcript::St
         };
         calls[i].at_ms = fallback;
     }
-}
-
-#[derive(Clone, Debug, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AgentLine {
-    pub id: String,
-    pub sub_type: Option<String>,
-    pub sub_role: Option<String>,
-    pub running: bool,
-    pub waiting: bool,
-    pub model: Option<String>,
-    pub resp_model: Option<String>,
-    pub ctx_used: Option<u64>,
-    pub ctx_max: u64,
-    pub compactions: usize,
-    pub cache_read: Option<u64>,
-    pub cache_write: Option<u64>,
-    pub cache_hit: Option<f64>,
-    pub ttft_ms: Option<f64>,
-    pub tps: Option<f64>,
-    pub out_tokens: Option<u64>,
-    pub cost: f64,
-    pub started_ms: Option<i64>,
-    pub ended_ms: Option<i64>,
-    pub step_total: usize,
-    pub current_step: Option<String>,
-    pub timeline: Vec<String>,
-    pub last_at: Option<i64>,
-    pub calls: usize,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct View {
-    pub main: AgentLine,
-    pub is_sub: bool,
-    pub cost_conv: f64,
-    pub cost_conv_today: f64,
-    pub multi_day: bool,
-    pub includes_subagents: bool,
-    pub cost_last: Option<Cost>,
-    pub last_call_costly: bool,
-    pub last_call_key: Option<String>,
-    pub last_call_miss: Option<MissInfo>,
-    pub price_name: Option<String>,
-    pub quota: Vec<QuotaView>,
-    pub subs: Vec<AgentLine>,
-    pub git: Option<GitInfo>,
-    pub workspace: Option<String>,
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct QuotaView {
-    pub window: String,
-    pub used: f64,
-    pub reset_ms: Option<i64>,
-    /// Used fraction minus elapsed fraction of the window; > 0 means burning faster than even pace.
-    pub pace: Option<f64>,
-    /// Fraction of the window already elapsed.
-    pub elapsed: Option<f64>,
-}
-
-fn quota_views(group: &Value, now: i64) -> Vec<QuotaView> {
-    let mut out: Vec<QuotaView> = group["buckets"]
-        .as_array()
-        .map(|bs| {
-            bs.iter()
-                .map(|b| {
-                    let window = b["window"].as_str().unwrap_or("").to_string();
-                    let remaining = b["remainingFraction"].as_f64().unwrap_or(1.0).clamp(0.0, 1.0);
-                    let reset_ms = b["resetTime"].as_str().and_then(parse_ts);
-                    let span_ms = match window.as_str() {
-                        "5h" => Some(5 * 3_600_000),
-                        "weekly" => Some(7 * 86_400_000),
-                        _ => None,
-                    };
-                    let elapsed = match (reset_ms, span_ms) {
-                        (Some(r), Some(span)) => Some(1.0 - ((r - now) as f64 / span as f64).clamp(0.0, 1.0)),
-                        _ => None,
-                    };
-                    // Rounded so the pushed payload only changes when the shown numbers can.
-                    let elapsed = elapsed.map(|e| (e * 1000.0).round() / 1000.0);
-                    let pace = elapsed.map(|e| (((1.0 - remaining) - e) * 1000.0).round() / 1000.0);
-                    QuotaView { window, used: 1.0 - remaining, reset_ms, pace, elapsed }
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // 5h first, then weekly.
-    out.sort_by_key(|q| if q.window == "5h" { 0 } else { 1 });
-    out
-}
-
-/// "Gemini 4 Neon (XHigh)" → "Gemini 4 Neon"; matches the quota group's model list.
-fn model_family(display: &str) -> String {
-    display.split(" (").next().unwrap_or(display).trim().to_string()
 }
 
 /// When a view is built: the wall clock, read once per request, and the start of its local day.
@@ -1562,7 +1201,7 @@ pub fn panel_json(
         s.panel.insert(id.clone(), Instant::now());
     }
     match engine().as_ref() {
-        Some(eng) => eng.panel(&id, cfg, online, Clock::read()),
+        Some(eng) => serde_json::to_value(eng.panel(&id, cfg, online, Clock::read())).unwrap_or(Value::Null),
         None => json!({ "id": null, "error": "language_server not connected" }),
     }
 }
@@ -1649,7 +1288,8 @@ pub fn run(shared: SharedRef) {
                     s.running = running;
                 });
                 let active_online = cfg.online_data_sync.then_some(online_prices).flatten();
-                let payload = eng.build_payload(&panes, &cfg, active_online.as_ref(), Clock::read()).to_string();
+                let payload = eng.build_payload(&panes, &cfg, active_online.as_ref(), Clock::read());
+                let payload = serde_json::to_string(&payload).unwrap_or_default();
                 if payload != last_payload {
                     last_payload = payload.clone();
                     let (m, cv) = &*shared;

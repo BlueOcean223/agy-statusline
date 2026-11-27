@@ -1,10 +1,11 @@
 //! Details for the side panel (Overview / Turns), built from the same engine state as the in-page bar.
 
+use super::view::{BarPayload, Priced, ViewReq};
 use super::{Clock, Engine, LiveCall};
 use crate::config::{Config, OnlinePrices};
-use crate::miss::MissSummary;
-use crate::pricing::Pricer;
-use serde_json::{Value, json};
+use crate::miss::{MissInfo, MissSummary};
+use crate::usage::AccountInfo;
+use serde::Serialize;
 use std::collections::HashSet;
 
 const SERIES_LEN: usize = 40;
@@ -43,11 +44,11 @@ impl Engine {
 
     /// The side panel for `id` from what is loaded; load it first (`load_for_panel`, or
     /// `live::panel_json` in the sidecar).
-    pub fn panel(&self, id: &str, cfg: &Config, online: Option<&OnlinePrices>, clock: Clock) -> Value {
+    pub fn panel(&self, id: &str, cfg: &Config, online: Option<&OnlinePrices>, clock: Clock) -> PanelView {
+        let req = ViewReq::new(self, cfg, online, clock);
         let now = clock.now;
         let recent_ids = self.top_level_recent();
         let id = id.to_string();
-        let pricer = Pricer::new(&cfg.models, online, now);
         let root = self.root_of(&id);
         let is_sub = root != id;
         let summary = self.summaries.get(&id).cloned().unwrap_or_default();
@@ -57,24 +58,18 @@ impl Engine {
         if !is_sub && cfg.include_subagents {
             ids.extend(self.tree(&root).into_iter().filter(|x| *x != id));
         }
-        let own: Vec<&LiveCall> =
-            self.convs.get(&id).map(|c| c.calls.iter().filter(|c| c.has_usage()).collect()).unwrap_or_default();
-        let all: Vec<&LiveCall> = ids
-            .iter()
-            .filter_map(|cid| self.convs.get(cid))
-            .flat_map(|c| c.calls.iter().filter(|c| c.has_usage()))
-            .collect();
+        let own = req.calls(&id);
+        let all: Vec<Priced> = ids.iter().flat_map(|cid| req.calls(cid).to_vec()).collect();
 
         // Tokens and cost
         let (mut fresh, mut cache, mut cache_write, mut out) = (0u64, 0u64, 0u64, 0u64);
         let (mut c_in, mut c_cache, mut c_cw, mut c_out) = (0.0, 0.0, 0.0, 0.0);
         let mut saved = 0.0;
-        for c in &all {
+        for &Priced { call: c, cost: k } in &all {
             fresh += c.tokens.input;
             cache += c.tokens.cache_read;
             cache_write += c.tokens.cache_write;
             out += c.tokens.output;
-            let k = pricer.call_cost(c);
             c_in += k.input;
             c_cache += k.cache;
             c_cw += k.cw;
@@ -85,22 +80,20 @@ impl Engine {
             }
         }
         let cost = c_in + c_cache + c_cw + c_out;
-        let first_at = own.iter().map(|c| c.at_ms).min().unwrap_or(0);
-        let last_at = own.iter().map(|c| c.at_ms).max().unwrap_or(0);
+        let first_at = own.iter().map(|p| p.call.at_ms).min().unwrap_or(0);
+        let last_at = own.iter().map(|p| p.call.at_ms).max().unwrap_or(0);
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer, clock.midnight);
-
         // Context
-        let last = own.last().copied();
+        let last = own.last().map(|p| p.call);
         let ctx_max = if cfg.context_limit_override > 0 {
             cfg.context_limit_override
         } else {
             last.map(|c| c.ctx_max).unwrap_or(0)
         };
         let ctx_used = last.map(|c| c.ctx_used).unwrap_or(0);
-        let ctx_series: Vec<u64> = own.iter().rev().take(SERIES_LEN).rev().map(|c| c.ctx_used).collect();
+        let ctx_series: Vec<u64> = own.iter().rev().take(SERIES_LEN).rev().map(|p| p.call.ctx_used).collect();
         let deltas: Vec<i64> = ctx_series.windows(2).map(|w| w[1] as i64 - w[0] as i64).collect();
         let last_delta = deltas.last().copied().unwrap_or(0);
         let recent: Vec<i64> = deltas.iter().rev().take(5).copied().filter(|d| *d > 0).collect();
@@ -114,140 +107,140 @@ impl Engine {
             if d == 0 { 0.0 } else { c.tokens.cache_read as f64 / d as f64 }
         };
         let session_hit = if fresh + cache > 0 { cache as f64 / (fresh + cache) as f64 } else { 0.0 };
-        let own_misses = self.conv_misses(&id, &pricer);
+        let own_misses = req.misses(&id);
         let mut miss_summary = MissSummary::default();
-        for (c, m) in own.iter().zip(own_misses.iter()) {
-            miss_summary.total_usd += pricer.call_cost(c).total();
+        for (p, m) in own.iter().zip(own_misses.iter()) {
+            miss_summary.total_usd += p.cost.total();
             if let Some(info) = m {
                 miss_summary.add(info);
             }
         }
         miss_summary.round_fields();
-        let misses = miss_summary.count;
         let warm_left = last.map(|c| (c.at_ms + cfg.cache_ttl_sec as i64 * 1000 - now) / 1000).filter(|s| *s > 0);
 
         // Speed
         let (out_sum, stream_sum) = own
             .iter()
-            .filter_map(|c| c.stream_ms.filter(|ms| *ms > 50.0).map(|ms| (c.tokens.output as f64, ms / 1000.0)))
+            .filter_map(|p| {
+                p.call.stream_ms.filter(|ms| *ms > 50.0).map(|ms| (p.call.tokens.output as f64, ms / 1000.0))
+            })
             .fold((0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-        let ttfts: Vec<f64> = own.iter().filter_map(|c| c.ttft_ms).collect();
-        let tps_series: Vec<f64> = own.iter().rev().take(SERIES_LEN).rev().filter_map(|c| c.tps()).collect();
+        let ttfts: Vec<f64> = own.iter().filter_map(|p| p.call.ttft_ms).collect();
+        let tps_series: Vec<f64> = own.iter().rev().take(SERIES_LEN).rev().filter_map(|p| p.call.tps()).collect();
 
-        let subagents: Vec<Value> = if is_sub {
+        let subagents: Vec<SubagentRow> = if is_sub {
             Vec::new()
         } else {
-            let mut subs: Vec<Value> = self
+            let mut subs: Vec<SubagentRow> = self
                 .tree(&root)
                 .into_iter()
                 .filter(|x| *x != root)
                 .map(|sid| {
                     let s = self.summaries.get(&sid).cloned().unwrap_or_default();
-                    let calls: Vec<&LiveCall> = self
-                        .convs
-                        .get(&sid)
-                        .map(|c| c.calls.iter().filter(|c| c.has_usage()).collect())
-                        .unwrap_or_default();
-                    json!({
-                        "id": sid,
-                        "parent": s.parent,
-                        "inLs": self.ls_loaded.contains(&sid),
-                        "type": s.sub_type,
-                        "role": s.sub_role,
-                        "model": calls.last().map(|c| c.model.display.clone()),
-                        "tokens": calls.iter().map(|c| c.tokens.input + c.tokens.cache_read + c.tokens.cache_write + c.tokens.output).sum::<u64>(),
-                        "cost": calls.iter().map(|c| pricer.call_cost(c).total()).sum::<f64>(),
-                        "running": self.is_running(&sid, now),
-                        "lastAt": calls.last().map(|c| c.at_ms),
-                    })
+                    let calls = req.calls(&sid);
+                    SubagentRow {
+                        parent: s.parent,
+                        in_ls: self.ls_loaded.contains(&sid),
+                        sub_type: s.sub_type,
+                        role: s.sub_role,
+                        model: calls.last().map(|p| p.call.model.display.clone()),
+                        tokens: calls.iter().map(|p| p.call.tokens.total()).sum(),
+                        cost: calls.iter().map(|p| p.cost.total()).sum(),
+                        running: self.is_running(&sid, now),
+                        last_at: calls.last().map(|p| p.call.at_ms),
+                        id: sid,
+                    }
                 })
                 .collect();
-            subs.sort_by_key(|v| (!v["running"].as_bool().unwrap_or(false), std::cmp::Reverse(v["lastAt"].as_i64())));
+            subs.sort_by_key(|s| (!s.running, std::cmp::Reverse(s.last_at)));
             subs
         };
-        let sub_cost: f64 = subagents.iter().filter_map(|v| v["cost"].as_f64()).sum();
+        let sub_cost: f64 = subagents.iter().map(|s| s.cost).sum();
 
         // Only the most recent turns are sent: this is rebuilt and re-rendered on every 1.5s poll,
         // and agent-team conversations can have thousands of calls.
         let turns_total = own.len();
-        let turns: Vec<Value> = own
+        let turns: Vec<Turn> = own
             .iter()
             .enumerate()
             .skip(turns_total.saturating_sub(TURNS_LEN))
-            .map(|(idx, c)| {
-                let c_usd = pricer.call_cost(c).total();
-                let costly = cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd;
-                let miss = own_misses.get(idx).cloned().flatten();
-                json!({
-                    "step": c.steps.first(),
-                    "at": c.at_ms,
-                    "model": c.model.display,
-                    "ctx": c.ctx_used,
-                    "hit": hit(c),
-                    "out": c.tokens.output,
-                    "cost": c_usd,
-                    "costly": costly,
-                    "miss": miss,
-                    "tps": c.tps(),
-                    "ttftMs": c.ttft_ms,
-                    "label": c.label.clone().unwrap_or_else(|| "…".into()),
-                })
+            .map(|(idx, &Priced { call: c, cost })| {
+                let c_usd = cost.total();
+                Turn {
+                    step: c.steps.first().copied(),
+                    at: c.at_ms,
+                    model: c.model.display.clone(),
+                    ctx: c.ctx_used,
+                    hit: hit(c),
+                    out: c.tokens.output,
+                    cost: c_usd,
+                    costly: cfg.costly_call_usd > 0.0 && c_usd >= cfg.costly_call_usd,
+                    miss: own_misses.get(idx).cloned().flatten(),
+                    tps: c.tps(),
+                    ttft_ms: c.ttft_ms,
+                    label: c.label.clone().unwrap_or_else(|| "…".into()),
+                }
             })
             .collect();
 
         let mut listed: HashSet<String> = HashSet::new();
-        let recent: Vec<Value> = std::iter::once(id.clone())
+        let recent: Vec<Recent> = std::iter::once(id.clone())
             .chain(recent_ids)
             .filter(|cid| listed.insert(cid.clone()))
             .take(RECENT_LEN + 1)
-            .map(|cid| json!({ "id": cid, "title": self.title(&cid) }))
+            .map(|cid| Recent { title: self.title(&cid), id: cid })
             .collect();
 
-        let running = self.is_running(&id, now);
-        let panes: HashSet<String> = [id.clone()].into();
-        json!({
-            "id": id,
-            "root": root,
-            "isSub": is_sub,
-            "title": self.title(&id),
-            "running": running,
-            "activity": if running { last.and_then(|c| c.label.clone()).map(|l| format!("Running · {l}")).unwrap_or_else(|| "Running".into()) } else { "Idle".into() },
-            "workspace": summary.workspace,
-            "branch": summary.branch,
-            "account": self.account,
-            "recent": recent,
-            "bar": self.build_payload(&panes, cfg, online, clock),
-            "ctx": {
-                "used": ctx_used, "max": ctx_max, "left": ctx_left, "delta": last_delta,
-                "turnsLeft": turns_left, "series": ctx_series,
-                "compactions": self.view(&id, cfg, &pricer, clock).main.compactions,
+        let bar = req.bar(&HashSet::from([id.clone()]));
+        let running = bar.views[&id].main.running;
+        PanelView {
+            title: self.title(&id),
+            activity: if running {
+                last.and_then(|c| c.label.clone()).map(|l| format!("Running · {l}")).unwrap_or_else(|| "Running".into())
+            } else {
+                "Idle".into()
             },
-            "cache": {
-                "lastHit": last.map(hit), "sessionHit": session_hit, "misses": misses,
-                "missSummary": miss_summary,
-                "savedUsd": saved, "warmLeftSec": warm_left, "ttlSec": cfg.cache_ttl_sec,
+            workspace: summary.workspace,
+            branch: summary.branch,
+            account: self.account.clone(),
+            recent,
+            bar,
+            ctx: PanelCtx { left: ctx_left, delta: last_delta, turns_left, series: ctx_series },
+            cache: PanelCache {
+                session_hit,
+                misses: miss_summary.count,
+                miss_summary,
+                saved_usd: saved,
+                warm_left_sec: warm_left,
+                ttl_sec: cfg.cache_ttl_sec,
             },
-            "tokens": {
-                "fresh": fresh, "cache": cache, "cacheWrite": cache_write, "out": out,
-                "total": fresh + cache + cache_write + out,
-                "costIn": c_in, "costCache": c_cache, "costCacheWrite": c_cw, "costOut": c_out, "cost": cost,
-                "ratePerHr": rate_per_hr, "todayCost": today_cost, "todayCliCost": today_cli_cost, "todayTokens": today_tokens,
-                "includesSubagents": !is_sub && cfg.include_subagents,
+            tokens: PanelTokens {
+                fresh,
+                cache,
+                cache_write,
+                out,
+                total: fresh + cache + cache_write + out,
+                cost_in: c_in,
+                cost_cache: c_cache,
+                cost_cache_write: c_cw,
+                cost_out: c_out,
+                rate_per_hr,
+                today_tokens: req.today().1,
             },
-            "speed": {
-                "lastTps": last.and_then(|c| c.tps()),
-                "avgTps": (stream_sum > 0.0).then(|| out_sum / stream_sum),
-                "lastTtftMs": last.and_then(|c| c.ttft_ms),
-                "avgTtftMs": (!ttfts.is_empty()).then(|| ttfts.iter().sum::<f64>() / ttfts.len() as f64),
-                "series": tps_series,
-                "wallSec": wall_sec,
+            speed: PanelSpeed {
+                avg_tps: (stream_sum > 0.0).then(|| out_sum / stream_sum),
+                avg_ttft_ms: (!ttfts.is_empty()).then(|| ttfts.iter().sum::<f64>() / ttfts.len() as f64),
+                series: tps_series,
+                wall_sec,
             },
-            "quota": self.quota_for(last, now),
-            "subagents": subagents,
-            "subCost": sub_cost,
-            "turns": turns,
-            "turnsTotal": turns_total,
-        })
+            subagents,
+            sub_cost,
+            turns,
+            turns_total,
+            id,
+            root,
+            is_sub,
+        }
     }
 
     fn title(&self, id: &str) -> String {
@@ -266,11 +259,165 @@ impl Engine {
     }
 }
 
+/// The side panel (`web/app.js`). What it shows of the conversation that the status bar shows
+/// too (context used, last call, cost, quota, running) it reads from `bar.views[id]`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelView {
+    pub id: String,
+    pub root: String,
+    pub is_sub: bool,
+    pub title: String,
+    pub activity: String,
+    pub workspace: Option<String>,
+    pub branch: Option<String>,
+    pub account: Option<AccountInfo>,
+    /// This conversation, then the most recent top-level ones.
+    pub recent: Vec<Recent>,
+    /// The status bar for this conversation alone.
+    pub bar: BarPayload,
+    pub ctx: PanelCtx,
+    pub cache: PanelCache,
+    pub tokens: PanelTokens,
+    pub speed: PanelSpeed,
+    /// Every subagent of the tree (roots only), running first.
+    pub subagents: Vec<SubagentRow>,
+    pub sub_cost: f64,
+    /// The last `TURNS_LEN` calls with usage.
+    pub turns: Vec<Turn>,
+    pub turns_total: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Recent {
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelCtx {
+    pub left: u64,
+    /// Context growth over the last call.
+    pub delta: i64,
+    /// Calls left at the recent growth rate.
+    pub turns_left: Option<i64>,
+    pub series: Vec<u64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelCache {
+    pub session_hit: f64,
+    pub misses: usize,
+    pub miss_summary: MissSummary,
+    /// What the cached tokens would have cost as fresh input, less what they cost.
+    pub saved_usd: f64,
+    pub warm_left_sec: Option<i64>,
+    pub ttl_sec: u64,
+}
+
+/// Totals over the conversation, with its subagents when `bar.views[id].includesSubagents`.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelTokens {
+    pub fresh: u64,
+    pub cache: u64,
+    pub cache_write: u64,
+    pub out: u64,
+    pub total: u64,
+    pub cost_in: f64,
+    pub cost_cache: f64,
+    pub cost_cache_write: f64,
+    pub cost_out: f64,
+    pub rate_per_hr: Option<f64>,
+    pub today_tokens: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PanelSpeed {
+    pub avg_tps: Option<f64>,
+    pub avg_ttft_ms: Option<f64>,
+    pub series: Vec<f64>,
+    pub wall_sec: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentRow {
+    pub id: String,
+    pub parent: Option<String>,
+    pub in_ls: bool,
+    #[serde(rename = "type")]
+    pub sub_type: Option<String>,
+    pub role: Option<String>,
+    pub model: Option<String>,
+    pub tokens: u64,
+    pub cost: f64,
+    pub running: bool,
+    pub last_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Turn {
+    pub step: Option<u64>,
+    pub at: i64,
+    pub model: String,
+    pub ctx: u64,
+    pub hit: f64,
+    pub out: u64,
+    pub cost: f64,
+    pub costly: bool,
+    pub miss: Option<MissInfo>,
+    pub tps: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    pub label: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::live::test_support::*;
+    use serde_json::{Value, json};
     use std::path::PathBuf;
+
+    /// The panel with what the side panel reads from `bar.views[id]` and `bar` put where the panel
+    /// itself carried it before (as `web/app.js` reads it), so one snapshot covers what it shows.
+    fn as_shown(p: &PanelView) -> Value {
+        let mut out = serde_json::to_value(p).unwrap();
+        let bar = out["bar"].clone();
+        let view = &bar["views"][&p.id];
+        let m = &view["main"];
+        // A last call with nothing to hit (no input, no cache read) showed as 0% before.
+        let last_hit = match (&m["cacheHit"], &m["lastAt"]) {
+            (Value::Null, Value::Null) => Value::Null,
+            (Value::Null, _) => json!(0.0),
+            (hit, _) => hit.clone(),
+        };
+        let moved = [
+            ("ctx", "used", json!(m["ctxUsed"].as_u64().unwrap_or(0))),
+            ("ctx", "max", m["ctxMax"].clone()),
+            ("ctx", "compactions", m["compactions"].clone()),
+            ("cache", "lastHit", last_hit),
+            ("speed", "lastTps", m["tps"].clone()),
+            ("speed", "lastTtftMs", m["ttftMs"].clone()),
+            ("tokens", "cost", view["costConv"].clone()),
+            ("tokens", "includesSubagents", view["includesSubagents"].clone()),
+            ("tokens", "todayCost", bar["today"].clone()),
+            ("tokens", "todayCliCost", bar["todayCli"].clone()),
+            ("", "quota", view["quota"].clone()),
+            ("", "running", m["running"].clone()),
+        ];
+        for (section, key, value) in moved {
+            let obj = if section.is_empty() { &mut out } else { &mut out[section] };
+            let obj = obj.as_object_mut().unwrap();
+            assert!(!obj.contains_key(key), "{section}.{key} is in the panel and the bar");
+            obj.insert(key.to_string(), value);
+        }
+        out
+    }
 
     fn snapshot_path(name: &str) -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/live/snapshots").join(format!("{name}.json"))
@@ -339,33 +486,34 @@ mod tests {
     #[test]
     fn panel_of_a_root_conversation_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_root", &e.panel(&ids.root, &view_config(), None, CLOCK));
+        assert_snapshot("panel_root", &as_shown(&e.panel(&ids.root, &view_config(), None, CLOCK)));
     }
 
     #[test]
     fn panel_of_a_root_without_subagent_totals_matches_its_snapshot() {
         let (e, ids) = view_fixture();
         let cfg = Config { include_subagents: false, ..view_config() };
-        assert_snapshot("panel_root_own", &e.panel(&ids.root, &cfg, None, CLOCK));
+        assert_snapshot("panel_root_own", &as_shown(&e.panel(&ids.root, &cfg, None, CLOCK)));
     }
 
     #[test]
     fn panel_of_a_subagent_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_subagent", &e.panel(&ids.running, &view_config(), None, CLOCK));
+        assert_snapshot("panel_subagent", &as_shown(&e.panel(&ids.running, &view_config(), None, CLOCK)));
     }
 
     #[test]
     fn panel_of_an_idle_subagent_matches_its_snapshot() {
         let (e, ids) = view_fixture();
-        assert_snapshot("panel_idle_subagent", &e.panel(&ids.old, &view_config(), None, CLOCK));
+        assert_snapshot("panel_idle_subagent", &as_shown(&e.panel(&ids.old, &view_config(), None, CLOCK)));
     }
 
     #[test]
     fn bar_payload_matches_its_snapshot() {
         let (e, ids) = view_fixture();
         let panes = HashSet::from([ids.root.clone(), ids.running.clone(), ids.other.clone()]);
-        assert_snapshot("bar", &e.build_payload(&panes, &view_config(), None, CLOCK));
+        let bar = e.build_payload(&panes, &view_config(), None, CLOCK);
+        assert_snapshot("bar", &serde_json::to_value(bar).unwrap());
     }
 
     #[test]

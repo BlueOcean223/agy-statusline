@@ -78,7 +78,7 @@ fn print_status(conv: &str) {
         return;
     };
     eng.load_for_panel(&id);
-    let p = eng.panel(&id, &cfg, None, live::Clock::read());
+    let p = serde_json::to_value(eng.panel(&id, &cfg, None, live::Clock::read())).unwrap_or_default();
     let id = id.as_str();
     let v = &p["bar"]["views"][id];
     let m = &v["main"];
