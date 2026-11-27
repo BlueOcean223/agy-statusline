@@ -10,6 +10,9 @@
 //! - Spawned via a short-lived `agy-statusline relaunch-prompt` subprocess so macOS AppKit runs
 //!   cleanly on its main thread and the resident sidecar keeps zero GUI libraries loaded.
 
+// Only the macOS and Windows painters draw this layout; other platforms never show the dialog.
+#![cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "windows")]
