@@ -5,11 +5,11 @@
 //! `agy CLI` shares the same Antigravity account quota as the desktop app, so including its SQLite
 //! call records keeps today's spend, daily history, weekly `cap ≈`, and call breakdowns accurate.
 
-use crate::call::{CLI, Call, DedupSet};
+use crate::call::{CLI, Call, DedupSet, ModelAgg};
 use crate::config::{ReadFile, read_json_keep, write_atomic};
 use crate::convdb::{DbSig, is_uuid_db, signature};
 use crate::usage::{
-    DbCache, HISTORY_KEEP_DAYS, ModelAgg, UsageHistory, day_start_ms, local_day_str, read_usage_calls, today_str,
+    DbCache, HISTORY_KEEP_DAYS, UsageHistory, day_start_ms, local_day_str, read_usage_calls, today_str,
 };
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -481,6 +481,11 @@ mod tests {
         Gen { input: 1000, output: 200, response_id, raw: "gemini-4-neon", steps, exec, ..Default::default() }
     }
 
+    /// Daily-aggregate key of the fixture calls (no display name).
+    fn neon_key() -> String {
+        crate::call::ModelId::new("gemini-4-neon", "").bucket_key()
+    }
+
     #[test]
     fn cleans_slash_command_from_cli_preview() {
         assert_eq!(clean_preview("/plan   refactor  statusline  module"), "refactor statusline module");
@@ -517,7 +522,7 @@ mod tests {
         assert!(apply_cli_delta(&mut h, delta));
 
         let today_rec = h.days.get(&today_str()).expect("healthy DB should populate today");
-        assert_eq!(today_rec.cli_raw["gemini-4-neon"].calls, 1);
+        assert_eq!(today_rec.cli_raw[&neon_key()].calls, 1);
         assert_eq!(today_rec.cli_convs, 1);
         let _ = fs::remove_dir_all(&root);
     }
@@ -574,7 +579,7 @@ mod tests {
         let mut scanner = CliScanner::default();
         let delta = scanner.scan_delta(&cli_dir, &pd, None, now_ms).unwrap();
         let old_day = local_day_str(old_at);
-        assert_eq!(delta.agg[&old_day].0["gemini-4-neon"].calls, 1);
+        assert_eq!(delta.agg[&old_day].0[&neon_key()].calls, 1);
         assert!(!scanner.cache.contains_key(old_fname));
         assert!(scanner.cache.contains_key(new_fname));
         assert!(scanner.index.files[old_fname].d.contains(&old_day));

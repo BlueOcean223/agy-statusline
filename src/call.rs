@@ -4,6 +4,7 @@
 //! tracking, usage history and the `agy CLI` scan all share this type. State the live engine keeps
 //! about a call (transcript dating, labels) lives in `live::LiveCall`, not here.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 /// Desktop Antigravity.
@@ -32,14 +33,20 @@ impl ModelId {
         format!("{} {}", self.raw, self.display).to_lowercase()
     }
 
-    /// Key for daily aggregates: the raw name, else the display name, else `"unknown"`.
+    /// Key for daily aggregates: `"raw|display"` (see ADR 0001), or `"unknown"` when both are empty.
     pub fn bucket_key(&self) -> String {
-        if !self.raw.is_empty() {
-            self.raw.clone()
-        } else if !self.display.is_empty() {
-            self.display.clone()
-        } else {
+        if self.raw.is_empty() && self.display.is_empty() {
             "unknown".to_string()
+        } else {
+            format!("{}|{}", self.raw, self.display)
+        }
+    }
+
+    /// Reads a daily-aggregate key. Keys written before ADR 0001 hold only the raw name.
+    pub fn from_bucket_key(key: &str) -> Self {
+        match key.split_once('|') {
+            Some((raw, display)) => Self { raw: raw.to_string(), display: display.to_string() },
+            None => Self { raw: key.to_string(), display: String::new() },
         }
     }
 }
@@ -59,6 +66,46 @@ impl Tokens {
 
     pub fn any(&self) -> bool {
         self.total() > 0
+    }
+}
+
+/// Calls and tokens summed per model for one day; the unit of usage history.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelAgg {
+    pub calls: u64,
+    pub input: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub output: u64,
+}
+
+impl ModelAgg {
+    pub fn add(&mut self, input: u64, cr: u64, cw: u64, out: u64) {
+        self.calls += 1;
+        self.input += input;
+        self.cache_read += cr;
+        self.cache_write += cw;
+        self.output += out;
+    }
+
+    pub fn add_tokens(&mut self, t: &Tokens) {
+        self.add(t.input, t.cache_read, t.cache_write, t.output);
+    }
+
+    pub fn merge_from(&mut self, other: &ModelAgg) {
+        self.calls += other.calls;
+        self.input += other.input;
+        self.cache_read += other.cache_read;
+        self.cache_write += other.cache_write;
+        self.output += other.output;
+    }
+
+    pub fn tokens(&self) -> Tokens {
+        Tokens { input: self.input, cache_read: self.cache_read, cache_write: self.cache_write, output: self.output }
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.input + self.cache_read + self.cache_write + self.output
     }
 }
 
@@ -176,8 +223,11 @@ mod tests {
     fn model_id_clips_long_names_and_falls_back_for_buckets() {
         let long = "x".repeat(80);
         assert_eq!(ModelId::new(&long, "").raw.chars().count(), 64);
-        assert_eq!(ModelId::new("", "Gemini 4 Neon").bucket_key(), "Gemini 4 Neon");
+        assert_eq!(ModelId::new("gemini-4-neon", "Gemini 4 Neon").bucket_key(), "gemini-4-neon|Gemini 4 Neon");
         assert_eq!(ModelId::new("", "").bucket_key(), "unknown");
+        let m = ModelId::new("orchestrator-exec", "Gemini 4 Hydrogen (Orchestrator)");
+        assert_eq!(ModelId::from_bucket_key(&m.bucket_key()), m);
+        assert_eq!(ModelId::from_bucket_key("gemini-4-neon"), ModelId::new("gemini-4-neon", ""), "pre-ADR key");
         assert_eq!(ModelId::new("gemini-4-neon", "Gemini 4 Neon").price_key(), "gemini-4-neon gemini 4 neon");
     }
 }

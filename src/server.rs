@@ -1,8 +1,8 @@
 use crate::config::{
-    ConfigPatch, OnlinePrices, apply_config_patch, effective_model_rules, find_app_data_dir, find_plugin_data_dir,
-    load_config,
+    ConfigPatch, OnlinePrices, apply_config_patch, find_app_data_dir, find_plugin_data_dir, load_config,
 };
 use crate::live::{ENGINE, USAGE, now_ms, wake};
+use crate::pricing::Pricer;
 use crate::relaunch;
 use crate::transcript;
 use crate::updater;
@@ -224,12 +224,7 @@ fn handle_client(stream: TcpStream, ui_token: String) {
             let span = query.get("days").map(String::as_str).unwrap_or("7");
             let cfg = load_config(&plugin_data);
             let online = active_online_prices(cfg.online_data_sync);
-            let rules = effective_model_rules(&cfg.models, online.as_ref());
-            let price_src = match &online {
-                Some(p) if !p.updated.is_empty() => format!("online ({})", p.updated),
-                Some(_) => "online".to_string(),
-                None => "bundled".to_string(),
-            };
+            let pricer = Pricer::new(&cfg.models, online.as_ref(), now_ms());
             let (live_calls, writes) = if let Ok(guard) = ENGINE.lock()
                 && let Some(eng) = guard.as_ref()
             {
@@ -261,9 +256,8 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                     &pd,
                     &mut cli_snap,
                     &live_calls,
-                    &rules,
+                    &pricer,
                     now_ms(),
-                    &price_src,
                 ),
                 None => json!({ "days": [], "error": "usage history initializing" }),
             };
@@ -279,7 +273,7 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                 query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(usage::DEFAULT_DAY_CALLS_LIMIT);
             let cfg = load_config(&plugin_data);
             let online = active_online_prices(cfg.online_data_sync);
-            let rules = effective_model_rules(&cfg.models, online.as_ref());
+            let pricer = Pricer::new(&cfg.models, online.as_ref(), now_ms());
             let live_calls =
                 ENGINE.lock().ok().and_then(|g| g.as_ref().map(|e| e.live_call_records())).unwrap_or_default();
             let snap = USAGE.lock().ok().and_then(|g| {
@@ -299,8 +293,7 @@ fn handle_client(stream: TcpStream, ui_token: String) {
                     &mut cli_snap,
                     date,
                     &live_calls,
-                    &rules,
-                    now_ms(),
+                    &pricer,
                     cfg.costly_call_usd,
                     limit,
                 ),
