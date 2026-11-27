@@ -4,16 +4,20 @@
 
 ## [Unreleased]
 
+## [v0.5.2] - 2026-11-27
+
 ### 改进与修复 (Fixed & Improved)
-- **macOS 与 Windows 重启询问弹窗升级为双端统一 Rust 自绘 Material 3 对话框**：替换旧版 macOS `osascript` 与 Windows `TaskDialogIndirect` 系统弹窗，零外部 GUI 框架——共享同一套 Google Material 3 布局、明暗色板与交互状态机，底层分别由 macOS 原生 Cocoa/CoreGraphics（sRGB + Retina）与 Windows 原生 `WS_EX_LAYERED` + GDI+ `32bppPARGB`（28px 抗锯齿圆角 + Per-Monitor DPI v2，保留 `MessageBoxW` 回退）绘制；精简文案并新增左下「不再询问」复选框（勾选后自动将 `relaunch_mode` 设为 `never`），支持拖拽与 `Enter`/`Esc`/`Space` 快捷键。
+- **macOS 与 Windows 重启询问弹窗升级为双端统一 Rust 自绘 Material 3 对话框**：替换旧版 macOS `osascript` 与 Windows `TaskDialogIndirect` 系统弹窗，零外部 GUI 框架——共享同一套 Google Material 3 布局、明暗色板与交互状态机，底层分别由 macOS 原生 Cocoa/CoreGraphics（sRGB + Retina）与 Windows 原生 `WS_EX_LAYERED` + GDI+ `32bppPARGB`（28px 抗锯齿圆角 + Per-Monitor DPI v2，保留 `MessageBoxW` 回退）绘制；精简文案并新增左下「不再询问」复选框（勾选后自动将 `relaunch_mode` 设为 `never`），支持拖拽与 `Enter`/`Esc`/`Space` 快捷键；弹窗出现后 0.7 秒内以及按住不放的 `Enter`/`Space` 会被忽略，避免在 Antigravity 里打字时误触重启或误勾「不再询问」，Windows 上用 Alt+F4 关闭等同「稍后」并保留复选框状态。对话框在独立的 `relaunch-prompt` 子进程中运行，AppKit/CoreGraphics 与 GDI+ 只在该进程里加载，常驻 sidecar 与每次 hook 调用都不加载。Windows 对话框按光标所在显示器的 DPI 确定尺寸，有任务栏与 Alt+Tab 入口（拿不到前台时闪烁任务栏按钮），绘制失败时改用 `MessageBoxW`；读屏软件可读到对话框的文字与按键说明。
+- **重启询问弹窗未能给出回答时不再算作「用户拒绝」**：对话框进程启动失败、崩溃或被结束时，`relaunch.log` 记为提示失败，本次会话仍算未询问，5 分钟后重新弹出（每个会话最多 3 次）；`relaunch-state.json` 无法读写时，同一会话也不会在点「稍后」后反复弹出。
 - **非调试模式启动时重启询问弹窗更快出现**：调试端口不可达的判定等待从 20 秒缩短为 3 秒，监视线程在 sidecar 启动后的前 60 秒内每 1 秒检查一次（此前固定 5 秒），弹窗由约 20–25 秒提前到约 3–4 秒；是否弹窗仍以 Antigravity 主进程命令行缺少 `--remote-debugging-port` 为准，不会因此误触发重启。
 - **修复 CLI 调试命令（`status` / `live`）在 Antigravity 2.35+ 上找不到 `language_server`**：新版 `language_server`（`--standalone --subclient_type hub`）改从 stdin 读取令牌，命令行不再带 `--csrf_token`，导致不经 sidecar 环境变量的发现逻辑总是失败。现在依次尝试：旧版 `--csrf_token` 参数；新版写入的 `~/.gemini/antigravity/daemon/hub_<port>.json` 发现文件（仅当其中 pid 为正在运行的 `language_server` 时采用）；最后读取正在运行的 agy-statusline sidecar 进程环境中的 `ANTIGRAVITY_LS_ADDRESS` / `ANTIGRAVITY_CSRF_TOKEN`。只连接回环地址，探测仅调用 `GetAllCascadeTrajectories`，不会让 `language_server` 加载新对话；sidecar 内的连接方式不变。
 - **按响应 ID 识别同一次调用，修复单日明细中实时调用与对话库副本重复计入**：`language_server` 返回的调用记录里没有 `requestId`，此前读取它的去重键始终为空，实时调用只能靠「对话 + 秒 + 输入/输出 token」匹配库中副本，尚未写入 transcript 的调用时间不准时会被算两次。现在实时记录取 `usage.responseId`、对话库取 usage 字段 11（本机 131/131 次调用核对一致），两者相同即为同一次调用；都带响应 ID 且不同时不再按秒级键误合并。桌面端、`agy CLI` 与实时路径共用同一套去重规则和同一个对话库解码器。
-- **修复调价当天同一次调用被计两次，各处金额统一按同一套计价规则**：每日聚合此前只按模型 raw 名称分键并匹配规则，而单次调用按「raw + display」匹配，两者落到不同规则时（例如 display 为 `Gemini 4 Hydrogen (Orchestrator)`），调价当天的余量扣减对不上，同一次调用会算两次。现在每日聚合的键改存为 `raw|display`（见 ADR 0001），状态栏、侧边面板、用量页、每周额度周期与缓存未命中分析都通过同一个计价模块匹配规则和计价；调价当天统一按「仍在磁盘上的调用按各自时间计价，其余按当天中午计价」处理，此前每周额度周期在调价当天整日按中午计价。不含 `|` 的旧键视为 display 为空，计价与旧版一致，不做迁移；升级当天同一模型可能暂时分成新旧两行，总量不变。
+- **修复调价当天同一次调用被计两次，各处金额统一按同一套计价规则**：每日聚合此前只按模型 raw 名称分键并匹配规则，而单次调用按「raw + display」匹配，两者落到不同规则时（例如 display 为 `Gemini 4 Hydrogen (Orchestrator)`），调价当天的余量扣减对不上，同一次调用会算两次。现在每日聚合的键改存为 `raw|display`（见 ADR 0001），状态栏、侧边面板、用量页、每周额度周期与缓存未命中分析都通过同一个计价模块匹配规则和计价；调价当天统一按「仍在磁盘上的调用按各自时间计价，其余按当天中午计价」处理，此前每周额度周期在调价当天整日按中午计价。不含 `|` 的旧键视为 display 为空，计价与旧版一致，不做迁移；升级当天同一模型可能暂时分成新旧两行，总量不变——调价当天的余量按每个聚合键扣减（先扣同键的调用，旧键再扣同一 raw 名称的调用），旧键与新键匹配到不同规则时也只计一次，每个键的余量按自己的规则计价。截止时间正好落在某天结束（次日 0 点）时，那一天不再按调价日处理。
 - **修复 Windows 开机后不久启动 sidecar 时崩溃**：Windows 上 `Instant` 从开机时刻起计且不能早于开机，此前主循环与 CDP 轮询用 `Instant::now() - 60s` / `- POLL_EVERY` 表示「立即到期」，开机后一分钟内启动 sidecar（例如登录后自动启动）会直接 panic。现在改为 `Option<Instant>`，`None` 表示尚未执行、首轮立即执行，行为不变。
 - **修复午夜进入夏令时的时区把全部历史对话算作「今天」**：在 00:00 进入夏令时的地区（如 `America/Santiago`、`America/Asuncion`、`Asia/Beirut`、`Africa/Cairo`），切换当天本地 00:00 不存在，此前「今天起点」退回为 0，所有历史对话都会被当作今天加载并计入今日花费；按日期求当天起点的 `day_start_ms` 在这一天返回空值，部分每日统计会跳过或改用兜底值。现在两者统一取当天第一个存在的本地时刻（例如 01:00）；整天被跳过的日期（如萨摩亚 2011-12-30）取下一天的起点。
 - **侧边面板打开未加载的对话时不再卡住状态栏**：此前面板请求在持有引擎锁期间同步读取对话本身、整棵子代理树和 transcript 里提到的历史子代理（language_server RPC 或对话数据库），子代理较多时状态栏刷新会一起等待。现在面板请求与引擎循环共用同一套「规划 → 锁外读取 → 合并」流程，只读取还没加载的对话，每次请求最多读 4 轮、每轮最多读 24 个数据库，其余由引擎循环补齐；面板加载不会淘汰对话，读取失败也不再显示在状态栏的错误里。
-- **引擎持锁期间不再读取任何文件，也不再查找 language_server**：未连接时查找 `language_server`（启动 `ps`/`lsof`、探测端口）改为在锁外进行，此前找不到时每轮都在锁内查找、面板请求一直等待；对话 transcript（用于给调用标注时间和标签）的增量读取并入对话读取计划，与 language_server / 数据库读取一起在锁外进行，合并时若已有另一次读取先合并则丢弃、下一轮重读；历史子代理线索只依据每 30 秒一次的 `brain/` 目录扫描判断是否存在，不在锁内逐个检查目录；侧边面板标题只使用每 10 秒刷新一次的 annotation 缓存，新建对话的标题最多晚 10 秒出现。
+- **引擎持锁期间不再读取任何文件，也不再查找 language_server**：未连接时查找 `language_server`（启动 `ps`/`lsof`、探测端口）改为在锁外进行，此前找不到时每轮都在锁内查找、面板请求一直等待；对话 transcript（用于给调用标注时间和标签）的增量读取并入对话读取计划，与 language_server / 数据库读取一起在锁外进行，合并时若已有另一次读取先合并则丢弃、下一轮重读；历史子代理线索只依据每 30 秒一次的 `brain/` 目录扫描判断是否存在，不在锁内逐个检查目录；侧边面板标题只使用每 10 秒刷新一次的 annotation 缓存，新建对话的标题最多晚 10 秒出现；调价当天状态栏「今日」所需的对话库与 `agy CLI` 调用改为在锁外每 5 秒读取一次，状态栏与面板只用读好的副本。面板读取对话库期间若 language_server 刚好加载了该对话，同一请求内会改从 language_server 重读，不再显示一次空数据。
+- **对话库中一行无法解析时不再丢掉整个对话的用量**：此前一行异常就会让整个对话库读取失败，首次补算历史时该对话的历史会永久缺失；现在该行按无用量记录处理，读取中途出错时保留已读的行。同一响应 ID 先被无 ID 副本匹配后，后续副本不会再被重复计入；实时调用与对话库副本合并时采用对话库记录的时间，尚未写入 transcript 的调用不会被算到错误的日期或价格档。
 
 ## [v0.5.1] - 2026-11-26
 
@@ -96,7 +100,8 @@
 - 统一由实时引擎驱动右侧辅助面板，移除旧版 transcript 桥接代码。
 - 修复 Antigravity 重启后查找未加载对话、按模型列表匹配首页额度组、跟随系统明暗主题、`language_server` 断开后自动退出以及面板轮询同步等问题。
 
-[Unreleased]: https://github.com/BlueOcean223/agy-statusline/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/BlueOcean223/agy-statusline/compare/v0.5.2...HEAD
+[v0.5.2]: https://github.com/BlueOcean223/agy-statusline/compare/v0.5.1...v0.5.2
 [v0.5.1]: https://github.com/BlueOcean223/agy-statusline/compare/v0.5.0...v0.5.1
 [v0.5.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.4.0...v0.5.0
 [v0.4.0]: https://github.com/BlueOcean223/agy-statusline/compare/v0.3.0...v0.4.0
