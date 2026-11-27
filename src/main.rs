@@ -78,52 +78,42 @@ fn print_status(conv: &str) {
         return;
     };
     eng.load_for_panel(&id);
-    let p = serde_json::to_value(eng.panel(&id, &cfg, None, live::Clock::read())).unwrap_or_default();
-    let id = id.as_str();
-    let v = &p["bar"]["views"][id];
-    let m = &v["main"];
+    let p = eng.panel(&id, &cfg, None, live::Clock::read());
+    let v = &p.bar.views[&id];
+    let m = &v.main;
     let c = |rgb: (u8, u8, u8), s: String| format!("\x1b[38;2;{};{};{}m{s}\x1b[0m", rgb.0, rgb.1, rgb.2);
     let sep = "\x1b[90m | \x1b[0m";
-    let used = m["ctxUsed"].as_u64().unwrap_or(0);
-    let max = m["ctxMax"].as_u64().unwrap_or(0);
+    let used = m.ctx_used.unwrap_or(0);
+    let max = m.ctx_max;
     let mut l1 = vec![
-        c((180, 190, 254), format!("✦ {}", m["model"].as_str().unwrap_or("–"))),
+        c((180, 190, 254), format!("✦ {}", m.model.as_deref().unwrap_or("–"))),
         c(
             (203, 166, 247),
             format!("◔ {}% · {} / {}", (used * 100).checked_div(max).unwrap_or(0), fmt_tok(used), fmt_tok(max)),
         ),
         c(
             (137, 220, 235),
-            format!(
-                "⛁ {} · {:.0}% hit",
-                fmt_tok(m["cacheRead"].as_u64().unwrap_or(0)),
-                m["cacheHit"].as_f64().unwrap_or(0.0) * 100.0
-            ),
+            format!("⛁ {} · {:.0}% hit", fmt_tok(m.cache_read.unwrap_or(0)), m.cache_hit.unwrap_or(0.0) * 100.0),
         ),
         c(
             (245, 194, 231),
-            format!(
-                "$ ${:.2}{} · ${:.2} today",
-                v["costConv"].as_f64().unwrap_or(0.0),
-                if v["multiDay"].as_bool() == Some(true) { " conv" } else { "" },
-                p["bar"]["today"].as_f64().unwrap_or(0.0)
-            ),
+            format!("$ ${:.2}{} · ${:.2} today", v.cost_conv, if v.multi_day { " conv" } else { "" }, p.bar.today),
         ),
     ];
-    if m["running"].as_bool() == Some(true) {
+    if m.running {
         l1.push(c((166, 227, 161), "● running".into()));
     }
     let mut l2 = vec![
-        c((242, 205, 205), format!("⧗ {:.1}s", m["ttftMs"].as_f64().unwrap_or(0.0) / 1000.0)),
-        c((148, 226, 213), format!("ϟ {:.0} tok/s", m["tps"].as_f64().unwrap_or(0.0))),
+        c((242, 205, 205), format!("⧗ {:.1}s", m.ttft_ms.unwrap_or(0.0) / 1000.0)),
+        c((148, 226, 213), format!("ϟ {:.0} tok/s", m.tps.unwrap_or(0.0))),
     ];
-    for q in v["quota"].as_array().into_iter().flatten() {
-        let label = if q["window"] == "5h" { "5h" } else { "7d" };
-        l2.push(c((250, 179, 135), format!("{label} {:.0}%", q["used"].as_f64().unwrap_or(0.0) * 100.0)));
+    for q in &v.quota {
+        let label = if q.window == "5h" { "5h" } else { "7d" };
+        l2.push(c((250, 179, 135), format!("{label} {:.0}%", q.used * 100.0)));
     }
     println!("{}", l1.join(sep));
     println!("{}", l2.join(sep));
-    println!("\x1b[90m{} ({id})\x1b[0m", p["title"].as_str().unwrap_or(""));
+    println!("\x1b[90m{} ({id})\x1b[0m", p.title);
 }
 
 fn print_live(ids: Vec<String>) {
