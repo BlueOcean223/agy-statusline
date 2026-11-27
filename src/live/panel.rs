@@ -90,7 +90,7 @@ impl Engine {
         let wall_sec = ((last_at - first_at).max(0) as f64) / 1000.0;
         let rate_per_hr = (wall_sec > 600.0).then(|| cost / (wall_sec / 3600.0));
 
-        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer, clock);
+        let (today_cost, today_tokens, today_cli_cost) = self.today_totals(&pricer, clock.midnight);
 
         // Context
         let last = own.last().copied();
@@ -286,10 +286,14 @@ mod tests {
                 keys.dedup();
                 keys.into_iter().find_map(|k| match (e.get(k), a.get(k)) {
                     (Some(ev), Some(av)) => diff(&format!("{path}.{k}"), ev, av),
-                    (ev, av) => Some(format!("{path}.{k}: expected {ev:?}, got {av:?}")),
+                    (Some(ev), None) => Some(format!("{path}.{k}: expected {ev}, missing")),
+                    (_, av) => Some(format!("{path}.{k}: unexpected {}", av.unwrap_or(&Value::Null))),
                 })
             }
-            (Value::Array(e), Value::Array(a)) if e.len() == a.len() => {
+            (Value::Array(e), Value::Array(a)) if e.len() != a.len() => {
+                Some(format!("{path}: expected {} items, got {}", e.len(), a.len()))
+            }
+            (Value::Array(e), Value::Array(a)) => {
                 e.iter().zip(a).enumerate().find_map(|(i, (ev, av))| diff(&format!("{path}[{i}]"), ev, av))
             }
             (Value::Number(e), Value::Number(a)) => {
@@ -301,12 +305,27 @@ mod tests {
         }
     }
 
+    /// Rounds floats to 12 significant digits, so a rewritten snapshot doesn't change in its last
+    /// bits with the order totals were summed in.
+    fn rounded(v: &Value) -> Value {
+        match v {
+            Value::Number(n) if n.is_f64() => {
+                let f = n.as_f64().unwrap_or(0.0);
+                let r = format!("{f:.11e}").parse::<f64>().unwrap_or(f);
+                serde_json::Number::from_f64(r).map_or(Value::Null, Value::Number)
+            }
+            Value::Array(a) => Value::Array(a.iter().map(rounded).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, v)| (k.clone(), rounded(v))).collect()),
+            _ => v.clone(),
+        }
+    }
+
     /// Compares `actual` with the stored snapshot `name`; `UPDATE_SNAPSHOTS=1` rewrites it instead.
     fn assert_snapshot(name: &str, actual: &Value) {
         let path = snapshot_path(name);
-        if std::env::var_os("UPDATE_SNAPSHOTS").is_some() {
+        if std::env::var("UPDATE_SNAPSHOTS").as_deref() == Ok("1") {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(&path, serde_json::to_string_pretty(actual).unwrap() + "\n").unwrap();
+            std::fs::write(&path, serde_json::to_string_pretty(&rounded(actual)).unwrap() + "\n").unwrap();
             return;
         }
         let text = std::fs::read_to_string(&path)
@@ -337,6 +356,12 @@ mod tests {
     }
 
     #[test]
+    fn panel_of_an_idle_subagent_matches_its_snapshot() {
+        let (e, ids) = view_fixture();
+        assert_snapshot("panel_idle_subagent", &e.panel(&ids.old, &view_config(), None, CLOCK));
+    }
+
+    #[test]
     fn bar_payload_matches_its_snapshot() {
         let (e, ids) = view_fixture();
         let panes = HashSet::from([ids.root.clone(), ids.running.clone(), ids.other.clone()]);
@@ -351,5 +376,7 @@ mod tests {
         assert!(diff("$", &e, &json!({ "a": [1.0], "c": "x" })).is_some());
         assert!(diff("$", &e, &json!({ "a": [1.0, { "b": 0.1 }] })).unwrap().starts_with("$.c"));
         assert!(diff("$", &json!({ "n": null }), &json!({ "n": 0 })).is_some());
+        assert!(diff("$", &e, &json!({ "a": [1.0, { "b": 0.1 }], "c": "x", "d": 1 })).unwrap().starts_with("$.d"));
+        assert_eq!(rounded(&json!([0.8598499999999999, 3, null])), json!([0.85985, 3, null]));
     }
 }

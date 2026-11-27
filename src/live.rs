@@ -1061,8 +1061,7 @@ impl Engine {
 
     /// Computes today's total cost and tokens (desktop live + persisted snapshot + `agy CLI`),
     /// returning `(total_usd, total_tokens, cli_usd)`.
-    fn today_totals(&self, pricer: &Pricer, clock: Clock) -> (f64, u64, f64) {
-        let midnight = clock.midnight;
+    fn today_totals(&self, pricer: &Pricer, midnight: i64) -> (f64, u64, f64) {
         let fp = pricer.fingerprint();
         let (mut live_cost, mut live_tok) = (0.0, 0u64);
         for conv in self.convs.values() {
@@ -1138,7 +1137,7 @@ impl Engine {
     ) -> Value {
         let now = clock.now;
         let pricer = Pricer::new(&cfg.models, online, now);
-        let (today, _, today_cli) = self.today_totals(&pricer, clock);
+        let (today, _, today_cli) = self.today_totals(&pricer, clock.midnight);
         let price_src = pricer.source().to_string();
 
         let mut views = serde_json::Map::new();
@@ -1492,11 +1491,6 @@ fn model_family(display: &str) -> String {
     display.split(" (").next().unwrap_or(display).trim().to_string()
 }
 
-/// Start of today in local time (see `day_start_in` for days whose 00:00 does not exist).
-fn local_midnight_ms() -> i64 {
-    local_midnight_at(now_ms())
-}
-
 /// When a view is built: the wall clock, read once per request, and the start of its local day.
 #[derive(Clone, Copy, Debug)]
 pub struct Clock {
@@ -1512,9 +1506,14 @@ impl Clock {
     }
 }
 
+/// Start of today in local time (see `day_start_in` for days whose 00:00 does not exist).
+fn local_midnight_ms() -> i64 {
+    local_midnight_at(now_ms())
+}
+
 /// Local midnight of the day containing `now_ms`.
 fn local_midnight_at(now_ms: i64) -> i64 {
-    let Some(now) = Local.timestamp_millis_opt(now_ms).earliest() else { return now_ms };
+    let Some(now) = Local.timestamp_millis_opt(now_ms).single() else { return now_ms };
     // `now` is itself a valid instant of today, so the fallback is never reached in practice;
     // if it were, counting nothing as today beats counting all history as today.
     crate::usage::day_start_in(now.date_naive(), &Local).unwrap_or_else(|| now.timestamp_millis())

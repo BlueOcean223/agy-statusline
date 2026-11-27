@@ -232,6 +232,7 @@ impl Engine {
     /// Decides what to (re)load. `interest` holds the conversations on screen (chat panes and the
     /// side panel); everything touched today is also kept current for today's cost.
     pub(super) fn plan_convs(&mut self, interest: &HashSet<String>) -> ConvPlan {
+        let now = now_ms();
         let midnight = local_midnight_ms();
         let mut want: HashSet<String> = HashSet::new();
         for (id, s) in &self.summaries {
@@ -259,7 +260,7 @@ impl Engine {
                     want.insert(id.clone());
                 }
             }
-            subs_shown.extend(self.shown_subs(root, now_ms()).into_iter().take(MAX_SUBS));
+            subs_shown.extend(self.shown_subs(root, now).into_iter().take(MAX_SUBS));
         }
         let mut visible: HashSet<String> = interest.clone();
         visible.extend(subs_shown.iter().cloned());
@@ -325,7 +326,7 @@ impl Engine {
             if !self.ls_loaded.contains(sid) {
                 continue;
             }
-            let running = self.is_running(sid, now_ms());
+            let running = self.is_running(sid, now);
             let step_count = self.summaries.get(sid).map_or(0, |s| s.step_count as usize);
             let cache = self.sub_steps.entry(sid.clone()).or_default();
             let due = if running {

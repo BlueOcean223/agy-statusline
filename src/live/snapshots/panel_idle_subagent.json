@@ -1,0 +1,237 @@
+{
+  "account": {
+    "key": "1a2b3c4d",
+    "masked": "ab***12@example.com",
+    "tier": "Google AI Ultra"
+  },
+  "activity": "Idle",
+  "bar": {
+    "costlyThreshold": 0.2,
+    "error": "language_server: connection refused",
+    "opts": {
+      "enabled": true,
+      "look": {
+        "bars": "thin",
+        "density": "compact",
+        "icons": "solid",
+        "palette": "cometix",
+        "skin": "plain"
+      },
+      "seg": {
+        "cache": true,
+        "context": true,
+        "cost": true,
+        "git": true,
+        "model": true,
+        "quota_5h": true,
+        "quota_7d": true,
+        "running": true,
+        "speed": true,
+        "subagents": true,
+        "today": true,
+        "ttft": true
+      }
+    },
+    "priceSource": "bundled",
+    "quotaGroups": [
+      {
+        "buckets": [
+          {
+            "elapsed": 0.6,
+            "pace": -0.15,
+            "resetMs": 1795788000000,
+            "used": 0.45,
+            "window": "5h"
+          },
+          {
+            "elapsed": 0.571,
+            "pace": 0.129,
+            "resetMs": 1796040000000,
+            "used": 0.7,
+            "window": "weekly"
+          }
+        ],
+        "models": "Gemini 4 Neon, Gemini 4 Flash",
+        "name": "Gemini Models"
+      },
+      {
+        "buckets": [
+          {
+            "elapsed": 0.3,
+            "pace": -0.2,
+            "resetMs": 1795793400000,
+            "used": 0.1,
+            "window": "5h"
+          }
+        ],
+        "models": "Claude Opus 5.5, GPT-6",
+        "name": "Claude and GPT Models"
+      }
+    ],
+    "today": 0.822956,
+    "todayCli": 0.0,
+    "views": {
+      "00000000-0000-4000-8000-000000000004": {
+        "costConv": 0.06125,
+        "costConvToday": 0.06125,
+        "costLast": {
+          "cache": 0.0,
+          "cw": 0.03125,
+          "in": 0.025,
+          "out": 0.005
+        },
+        "git": {
+          "added": 40,
+          "ahead": 2,
+          "behind": 0,
+          "branch": "main",
+          "deleted": 12,
+          "dirty": true
+        },
+        "includesSubagents": false,
+        "isSub": true,
+        "lastCallCostly": false,
+        "lastCallKey": "00000000-0000-4000-8000-000000000004:1:1795774200000",
+        "lastCallMiss": null,
+        "main": {
+          "cacheHit": 0.0,
+          "cacheRead": 0,
+          "cacheWrite": 5000,
+          "calls": 1,
+          "compactions": 0,
+          "cost": 0.06125,
+          "ctxMax": 200000,
+          "ctxUsed": 10000,
+          "currentStep": null,
+          "endedMs": 1795774200000,
+          "id": "00000000-0000-4000-8000-000000000004",
+          "lastAt": 1795774200000,
+          "model": "Claude Opus 5.5",
+          "outTokens": 200,
+          "respModel": "claude-opus-5-5",
+          "running": false,
+          "startedMs": 1795774200000,
+          "stepTotal": 2,
+          "subRole": "Map modules",
+          "subType": "explorer",
+          "timeline": [],
+          "tps": null,
+          "ttftMs": null,
+          "waiting": false
+        },
+        "multiDay": false,
+        "priceName": "Claude Opus",
+        "quota": [
+          {
+            "elapsed": 0.3,
+            "pace": -0.2,
+            "resetMs": 1795793400000,
+            "used": 0.1,
+            "window": "5h"
+          }
+        ],
+        "subs": [],
+        "workspace": "/work/agy"
+      }
+    }
+  },
+  "branch": null,
+  "cache": {
+    "lastHit": 0.0,
+    "missSummary": {
+      "by": {},
+      "count": 0,
+      "totalUsd": 0.06125,
+      "usd": 0.0
+    },
+    "misses": 0,
+    "savedUsd": 0.0,
+    "sessionHit": 0.0,
+    "ttlSec": 300,
+    "warmLeftSec": null
+  },
+  "ctx": {
+    "compactions": 0,
+    "delta": 0,
+    "left": 190000,
+    "max": 200000,
+    "series": [
+      10000
+    ],
+    "turnsLeft": null,
+    "used": 10000
+  },
+  "id": "00000000-0000-4000-8000-000000000004",
+  "isSub": true,
+  "quota": [
+    {
+      "elapsed": 0.3,
+      "pace": -0.2,
+      "resetMs": 1795793400000,
+      "used": 0.1,
+      "window": "5h"
+    }
+  ],
+  "recent": [
+    {
+      "id": "00000000-0000-4000-8000-000000000004",
+      "title": "explorer · Map modules"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000001",
+      "title": "Refactor the panel"
+    },
+    {
+      "id": "00000000-0000-4000-8000-000000000005",
+      "title": "Release notes"
+    }
+  ],
+  "root": "00000000-0000-4000-8000-000000000001",
+  "running": false,
+  "speed": {
+    "avgTps": null,
+    "avgTtftMs": null,
+    "lastTps": null,
+    "lastTtftMs": null,
+    "series": [],
+    "wallSec": 0.0
+  },
+  "subCost": -0.0,
+  "subagents": [],
+  "title": "explorer · Map modules",
+  "tokens": {
+    "cache": 0,
+    "cacheWrite": 5000,
+    "cost": 0.06125,
+    "costCache": 0.0,
+    "costCacheWrite": 0.03125,
+    "costIn": 0.025,
+    "costOut": 0.005,
+    "fresh": 5000,
+    "includesSubagents": false,
+    "out": 200,
+    "ratePerHr": null,
+    "todayCliCost": 0.0,
+    "todayCost": 0.822956,
+    "todayTokens": 184003,
+    "total": 10200
+  },
+  "turns": [
+    {
+      "at": 1795774200000,
+      "cost": 0.06125,
+      "costly": false,
+      "ctx": 10000,
+      "hit": 0.0,
+      "label": "…",
+      "miss": null,
+      "model": "Claude Opus 5.5",
+      "out": 200,
+      "step": 1,
+      "tps": null,
+      "ttftMs": null
+    }
+  ],
+  "turnsTotal": 1,
+  "workspace": null
+}
